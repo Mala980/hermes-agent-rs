@@ -176,6 +176,157 @@ impl CdpBrowserBackend {
             })
     }
 
+    /// Resolve the browser-level DevTools WebSocket URL.
+    ///
+    /// Unlike [`CdpBrowserBackend::resolve_target`] (which picks a page target),
+    /// this returns the browser session endpoint so that browser-level methods
+    /// (`Target.*`, `Browser.*`) and `Target.attachToTarget` work.
+    async fn resolve_browser_ws(&self) -> Result<String, ToolError> {
+        if looks_like_cdp_websocket(&self.endpoint) {
+            return Ok(self.endpoint.clone());
+        }
+        let version_resp = self
+            .client
+            .get(format!(
+                "{}/json/version",
+                self.endpoint.trim_end_matches('/')
+            ))
+            .send()
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to connect to Chrome CDP at {}: {}",
+                    self.endpoint, e
+                ))
+            })?;
+        let version: Value = version_resp.json().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to parse CDP version: {}", e))
+        })?;
+        version
+            .get("webSocketDebuggerUrl")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed(
+                    "No browser WebSocket debugger URL found. Is Chrome running with --remote-debugging-port=9222?"
+                        .into(),
+                )
+            })
+    }
+
+    /// Send a raw CDP command over the browser-level WebSocket.
+    ///
+    /// When `target_id` is given, attaches via `Target.attachToTarget`
+    /// (`flatten: true`) and multiplexes the call over that session —
+    /// equivalent to the Python `browser_cdp` target routing.
+    pub(crate) async fn cdp_raw_command(
+        &self,
+        method: &str,
+        params: Value,
+        target_id: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        let browser_ws = self.resolve_browser_ws().await?;
+        let (mut ws, _) = connect_async(&browser_ws).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "Failed to connect to CDP websocket {browser_ws}: {e}"
+            ))
+        })?;
+
+        static NEXT_CDP_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1_000_000);
+
+        async fn send_and_recv(
+            ws: &mut tokio_tungstenite::WebSocketStream<
+                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+            >,
+            method: &str,
+            mut req: Value,
+        ) -> Result<Value, ToolError> {
+            let request_id =
+                NEXT_CDP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            req["id"] = json!(request_id);
+            req["method"] = json!(method);
+            let payload = serde_json::to_string(&req).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to serialize CDP command {method}: {e}"
+                ))
+            })?;
+            ws.send(WsMessage::Text(payload)).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to send CDP command {method}: {e}"))
+            })?;
+
+            while let Some(frame) = ws.next().await {
+                let frame = frame.map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "CDP stream read failed for {method}: {e}"
+                    ))
+                })?;
+                let text = match frame {
+                    WsMessage::Text(t) => t,
+                    WsMessage::Binary(bytes) => {
+                        String::from_utf8(bytes).map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "CDP binary frame decode failed: {e}"
+                            ))
+                        })?
+                    }
+                    WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+                    WsMessage::Close(_) => {
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "CDP connection closed before response for {method}"
+                        )));
+                    }
+                    WsMessage::Frame(_) => continue,
+                };
+                let parsed: Value = serde_json::from_str(&text).map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "Failed to parse CDP response JSON: {e}"
+                    ))
+                })?;
+                if parsed.get("id").and_then(|v| v.as_u64()) != Some(request_id) {
+                    continue; // event or out-of-order response
+                }
+                if let Some(err) = parsed.get("error") {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "CDP command {method} failed: {err}"
+                    )));
+                }
+                return Ok(parsed.get("result").cloned().unwrap_or(parsed));
+            }
+            Err(ToolError::ExecutionFailed(format!(
+                "No CDP response received for command {method}"
+            )))
+        }
+
+        let mut req = json!({"params": params});
+        if let Some(tid) = target_id {
+            let attach = send_and_recv(
+                &mut ws,
+                "Target.attachToTarget",
+                json!({"params": {"targetId": tid, "flatten": true}}),
+            )
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Target.attachToTarget failed for target {tid}: {e}"
+                ))
+            })?;
+            let session_id = attach
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ToolError::ExecutionFailed(
+                        "Target.attachToTarget did not return a sessionId".into(),
+                    )
+                })?;
+            req["sessionId"] = json!(session_id);
+        }
+
+        let result = send_and_recv(&mut ws, method, req).await;
+        let _ = ws.close(None).await;
+        result
+    }
+
     /// Send a CDP command via HTTP/WebSocket discovery shim.
     async fn cdp_command(&self, method: &str, params: Value) -> Result<Value, ToolError> {
         let target = self.resolve_target().await?;
@@ -510,6 +661,25 @@ impl AutoBrowserBackend {
 
 #[async_trait]
 impl BrowserBackend for AutoBrowserBackend {
+    async fn cdp_raw(
+        &self,
+        method: &str,
+        params: Value,
+        target_id: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        match &self.inner {
+            ResolvedBrowserBackend::Local(b) => b.cdp_raw(method, params, target_id).await,
+            ResolvedBrowserBackend::CamoFox(b) => b.cdp_raw(method, params, target_id).await,
+            ResolvedBrowserBackend::Cloud(b) => {
+                let (backend, _provider, _transport) = b.ensure_backend().await?;
+                backend.cdp_raw(method, params, target_id).await
+            }
+            ResolvedBrowserBackend::Unsupported(msg) => {
+                Err(ToolError::ExecutionFailed(msg.clone()))
+            }
+        }
+    }
+
     async fn navigate(&self, url: &str) -> Result<String, ToolError> {
         match &self.inner {
             ResolvedBrowserBackend::Local(b) => b.navigate(url).await,
@@ -693,6 +863,15 @@ impl BrowserBackend for AutoBrowserBackend {
 
 #[async_trait]
 impl BrowserBackend for CdpBrowserBackend {
+    async fn cdp_raw(
+        &self,
+        method: &str,
+        params: Value,
+        target_id: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        self.cdp_raw_command(method, params, target_id).await
+    }
+
     async fn navigate(&self, url: &str) -> Result<String, ToolError> {
         let result = self
             .cdp_command("Page.navigate", json!({"url": url}))
@@ -833,6 +1012,17 @@ impl BrowserBackend for CdpBrowserBackend {
 
 #[async_trait]
 impl BrowserBackend for CamoFoxBrowserBackend {
+    async fn cdp_raw(
+        &self,
+        method: &str,
+        params: Value,
+        target_id: Option<&str>,
+    ) -> Result<Value, ToolError> {
+        // Camofox is anti-detection Chromium: CDP works, but annotate like the
+        // other methods. The raw result stays a Value (no string annotation).
+        self.inner.cdp_raw(method, params, target_id).await
+    }
+
     async fn navigate(&self, url: &str) -> Result<String, ToolError> {
         let result = self.inner.navigate(url).await?;
         Ok(annotate_result(result, "camofox", "direct"))
