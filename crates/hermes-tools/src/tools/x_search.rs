@@ -105,7 +105,9 @@ impl XSearchHandler {
                         .await;
                         continue;
                     }
-                    return Err(ToolError::ExecutionFailed(format!("xAI x_search request failed: {e}")));
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "xAI x_search request failed: {e}"
+                    )));
                 }
             }
         }
@@ -142,9 +144,9 @@ fn parse_iso_date(raw: &str, field: &str) -> Result<Option<NaiveDate>, ToolError
     if raw.is_empty() {
         return Ok(None);
     }
-    NaiveDate::parse_from_str(raw, "%Y-%m-%d").map(Some).map_err(|_| {
-        ToolError::InvalidParams(format!("{field} must be YYYY-MM-DD (got {raw:?})"))
-    })
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| ToolError::InvalidParams(format!("{field} must be YYYY-MM-DD (got {raw:?})")))
 }
 
 /// Both parse as YYYY-MM-DD; from <= to; from not after today (UTC).
@@ -296,14 +298,21 @@ impl ToolHandler for XSearchHandler {
             .filter(|q| !q.is_empty())
             .ok_or_else(|| ToolError::InvalidParams("query is required for x_search".into()))?;
 
-        let api_key = self.api_key.clone().filter(|k| !k.trim().is_empty()).ok_or_else(|| {
-            ToolError::ExecutionFailed("No xAI credentials available. Set XAI_API_KEY.".into())
-        })?;
+        let api_key = self
+            .api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| {
+                ToolError::ExecutionFailed("No xAI credentials available. Set XAI_API_KEY.".into())
+            })?;
 
         let (tool_def, active_filters) = build_tool_def(
             &str_list(&params, "allowed_x_handles"),
             &str_list(&params, "excluded_x_handles"),
-            params.get("from_date").and_then(|v| v.as_str()).unwrap_or(""),
+            params
+                .get("from_date")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
             params.get("to_date").and_then(|v| v.as_str()).unwrap_or(""),
             params
                 .get("enable_image_understanding")
@@ -323,7 +332,9 @@ impl ToolHandler for XSearchHandler {
         });
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let data = self.post_with_retries(&url, api_key.trim(), &payload).await?;
+        let data = self
+            .post_with_retries(&url, api_key.trim(), &payload)
+            .await?;
 
         let citations: Vec<Value> = data
             .get("citations")
@@ -455,20 +466,14 @@ mod tests {
 
     #[test]
     fn build_tool_def_rejects_both_handle_lists() {
-        let r = build_tool_def(
-            &["a".to_string()],
-            &["b".to_string()],
-            "",
-            "",
-            false,
-            false,
-        );
+        let r = build_tool_def(&["a".to_string()], &["b".to_string()], "", "", false, false);
         assert!(r.is_err());
     }
 
     #[test]
     fn build_tool_def_tracks_active_filters() {
-        let (def, filters) = build_tool_def(&[], &["spam".to_string()], "2026-01-01", "", true, false).unwrap();
+        let (def, filters) =
+            build_tool_def(&[], &["spam".to_string()], "2026-01-01", "", true, false).unwrap();
         assert_eq!(def["type"], "x_search");
         assert_eq!(def["excluded_x_handles"], json!(["spam"]));
         assert_eq!(def["from_date"], "2026-01-01");

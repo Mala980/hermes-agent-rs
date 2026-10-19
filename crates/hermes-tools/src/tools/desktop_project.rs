@@ -103,10 +103,7 @@ impl ProjectStore {
     fn load(&self) -> Result<ProjectFile, ToolError> {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
-                ToolError::ExecutionFailed(format!(
-                    "could not parse {}: {e}",
-                    self.path.display()
-                ))
+                ToolError::ExecutionFailed(format!("could not parse {}: {e}", self.path.display()))
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectFile::default()),
             Err(e) => Err(ToolError::ExecutionFailed(format!(
@@ -119,10 +116,7 @@ impl ProjectStore {
     fn save(&self, file: &ProjectFile) -> Result<(), ToolError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                ToolError::ExecutionFailed(format!(
-                    "could not create {}: {e}",
-                    parent.display()
-                ))
+                ToolError::ExecutionFailed(format!("could not create {}: {e}", parent.display()))
             })?;
         }
         let text = serde_json::to_string_pretty(file).map_err(|e| {
@@ -164,14 +158,21 @@ impl ProjectStore {
         let mut file = self.load()?;
         if let Some(existing) = folder
             .as_deref()
-            .and_then(|f| file.projects.iter().find(|p| p.primary_path.as_deref() == Some(f)))
+            .and_then(|f| {
+                file.projects
+                    .iter()
+                    .find(|p| p.primary_path.as_deref() == Some(f))
+            })
             .cloned()
         {
             return Ok(existing);
         }
         let mut slug = slugify(name);
         if slug.is_empty() {
-            slug = format!("project-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            slug = format!(
+                "project-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            );
         }
         // De-duplicate slugs.
         let base = slug.clone();
@@ -198,9 +199,7 @@ impl ProjectStore {
         let mut file = self.load()?;
         let proj = resolve_token(&file.projects, token)
             .cloned()
-            .ok_or_else(|| {
-                ToolError::NotFound(format!("no project matching '{token}'"))
-            })?;
+            .ok_or_else(|| ToolError::NotFound(format!("no project matching '{token}'")))?;
         file.active_id = Some(proj.id.clone());
         self.save(&file)?;
         Ok(proj)
@@ -370,7 +369,10 @@ mod tests {
 
     #[test]
     fn store_roundtrip_in_tempdir() {
-        let dir = std::env::temp_dir().join(format!("hermes-proj-test-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!(
+            "hermes-proj-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let store = ProjectStore::new(dir.join("projects.json"));
         let p = store.create("Demo", Some("/tmp/demo")).unwrap();
         assert_eq!(p.slug, "demo");
@@ -391,10 +393,7 @@ mod tests {
 
     #[test]
     fn schema_name_matches_original() {
-        let h = DesktopProjectHandler::new(
-            ProjectStore::new(PathBuf::from("/nonexistent")),
-            None,
-        );
+        let h = DesktopProjectHandler::new(ProjectStore::new(PathBuf::from("/nonexistent")), None);
         assert_eq!(h.schema().name, "desktop_project");
     }
 }
