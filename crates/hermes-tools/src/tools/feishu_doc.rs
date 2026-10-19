@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use hermes_core::{tool_schema, JsonSchema, ToolError, ToolHandler, ToolSchema};
 
 const TOKEN_URL: &str = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
-const RAW_CONTENT_URL: &str = "https://open.feishu.cn/open-apis/docx/v1/documents/{doc_token}/raw_content";
+const RAW_CONTENT_URL: &str =
+    "https://open.feishu.cn/open-apis/docx/v1/documents/{doc_token}/raw_content";
 
 /// Read Feishu/Lark document content.
 pub struct FeishuDocHandler {
@@ -35,10 +36,7 @@ impl FeishuDocHandler {
         }
     }
 
-    pub fn with_credentials(
-        app_id: impl Into<String>,
-        app_secret: impl Into<String>,
-    ) -> Self {
+    pub fn with_credentials(app_id: impl Into<String>, app_secret: impl Into<String>) -> Self {
         Self {
             app_id: Some(app_id.into()),
             app_secret: Some(app_secret.into()),
@@ -46,7 +44,11 @@ impl FeishuDocHandler {
         }
     }
 
-    async fn tenant_access_token(&self, app_id: &str, app_secret: &str) -> Result<String, ToolError> {
+    async fn tenant_access_token(
+        &self,
+        app_id: &str,
+        app_secret: &str,
+    ) -> Result<String, ToolError> {
         let resp = self
             .client
             .post(TOKEN_URL)
@@ -140,7 +142,8 @@ impl ToolHandler for FeishuDocHandler {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 ToolError::ExecutionFailed(
-                    "Feishu credentials not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET.".into(),
+                    "Feishu credentials not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET."
+                        .into(),
                 )
             })?;
         let app_secret = self
@@ -149,11 +152,14 @@ impl ToolHandler for FeishuDocHandler {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| {
                 ToolError::ExecutionFailed(
-                    "Feishu credentials not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET.".into(),
+                    "Feishu credentials not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET."
+                        .into(),
                 )
             })?;
 
-        let token = self.tenant_access_token(app_id.trim(), app_secret.trim()).await?;
+        let token = self
+            .tenant_access_token(app_id.trim(), app_secret.trim())
+            .await?;
         let content = self.raw_content(&token, doc_token).await?;
         Ok(json!({"success": true, "content": content}).to_string())
     }

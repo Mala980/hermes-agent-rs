@@ -74,7 +74,10 @@ impl ToolHandler for CloseTerminalHandler {
                     "process_id is required (the background process whose tab to close).".into(),
                 )
             })?;
-        let bridge = self.bridge.as_ref().ok_or_else(|| no_bridge("close_terminal"))?;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| no_bridge("close_terminal"))?;
         bridge.close_terminal_tab(process_id).await
     }
 
@@ -111,14 +114,15 @@ impl ReadTerminalHandler {
 }
 
 /// Validate and normalize the paging window. Pure logic, unit-tested.
-fn normalize_window(start_line: Option<&Value>, count: Option<&Value>) -> Result<(Option<u64>, Option<u64>), ToolError> {
+fn normalize_window(
+    start_line: Option<&Value>,
+    count: Option<&Value>,
+) -> Result<(Option<u64>, Option<u64>), ToolError> {
     let parse = |v: &Value, floor: u64, name: &str| -> Result<u64, ToolError> {
         let n = v
             .as_u64()
             .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
-            .ok_or_else(|| {
-                ToolError::InvalidParams(format!("{name} must be an integer."))
-            })?;
+            .ok_or_else(|| ToolError::InvalidParams(format!("{name} must be an integer.")))?;
         Ok(n.max(floor))
     };
     let start = start_line
@@ -135,9 +139,11 @@ fn normalize_window(start_line: Option<&Value>, count: Option<&Value>) -> Result
 #[async_trait]
 impl ToolHandler for ReadTerminalHandler {
     async fn execute(&self, params: Value) -> Result<String, ToolError> {
-        let (start, count) =
-            normalize_window(params.get("start_line"), params.get("count"))?;
-        let bridge = self.bridge.as_ref().ok_or_else(|| no_bridge("read_terminal"))?;
+        let (start, count) = normalize_window(params.get("start_line"), params.get("count"))?;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| no_bridge("read_terminal"))?;
         bridge.read_terminal(start, count).await
     }
 
@@ -205,7 +211,13 @@ mod tests {
 
     #[test]
     fn schema_names_match_original() {
-        assert_eq!(CloseTerminalHandler::new(None).schema().name, "close_terminal");
-        assert_eq!(ReadTerminalHandler::new(None).schema().name, "read_terminal");
+        assert_eq!(
+            CloseTerminalHandler::new(None).schema().name,
+            "close_terminal"
+        );
+        assert_eq!(
+            ReadTerminalHandler::new(None).schema().name,
+            "read_terminal"
+        );
     }
 }

@@ -122,7 +122,7 @@ fn curses_checklist_inner(
             }
             let check = if chosen.contains(&i) { "✓" } else { " " };
             let arrow = if i == cursor_pos { "→" } else { " " };
-            let line = format!(" {} [{}] {}", arrow, check, &items[i]);
+            let line = format!(" {} [{}] {}", arrow, check, items[i]);
             let truncated = &line[..line.len().min(max_x)];
 
             execute!(stdout, cursor::MoveTo(0, y as u16))?;
