@@ -242,14 +242,11 @@ impl CdpBrowserBackend {
             method: &str,
             mut req: Value,
         ) -> Result<Value, ToolError> {
-            let request_id =
-                NEXT_CDP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let request_id = NEXT_CDP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             req["id"] = json!(request_id);
             req["method"] = json!(method);
             let payload = serde_json::to_string(&req).map_err(|e| {
-                ToolError::ExecutionFailed(format!(
-                    "Failed to serialize CDP command {method}: {e}"
-                ))
+                ToolError::ExecutionFailed(format!("Failed to serialize CDP command {method}: {e}"))
             })?;
             ws.send(WsMessage::Text(payload)).await.map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to send CDP command {method}: {e}"))
@@ -257,19 +254,13 @@ impl CdpBrowserBackend {
 
             while let Some(frame) = ws.next().await {
                 let frame = frame.map_err(|e| {
-                    ToolError::ExecutionFailed(format!(
-                        "CDP stream read failed for {method}: {e}"
-                    ))
+                    ToolError::ExecutionFailed(format!("CDP stream read failed for {method}: {e}"))
                 })?;
                 let text = match frame {
                     WsMessage::Text(t) => t,
-                    WsMessage::Binary(bytes) => {
-                        String::from_utf8(bytes).map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "CDP binary frame decode failed: {e}"
-                            ))
-                        })?
-                    }
+                    WsMessage::Binary(bytes) => String::from_utf8(bytes).map_err(|e| {
+                        ToolError::ExecutionFailed(format!("CDP binary frame decode failed: {e}"))
+                    })?,
                     WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
                     WsMessage::Close(_) => {
                         return Err(ToolError::ExecutionFailed(format!(
@@ -279,9 +270,7 @@ impl CdpBrowserBackend {
                     WsMessage::Frame(_) => continue,
                 };
                 let parsed: Value = serde_json::from_str(&text).map_err(|e| {
-                    ToolError::ExecutionFailed(format!(
-                        "Failed to parse CDP response JSON: {e}"
-                    ))
+                    ToolError::ExecutionFailed(format!("Failed to parse CDP response JSON: {e}"))
                 })?;
                 if parsed.get("id").and_then(|v| v.as_u64()) != Some(request_id) {
                     continue; // event or out-of-order response
