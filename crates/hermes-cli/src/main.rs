@@ -3414,10 +3414,10 @@ async fn run_profile(
                 )
             })?;
 
-            let profile_path = profiles_dir.join(format!("{}.yaml", &name));
+            let profile_path = profiles_dir.join(format!("{}.yaml", name));
             if !profile_path.exists() {
                 // Also try .yml
-                let alt = profiles_dir.join(format!("{}.yml", &name));
+                let alt = profiles_dir.join(format!("{}.yml", name));
                 if !alt.exists() {
                     println!("Profile '{}' not found. Available profiles:", name);
                     if let Ok(rd) = std::fs::read_dir(&profiles_dir) {
