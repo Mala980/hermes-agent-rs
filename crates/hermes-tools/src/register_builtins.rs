@@ -542,11 +542,10 @@ pub fn register_builtin_tools(
             vec![],
         );
         {
-            let vault: Arc<dyn crate::tools::browser::VaultBackend> = Arc::new(
-                crate::tools::browser::FileVaultBackend::new(
+            let vault: Arc<dyn crate::tools::browser::VaultBackend> =
+                Arc::new(crate::tools::browser::FileVaultBackend::new(
                     crate::tools::browser::FileVaultBackend::default_path(),
-                ),
-            );
+                ));
             reg(
                 registry,
                 "browser",
@@ -655,7 +654,6 @@ pub fn register_builtin_tools(
         vec![],
     );
 
-
     // -- Ported from latest upstream (v0.2) ----------------------------------
     reg(
         registry,
@@ -688,14 +686,18 @@ pub fn register_builtin_tools(
     reg(
         registry,
         "terminal",
-        Arc::new(crate::tools::desktop_terminal::CloseTerminalHandler::new(None)),
+        Arc::new(crate::tools::desktop_terminal::CloseTerminalHandler::new(
+            None,
+        )),
         "❌",
         vec![],
     );
     reg(
         registry,
         "terminal",
-        Arc::new(crate::tools::desktop_terminal::ReadTerminalHandler::new(None)),
+        Arc::new(crate::tools::desktop_terminal::ReadTerminalHandler::new(
+            None,
+        )),
         "📟",
         vec![],
     );
@@ -709,26 +711,27 @@ pub fn register_builtin_tools(
     reg(
         registry,
         "productivity",
-        Arc::new(
-            crate::tools::desktop_project::DesktopProjectHandler::new(
-                crate::tools::desktop_project::ProjectStore::default_path(),
-                None,
-            ),
-        ),
+        Arc::new(crate::tools::desktop_project::DesktopProjectHandler::new(
+            crate::tools::desktop_project::ProjectStore::default_path(),
+            None,
+        )),
         "📁",
         vec![],
     );
     {
         let mcp_servers: Vec<crate::tools::manage_connections::LocalMcpServer> =
             hermes_config::load_config(None)
-                .map(|cfg| cfg.mcp_servers.iter().map(crate::tools::manage_connections::LocalMcpServer::from).collect())
+                .map(|cfg| {
+                    cfg.mcp_servers
+                        .iter()
+                        .map(crate::tools::manage_connections::LocalMcpServer::from)
+                        .collect()
+                })
                 .unwrap_or_default();
         reg(
             registry,
             "system",
-            Arc::new(crate::tools::manage_connections::ManageConnectionsHandler::new(
-                mcp_servers,
-            )),
+            Arc::new(crate::tools::manage_connections::ManageConnectionsHandler::new(mcp_servers)),
             "🔗",
             vec![],
         );
@@ -740,7 +743,6 @@ pub fn register_builtin_tools(
         "📚",
         vec![],
     );
-
 
     // -- Desktop UI bridges (desktop app only; error clearly without a bridge) --
     reg(
