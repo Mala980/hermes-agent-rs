@@ -733,6 +733,58 @@ pub fn register_builtin_tools(
         vec![],
     );
 
+
+    // -- Desktop UI bridges (desktop app only; error clearly without a bridge) --
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::ShowTipHandler::new(None)),
+        "💡",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::AnnotatePreviewHandler::new(None)),
+        "✏️",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::FocusPaneHandler::new(None)),
+        "🎯",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::GuiTourHandler::new(None)),
+        "🗺️",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::SetThemeHandler::new(None)),
+        "🎨",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::DesktopPreviewHandler::new(None)),
+        "🖼️",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::ReadWindowBelowHandler::new(None)),
+        "🪟",
+        vec![],
+    );
+
     tracing::info!("Registered {} built-in tools", registry.list_tools().len());
 }
 

@@ -13,6 +13,7 @@ pub mod cronjob;
 pub mod delegation;
 pub mod desktop_project;
 pub mod desktop_terminal;
+pub mod desktop_ui;
 pub mod drive_preview;
 pub mod env_passthrough;
 pub mod feishu_doc;
