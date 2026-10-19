@@ -1487,9 +1487,7 @@ mod tests {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if expr.contains("window.location.origin") {
-                    return Ok(
-                        json!({"result": {"type": "string", "value": self.origin.clone()}})
-                    );
+                    return Ok(json!({"result": {"type": "string", "value": self.origin.clone()}}));
                 }
                 if expr.contains("input[type=password]") {
                     return Ok(json!({"result": {"type": "string", "value": "focused"}}));
@@ -1610,10 +1608,7 @@ mod tests {
         assert_eq!(params["accept"], true);
         assert_eq!(params["promptText"], "hello");
 
-        let out = handler
-            .execute(json!({"action": "dismiss"}))
-            .await
-            .unwrap();
+        let out = handler.execute(json!({"action": "dismiss"})).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], true);
         let (method, params, _) = backend.last_call();
@@ -1727,10 +1722,7 @@ mod tests {
     async fn test_vault_unknown_action() {
         let vault = MockVaultBackend::with_item(MockVaultBackend::sample_item());
         let handler = BrowserVaultHandler::new(CdpMockBackend::new(), vault);
-        let out = handler
-            .execute(json!({"action": "explode"}))
-            .await
-            .unwrap();
+        let out = handler.execute(json!({"action": "explode"})).await.unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["success"], false);
     }
@@ -1815,5 +1807,4 @@ mod tests {
         let schema = handler.schema();
         assert_eq!(schema.name, "browser_vault");
     }
-
 }
