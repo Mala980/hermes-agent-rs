@@ -76,16 +76,22 @@ fn get_str(params: &Value, key: &str) -> Option<String> {
 const TIP_SIDES: &[&str] = &["top", "right", "bottom", "left"];
 
 /// Pure validation for `show_tip` (mirrors `tip_tool`).
-fn validate_tip(text: &str, selector: &str, side: &str) -> Result<(String, String, Option<String>), String> {
+fn validate_tip(
+    text: &str,
+    selector: &str,
+    side: &str,
+) -> Result<(String, String, Option<String>), String> {
     let text = text.trim().to_string();
     let selector = selector.trim().to_string();
     if text.is_empty() {
         return Err("tip needs text — the one line the bubble says.".into());
     }
     if selector.is_empty() {
-        return Err("tip needs a selector to point at. Call tour(action='targets') to see \
+        return Err(
+            "tip needs a selector to point at. Call tour(action='targets') to see \
             what's on screen and prefer a target reporting stable: true."
-            .into());
+                .into(),
+        );
     }
     let side = side.trim();
     if !side.is_empty() && !TIP_SIDES.contains(&side) {
@@ -109,7 +115,10 @@ impl ShowTipHandler {
 impl ToolHandler for ShowTipHandler {
     async fn execute(&self, params: Value) -> Result<String, ToolError> {
         let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+        let selector = params
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let side = params.get("side").and_then(|v| v.as_str()).unwrap_or("");
         let title = get_str(&params, "title");
         let (text, selector, side) =
@@ -123,7 +132,10 @@ impl ToolHandler for ShowTipHandler {
             payload["side"] = json!(s);
         }
         let answer = bridge.call("tip.show", payload).await?;
-        let ok = answer.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ok = answer
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !ok {
             return Err(no_bridge("show_tip"));
         }
@@ -185,8 +197,14 @@ fn validate_annotate(
             ANNOTATE_ACTIONS.join(", ")
         ));
     }
-    let reference = reference.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    let selector = selector.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let reference = reference
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let selector = selector
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
     if (verb == "add" || verb == "remove") && reference.is_none() && selector.is_none() {
         return Err(format!(
             "{verb} needs a ref from drive_preview action='elements' (e.g. 'btn-sign-in') or a CSS selector."
@@ -209,7 +227,10 @@ impl AnnotatePreviewHandler {
 #[async_trait]
 impl ToolHandler for AnnotatePreviewHandler {
     async fn execute(&self, params: Value) -> Result<String, ToolError> {
-        let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("add");
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("add");
         let reference = params.get("ref").and_then(|v| v.as_str());
         let selector = params.get("selector").and_then(|v| v.as_str());
         let label = get_str(&params, "label");
@@ -233,9 +254,12 @@ impl ToolHandler for AnnotatePreviewHandler {
         if let Some(l) = label {
             payload["text"] = json!(l);
         }
-        let answer = bridge.call("preview.annotate", payload).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to annotate the in-app browser: {e}"))
-        })?;
+        let answer = bridge
+            .call("preview.annotate", payload)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to annotate the in-app browser: {e}"))
+            })?;
         if answer.is_null() {
             return Err(ToolError::ExecutionFailed(
                 "No GUI window answered with a page: no preview tab is open. \
@@ -303,7 +327,10 @@ impl ToolHandler for FocusPaneHandler {
     async fn execute(&self, params: Value) -> Result<String, ToolError> {
         let pane = params.get("pane").and_then(|v| v.as_str()).unwrap_or("");
         let name = validate_focus_pane(pane).map_err(ToolError::InvalidParams)?;
-        let bridge = self.bridge.as_ref().ok_or_else(|| no_bridge("focus_pane"))?;
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| no_bridge("focus_pane"))?;
         bridge
             .call("pane.reveal", json!({ "pane": name }))
             .await
@@ -337,12 +364,19 @@ const TOUR_PRESETS: &[&str] = &["quick", "full"];
 
 /// One step of a custom tour (mirrors `_STEP_SCHEMA`).
 fn validate_tour_step(step: &Value, index: usize) -> Result<(), String> {
-    let obj = step.as_object().ok_or_else(|| format!("steps[{index}] must be an object."))?;
-    let has_target = ["selector", "title", "text"]
-        .iter()
-        .any(|k| obj.get(*k).and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false));
+    let obj = step
+        .as_object()
+        .ok_or_else(|| format!("steps[{index}] must be an object."))?;
+    let has_target = ["selector", "title", "text"].iter().any(|k| {
+        obj.get(*k)
+            .and_then(|v| v.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    });
     if !has_target {
-        return Err(format!("steps[{index}] needs a selector and/or title/text."));
+        return Err(format!(
+            "steps[{index}] needs a selector and/or title/text."
+        ));
     }
     Ok(())
 }
@@ -361,11 +395,17 @@ fn validate_tour(
 ) -> Result<Value, String> {
     let verb = action.trim().to_lowercase();
     if !TOUR_ACTIONS.contains(&verb.as_str()) {
-        return Err(format!("action must be one of: {}.", TOUR_ACTIONS.join(", ")));
+        return Err(format!(
+            "action must be one of: {}.",
+            TOUR_ACTIONS.join(", ")
+        ));
     }
     let surface = surface.unwrap_or("app").trim().to_lowercase();
     if !TOUR_SURFACES.contains(&surface.as_str()) {
-        return Err(format!("surface must be one of: {}.", TOUR_SURFACES.join(", ")));
+        return Err(format!(
+            "surface must be one of: {}.",
+            TOUR_SURFACES.join(", ")
+        ));
     }
     if let Some(s) = side {
         if !TIP_SIDES.contains(&s) {
@@ -374,7 +414,10 @@ fn validate_tour(
     }
     if let Some(p) = preset {
         if !TOUR_PRESETS.contains(&p) {
-            return Err(format!("preset must be one of: {}.", TOUR_PRESETS.join(", ")));
+            return Err(format!(
+                "preset must be one of: {}.",
+                TOUR_PRESETS.join(", ")
+            ));
         }
         if steps.is_some() {
             return Err("preset picks a built-in tour; pass steps or preset, not both.".into());
@@ -387,12 +430,17 @@ fn validate_tour(
         return Err("show needs a selector (and/or title/text for the popover).".into());
     }
     if verb == "start" && steps.is_none() && surface != "app" {
-        return Err("The built-in tour runs on surface='app'; pass steps for a preview tour.".into());
+        return Err(
+            "The built-in tour runs on surface='app'; pass steps for a preview tour.".into(),
+        );
     }
     if let Some(steps) = steps {
         if verb == "start" {
             if steps.is_empty() {
-                return Err("start needs a non-empty steps array, or no steps for the built-in tour.".into());
+                return Err(
+                    "start needs a non-empty steps array, or no steps for the built-in tour."
+                        .into(),
+                );
             }
             for (i, step) in steps.iter().enumerate() {
                 validate_tour_step(step, i)?;
@@ -451,9 +499,10 @@ impl ToolHandler for GuiTourHandler {
             payload["step_index"] = json!(idx);
         }
         let bridge = self.bridge.as_ref().ok_or_else(|| no_bridge("gui_tour"))?;
-        let answer = bridge.call("tour.request", payload).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Tour action failed: {e}"))
-        })?;
+        let answer = bridge
+            .call("tour.request", payload)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Tour action failed: {e}")))?;
         if answer.is_null() {
             return Err(ToolError::ExecutionFailed(
                 "The tour request timed out, or no GUI window answered. \
@@ -495,8 +544,14 @@ impl ToolHandler for GuiTourHandler {
             "selector".into(),
             json!({"type": "string", "description": "Element to highlight; omit = centered narration."}),
         );
-        step_props.insert("title".into(), json!({"type": "string", "description": "Popover title."}));
-        step_props.insert("text".into(), json!({"type": "string", "description": "Popover body."}));
+        step_props.insert(
+            "title".into(),
+            json!({"type": "string", "description": "Popover title."}),
+        );
+        step_props.insert(
+            "text".into(),
+            json!({"type": "string", "description": "Popover body."}),
+        );
         step_props.insert(
             "side".into(),
             json!({"type": "string", "enum": TIP_SIDES, "description": "Popover side; omit to auto-place."}),
@@ -525,7 +580,9 @@ impl ToolHandler for GuiTourHandler {
 // set_theme
 // ---------------------------------------------------------------------------
 
-const ACCENT_SWATCHES: &[&str] = &["mono", "green", "cyan", "nous", "violet", "pink", "red", "orange"];
+const ACCENT_SWATCHES: &[&str] = &[
+    "mono", "green", "cyan", "nous", "violet", "pink", "red", "orange",
+];
 const THEME_ACCENT: &str = "theme";
 const THEME_MODES: &[&str] = &["light", "dark", "system"];
 const THEME_PICKERS: &[&str] = &["accent", "layout"];
@@ -548,11 +605,15 @@ fn validate_set_theme(
 
     if let Some(p) = &picker {
         if !THEME_PICKERS.contains(&p.as_str()) {
-            return Err(format!("picker must be one of: {}.", THEME_PICKERS.join(", ")));
+            return Err(format!(
+                "picker must be one of: {}.",
+                THEME_PICKERS.join(", ")
+            ));
         }
         if accent.is_some() || mode.is_some() || layout.is_some() {
             return Err(
-                "picker shows a card for the user to choose; pass picker alone, without values.".into(),
+                "picker shows a card for the user to choose; pass picker alone, without values."
+                    .into(),
             );
         }
         return Ok(json!({ "picker": p }));
@@ -571,7 +632,9 @@ fn validate_set_theme(
         }
     }
     if let Some(a) = &accent {
-        let is_hex = Regex::new(r"^#[0-9a-fA-F]{6}$").map(|re| re.is_match(a)).unwrap_or(false);
+        let is_hex = Regex::new(r"^#[0-9a-fA-F]{6}$")
+            .map(|re| re.is_match(a))
+            .unwrap_or(false);
         if !ACCENT_SWATCHES.contains(&a.as_str()) && a != THEME_ACCENT && !is_hex {
             let mut available: Vec<&str> = ACCENT_SWATCHES.to_vec();
             available.push(THEME_ACCENT);
@@ -656,12 +719,18 @@ const PREVIEW_ACTIONS: &[&str] = &["open", "close", "read"];
 /// Port of `open_preview_tool._normalize_target`.
 fn normalize_preview_target(raw: &str) -> String {
     let v = raw.trim().trim_matches('`').trim().to_string();
-    if v.is_empty() || v.contains("://") || v.starts_with('/') || v.starts_with("./")
-        || v.starts_with("../") || v.starts_with('~') || v.starts_with("file:")
+    if v.is_empty()
+        || v.contains("://")
+        || v.starts_with('/')
+        || v.starts_with("./")
+        || v.starts_with("../")
+        || v.starts_with('~')
+        || v.starts_with("file:")
     {
         return v;
     }
-    let localhost = Regex::new(r"(?i)^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)").unwrap();
+    let localhost =
+        Regex::new(r"(?i)^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(/|$)").unwrap();
     if localhost.is_match(&v) {
         return format!("http://{v}");
     }
@@ -724,11 +793,18 @@ impl ToolHandler for DesktopPreviewHandler {
             let answer = bridge.call("preview.open", payload).await?;
             Ok(passthrough(answer))
         } else {
-            let answer = bridge.call("preview.close", json!({ "url": target })).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to close the preview: {e}"))
-            })?;
+            let answer = bridge
+                .call("preview.close", json!({ "url": target }))
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to close the preview: {e}"))
+                })?;
             let _ = answer;
-            let closed = if target.is_empty() { "all".to_string() } else { target };
+            let closed = if target.is_empty() {
+                "all".to_string()
+            } else {
+                target
+            };
             Ok(json!({ "success": true, "closed": closed }).to_string())
         }
     }
@@ -942,7 +1018,9 @@ mod tests {
 
     #[test]
     fn focus_pane_accepts_all_panes_case_insensitive() {
-        for pane in ["chat", "files", "terminal", "review", "sessions", "CHAT", " Review "] {
+        for pane in [
+            "chat", "files", "terminal", "review", "sessions", "CHAT", " Review ",
+        ] {
             assert!(validate_focus_pane(pane).is_ok(), "{pane}");
         }
     }
@@ -965,21 +1043,38 @@ mod tests {
     fn tour_show_needs_point_or_text() {
         let err = validate_tour("show", None, None, None, None, None, None, None).unwrap_err();
         assert!(err.contains("show needs a selector"));
-        assert!(validate_tour("show", None, Some("[data-tour=x]"), None, None, None, None, None).is_ok());
+        assert!(validate_tour(
+            "show",
+            None,
+            Some("[data-tour=x]"),
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_ok());
         assert!(validate_tour("show", None, None, Some("T"), None, None, None, None).is_ok());
     }
 
     #[test]
     fn tour_start_without_steps_requires_app_surface() {
-        let err = validate_tour("start", Some("preview"), None, None, None, None, None, None).unwrap_err();
+        let err = validate_tour("start", Some("preview"), None, None, None, None, None, None)
+            .unwrap_err();
         assert!(err.contains("surface='app'"));
     }
 
     #[test]
     fn tour_preset_and_steps_conflict() {
         let err = validate_tour(
-            "start", None, None, None, None, None,
-            Some(&vec![json!({"selector": "x"})]), Some("quick"),
+            "start",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&vec![json!({"selector": "x"})]),
+            Some("quick"),
         )
         .unwrap_err();
         assert!(err.contains("not both"));
@@ -988,10 +1083,12 @@ mod tests {
     #[test]
     fn tour_steps_must_be_valid_objects() {
         let bad = vec![json!({"title": ""})];
-        let err = validate_tour("start", None, None, None, None, None, Some(&bad), None).unwrap_err();
+        let err =
+            validate_tour("start", None, None, None, None, None, Some(&bad), None).unwrap_err();
         assert!(err.contains("needs a selector"));
         let not_obj = vec![json!("nope")];
-        let err = validate_tour("start", None, None, None, None, None, Some(&not_obj), None).unwrap_err();
+        let err =
+            validate_tour("start", None, None, None, None, None, Some(&not_obj), None).unwrap_err();
         assert!(err.contains("must be an object"));
         let good = vec![json!({"selector": "[data-tour=a]", "title": "A"})];
         assert!(validate_tour("start", None, None, None, None, None, Some(&good), None).is_ok());
@@ -1013,7 +1110,10 @@ mod tests {
 
     #[test]
     fn set_theme_picker_alone() {
-        assert_eq!(validate_set_theme(None, None, None, Some("accent")).unwrap(), json!({"picker": "accent"}));
+        assert_eq!(
+            validate_set_theme(None, None, None, Some("accent")).unwrap(),
+            json!({"picker": "accent"})
+        );
         let err = validate_set_theme(None, Some("dark"), None, Some("accent")).unwrap_err();
         assert!(err.contains("alone"));
         let err = validate_set_theme(None, None, None, Some("bogus")).unwrap_err();
@@ -1025,8 +1125,14 @@ mod tests {
         assert!(validate_set_theme(None, Some("dark"), None, None).is_ok());
         let err = validate_set_theme(None, Some("neon"), None, None).unwrap_err();
         assert!(err.contains("Unknown mode"));
-        for good in ["mono", "green", "cyan", "nous", "violet", "pink", "red", "orange", "theme", "#a1b2c3", "#A1B2C3"] {
-            assert!(validate_set_theme(Some(good), None, None, None).is_ok(), "{good}");
+        for good in [
+            "mono", "green", "cyan", "nous", "violet", "pink", "red", "orange", "theme", "#a1b2c3",
+            "#A1B2C3",
+        ] {
+            assert!(
+                validate_set_theme(Some(good), None, None, None).is_ok(),
+                "{good}"
+            );
         }
         let err = validate_set_theme(Some("puce"), None, None, None).unwrap_err();
         assert!(err.contains("Unknown accent"));
@@ -1038,14 +1144,26 @@ mod tests {
 
     #[test]
     fn preview_target_normalization_matches_python() {
-        assert_eq!(normalize_preview_target("www.cnn.com"), "https://www.cnn.com");
-        assert_eq!(normalize_preview_target("localhost:3000"), "http://localhost:3000");
-        assert_eq!(normalize_preview_target("127.0.0.1:8080/x"), "http://127.0.0.1:8080/x");
+        assert_eq!(
+            normalize_preview_target("www.cnn.com"),
+            "https://www.cnn.com"
+        );
+        assert_eq!(
+            normalize_preview_target("localhost:3000"),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            normalize_preview_target("127.0.0.1:8080/x"),
+            "http://127.0.0.1:8080/x"
+        );
         assert_eq!(normalize_preview_target("https://a.com"), "https://a.com");
         assert_eq!(normalize_preview_target("/tmp/x.html"), "/tmp/x.html");
         assert_eq!(normalize_preview_target("~/x.html"), "~/x.html");
         assert_eq!(normalize_preview_target(""), "");
-        assert_eq!(normalize_preview_target("`example.com`"), "https://example.com");
+        assert_eq!(
+            normalize_preview_target("`example.com`"),
+            "https://example.com"
+        );
     }
 
     // -- schemas --
@@ -1053,20 +1171,30 @@ mod tests {
     #[test]
     fn schema_names_match_original() {
         assert_eq!(ShowTipHandler::new(None).schema().name, "show_tip");
-        assert_eq!(AnnotatePreviewHandler::new(None).schema().name, "annotate_preview");
+        assert_eq!(
+            AnnotatePreviewHandler::new(None).schema().name,
+            "annotate_preview"
+        );
         assert_eq!(FocusPaneHandler::new(None).schema().name, "focus_pane");
         assert_eq!(GuiTourHandler::new(None).schema().name, "gui_tour");
         assert_eq!(SetThemeHandler::new(None).schema().name, "set_theme");
-        assert_eq!(DesktopPreviewHandler::new(None).schema().name, "desktop_preview");
-        assert_eq!(ReadWindowBelowHandler::new(None).schema().name, "read_window_below");
-        assert_eq!(ReactToMessageHandler::new(None).schema().name, "react_to_message");
+        assert_eq!(
+            DesktopPreviewHandler::new(None).schema().name,
+            "desktop_preview"
+        );
+        assert_eq!(
+            ReadWindowBelowHandler::new(None).schema().name,
+            "read_window_below"
+        );
+        assert_eq!(
+            ReactToMessageHandler::new(None).schema().name,
+            "react_to_message"
+        );
     }
 
     #[test]
     fn schema_required_fields_match_python() {
-        let req = |h: &dyn ToolHandler| {
-            h.schema().parameters.required.clone().unwrap_or_default()
-        };
+        let req = |h: &dyn ToolHandler| h.schema().parameters.required.clone().unwrap_or_default();
         assert_eq!(req(&ShowTipHandler::new(None)), vec!["text", "selector"]);
         assert_eq!(req(&FocusPaneHandler::new(None)), vec!["pane"]);
         assert_eq!(req(&GuiTourHandler::new(None)), vec!["action"]);
