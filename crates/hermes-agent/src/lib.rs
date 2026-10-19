@@ -7,7 +7,8 @@
     clippy::needless_range_loop,
     clippy::ptr_arg,
     clippy::too_many_arguments,
-    clippy::type_complexity
+    clippy::type_complexity,
+    clippy::double_must_use
 )]
 //! # hermes-agent
 //!

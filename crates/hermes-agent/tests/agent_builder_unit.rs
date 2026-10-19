@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use std::sync::Arc;
 
 use hermes_agent::agent_builder::{

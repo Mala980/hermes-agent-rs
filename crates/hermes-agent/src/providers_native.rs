@@ -184,8 +184,8 @@ impl GeminiProvider {
                     }
                     if let Some(tcs) = m.tool_calls.as_deref() {
                         for tc in tcs {
-                            let args: Value = serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or(Value::Null);
+                            let args: Value =
+                                serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null);
                             parts.push(json!({
                                 "functionCall": { "name": tc.function.name, "args": args }
                             }));
@@ -806,8 +806,8 @@ impl BedrockProvider {
                     }
                     if let Some(tcs) = m.tool_calls.as_deref() {
                         for tc in tcs {
-                            let input: Value = serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or(json!({}));
+                            let input: Value =
+                                serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
                             blocks.push(json!({
                                 "toolUse": {
                                     "toolUseId": tc.id,
@@ -1126,8 +1126,8 @@ fn hex_hmac(key: &[u8], data: &[u8]) -> String {
 /// Derive the SigV4 signing key: `AWS4{secret} -> date -> region -> bedrock -> aws4_request`.
 fn sig_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
     use hmac::{Hmac, Mac};
-    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(format!("AWS4{secret}").as_bytes())
-        .expect("hmac key");
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(format!("AWS4{secret}").as_bytes()).expect("hmac key");
     mac.update(date.as_bytes());
     let k_date = mac.finalize().into_bytes().to_vec();
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&k_date).expect("hmac key");

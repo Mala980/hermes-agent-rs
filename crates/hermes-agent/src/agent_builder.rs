@@ -451,10 +451,16 @@ mod build_provider_tests {
     fn azure_target_parsing() {
         // Model-string form wins.
         let (r, d, m) = parse_azure_target("myres/mydep/gpt-4o").unwrap();
-        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("myres", "mydep", "gpt-4o"));
+        assert_eq!(
+            (r.as_str(), d.as_str(), m.as_str()),
+            ("myres", "mydep", "gpt-4o")
+        );
         // Deployment doubles as the model label when omitted.
         let (r, d, m) = parse_azure_target("myres/mydep").unwrap();
-        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("myres", "mydep", "mydep"));
+        assert_eq!(
+            (r.as_str(), d.as_str(), m.as_str()),
+            ("myres", "mydep", "mydep")
+        );
 
         // Env fallback.
         let saved_r = std::env::var("AZURE_OPENAI_RESOURCE").ok();
@@ -462,7 +468,10 @@ mod build_provider_tests {
         std::env::set_var("AZURE_OPENAI_RESOURCE", "envres");
         std::env::set_var("AZURE_OPENAI_DEPLOYMENT", "envdep");
         let (r, d, m) = parse_azure_target("").unwrap();
-        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("envres", "envdep", "envdep"));
+        assert_eq!(
+            (r.as_str(), d.as_str(), m.as_str()),
+            ("envres", "envdep", "envdep")
+        );
         std::env::remove_var("AZURE_OPENAI_RESOURCE");
         std::env::remove_var("AZURE_OPENAI_DEPLOYMENT");
         assert!(parse_azure_target("").is_none());
@@ -486,10 +495,7 @@ mod build_provider_tests {
             provider_api_key_from_env("gemini").as_deref(),
             Some("g-key")
         );
-        assert_eq!(
-            provider_api_key_from_env("azure").as_deref(),
-            Some("a-key")
-        );
+        assert_eq!(provider_api_key_from_env("azure").as_deref(), Some("a-key"));
         match saved_g {
             Some(v) => std::env::set_var("GEMINI_API_KEY", v),
             None => std::env::remove_var("GEMINI_API_KEY"),
