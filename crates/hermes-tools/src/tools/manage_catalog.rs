@@ -96,7 +96,8 @@ pub fn validate_catalog_args(args: &Value) -> Result<CatalogArgs, String> {
     let mut items = vec![];
     if action == "install" {
         let raw_items = map.get("items").and_then(|v| v.as_array()).ok_or_else(|| {
-            "install needs 'items': [{\"kind\": \"plugin\", \"id\": \"<catalog id>\"}, ...].".to_string()
+            "install needs 'items': [{\"kind\": \"plugin\", \"id\": \"<catalog id>\"}, ...]."
+                .to_string()
         })?;
         if raw_items.is_empty() {
             return Err(
@@ -192,10 +193,7 @@ impl ToolHandler for ManageCatalogHandler {
 
     fn schema(&self) -> ToolSchema {
         let mut props = IndexMap::new();
-        props.insert(
-            "action".into(),
-            json!({"type": "string", "enum": ACTIONS}),
-        );
+        props.insert("action".into(), json!({"type": "string", "enum": ACTIONS}));
         props.insert(
             "kind".into(),
             json!({
@@ -279,7 +277,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             a.items,
-            vec![CatalogItem { kind: "plugin".into(), id: "github".into() }]
+            vec![CatalogItem {
+                kind: "plugin".into(),
+                id: "github".into()
+            }]
         );
         // bad kind
         assert!(validate_catalog_args(&json!({

@@ -123,7 +123,10 @@ impl ToolHandler for SetupBeatHandler {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        let skip = params.get("skip").and_then(|v| v.as_bool()).unwrap_or(false);
+        let skip = params
+            .get("skip")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if skip {
             let mut done = completed;
@@ -211,7 +214,15 @@ mod tests {
     fn beat_ids_in_order() {
         assert_eq!(
             BEATS,
-            &["name", "theme", "layout", "connectors", "plugins", "tour", "build"]
+            &[
+                "name",
+                "theme",
+                "layout",
+                "connectors",
+                "plugins",
+                "tour",
+                "build"
+            ]
         );
     }
 
@@ -228,7 +239,11 @@ mod tests {
         assert_eq!(next_beat(&[]), Some("name"));
         assert_eq!(next_beat(&["name".to_string()]), Some("theme"));
         assert_eq!(
-            next_beat(&["name".to_string(), "theme".to_string(), "layout".to_string()]),
+            next_beat(&[
+                "name".to_string(),
+                "theme".to_string(),
+                "layout".to_string()
+            ]),
             Some("connectors")
         );
         let all: Vec<String> = BEATS.iter().map(|s| s.to_string()).collect();
@@ -314,12 +329,10 @@ mod tests {
     #[tokio::test]
     async fn execute_presents_card_without_answer() {
         let h = SetupBeatHandler::new();
-        let out: Value = serde_json::from_str(
-            &h.execute(json!({"beat": "connectors"})).await.unwrap(),
-        )
-        .unwrap();
+        let out: Value =
+            serde_json::from_str(&h.execute(json!({"beat": "connectors"})).await.unwrap()).unwrap();
         assert_eq!(out["card"]["beat"], "connectors");
-        assert!(out["card"]["question"].as_str().unwrap().len() > 0);
+        assert!(!out["card"]["question"].as_str().unwrap().is_empty());
     }
 
     #[test]
