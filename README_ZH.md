@@ -13,6 +13,7 @@
 </div>
 
 > **v0.2：** 新增原生 Gemini（`GEMINI_API_KEY`）、Azure OpenAI（`AZURE_OPENAI_API_KEY`）与 AWS Bedrock（Converse + SigV4）提供商——文档中记录的 C1 Bedrock 兼容性缺口现已补齐，共 13 个提供商。
+> **v0.2（工具）：** 从最新上游移植 21 个工具——`x_search`、`feishu_doc_read`、`setup_beat`、`browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`、`computer_use`、`close_terminal`/`read_terminal`、`drive_preview`、`desktop_project`、`manage_connections`/`manage_catalog`，以及 7 个桌面 UI 桥接工具。审批引擎已加固（载荷提取、包装器解包、拒绝关机命令）。
 
 ---
 
@@ -22,7 +23,7 @@
 
 🧠 **自进化引擎** — 多臂老虎机模型选择、长任务规划、Prompt 与记忆自动塑形。用得越多，Agent 越聪明。
 
-🔌 **17 个平台 · 30+ 工具 · 8 个记忆后端** — Telegram、Discord、Slack、微信、钉钉、飞书、企业微信等 17 个平台。文件操作、浏览器、代码执行、视觉、语音、网页搜索、Home Assistant 等 30+ 工具。
+🔌 **17 个平台 · 70+ 工具 · 8 个记忆后端** — Telegram、Discord、Slack、微信、钉钉、飞书、企业微信等 17 个平台。文件操作、浏览器、代码执行、视觉、语音、网页搜索、Home Assistant 等 70+ 工具。
 
 ⚡ **真并发** — Rust tokio 运行时将工具调用分发到 OS 线程。30 秒的浏览器抓取不会阻塞 50ms 的文件读取。没有 GIL。
 
@@ -86,7 +87,7 @@ hermes-cli                    # 二进制入口、TUI、斜杠命令
 │   ├── hermes-core           # 共享类型、trait、错误层级
 │   ├── hermes-intelligence   # 模型路由、Prompt 构建、自进化
 │   └── hermes-config         # 配置加载、YAML/环境变量合并
-├── hermes-tools              # 30+ 工具后端、审批引擎
+├── hermes-tools              # 70+ 工具后端、审批引擎
 ├── hermes-gateway            # 17 个平台适配器、会话管理
 ├── hermes-environments       # 终端：Local/Docker/SSH/Daytona/Modal/Singularity
 ├── hermes-mcp                # Model Context Protocol 客户端/服务端
@@ -98,7 +99,7 @@ hermes-cli                    # 二进制入口、TUI、斜杠命令
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**核心 trait：** `LlmProvider`（13 个提供商）· `ToolHandler`（30+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
+**核心 trait：** `LlmProvider`（13 个提供商）· `ToolHandler`（70+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
 
 **工具调用解析器：** Hermes、Anthropic、OpenAI、Qwen、Llama、DeepSeek、Auto
 

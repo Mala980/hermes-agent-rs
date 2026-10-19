@@ -46,7 +46,7 @@ hermes-agent-rust/
 └── crates/
     ├── hermes-core/          # Shared types, traits, error hierarchy
     ├── hermes-agent/         # Agent loop, LLM providers, memory plugins, context
-    ├── hermes-tools/         # Tool registry, dispatch, 30 tool backends
+    ├── hermes-tools/         # Tool registry, dispatch, 70+ tool backends
     ├── hermes-gateway/       # Message gateway, 17 platform adapters
     ├── hermes-cli/           # CLI/TUI binary, slash commands, app state
     ├── hermes-config/        # Config loading, YAML/JSON/env merging, validation
@@ -72,7 +72,7 @@ hermes-cli (binary entry point)
 │   ├── hermes-core (types, traits, errors)
 │   ├── hermes-intelligence (routing, prompts, pricing)
 │   ├── hermes-config (config loading)
-├── hermes-tools (30 tool backends)
+├── hermes-tools (70+ tool backends)
 ├── hermes-gateway (17 platform adapters)
 │   └── hermes-core
 ├── hermes-server (REST/WS server)
@@ -100,7 +100,7 @@ trait LlmProvider: Send + Sync {
     fn chat_completion_stream(&self, ...) -> BoxStream<Result<StreamChunk, AgentError>>;
 }
 
-// Tool execution — 30 backends implement this
+// Tool execution — 70+ backends implement this
 trait ToolHandler: Send + Sync {
     async fn execute(&self, params: Value) -> Result<String, ToolError>;
     fn schema(&self) -> ToolSchema;
@@ -240,7 +240,7 @@ registry.register(
 
 `register_builtin_tools()` in `crates/hermes-tools/src/register_builtins.rs` — equivalent of `_discover_tools()` in the original codebase. Takes a `TerminalBackend` and `SkillProvider`, instantiates all handlers.
 
-### Tool Backends (30)
+### Tool Backends (70+)
 
 ```
 crates/hermes-tools/src/

@@ -13,6 +13,7 @@
 </div>
 
 > **v0.2:** 네이티브 Gemini(`GEMINI_API_KEY`), Azure OpenAI(`AZURE_OPENAI_API_KEY`), AWS Bedrock(Converse + SigV4) 프로바이더 추가 — 문서에 기록된 C1 Bedrock 패리티 갭이 해소되었습니다. 총 13개 프로바이더.
+> **v0.2(도구):** 최신 업스트림에서 21개 도구 포팅 — `x_search`, `feishu_doc_read`, `setup_beat`, `browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`, `computer_use`, `close_terminal`/`read_terminal`, `drive_preview`, `desktop_project`, `manage_connections`/`manage_catalog`, 7개 데스크톱 UI 브리지 도구 포함. 승인 엔진 강화(페이로드 추출, 래퍼 해제, 종료 명령 거부).
 
 ---
 
@@ -86,7 +87,7 @@ hermes-cli                    # 바이너리 진입점, TUI, 슬래시 명령
 │   ├── hermes-core           # 공유 타입, trait, 에러 계층
 │   ├── hermes-intelligence   # 모델 라우팅, 프롬프트 구축, 자기 진화
 │   └── hermes-config         # 설정 로딩, YAML/환경변수 병합
-├── hermes-tools              # 30개 이상의 도구 백엔드, 승인 엔진
+├── hermes-tools              # 70개 이상의 도구 백엔드, 승인 엔진
 ├── hermes-gateway            # 17개 플랫폼 어댑터, 세션 관리
 ├── hermes-environments       # 터미널: Local/Docker/SSH/Daytona/Modal/Singularity
 ├── hermes-mcp                # Model Context Protocol 클라이언트/서버
@@ -98,7 +99,7 @@ hermes-cli                    # 바이너리 진입점, TUI, 슬래시 명령
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**핵심 trait:** `LlmProvider` (13개 프로바이더) · `ToolHandler` (30개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
+**핵심 trait:** `LlmProvider` (13개 프로바이더) · `ToolHandler` (70개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
 
 **도구 호출 파서:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 

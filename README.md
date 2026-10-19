@@ -17,6 +17,7 @@ Rust rewrite of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by 
 > **v0.1 Status:** Core agent loop, 10 LLM providers, 30 tool backends, 17 platform adapters, memory system, and CLI/TUI are production-ready.
 >
 > **v0.2:** Native Gemini (`GEMINI_API_KEY`), Azure OpenAI (`AZURE_OPENAI_API_KEY`), and AWS Bedrock (Converse + SigV4) providers added — closing the documented C1 Bedrock parity gap. 13 providers total.
+> **v0.2 (tools):** 21 tools ported from the latest upstream — `x_search`, `feishu_doc_read`, `setup_beat`, `browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`, `computer_use`, `close_terminal`/`read_terminal`, `drive_preview`, `desktop_project`, `manage_connections`/`manage_catalog`, plus 7 desktop-UI bridge tools. Approval engine hardened (payload extraction, wrapper unwrapping, shutdown denied).
 
 ## Project Status
 
@@ -36,7 +37,7 @@ from `main` or use a release newer than `v0.1.1` for that fix.
 
 🧠 **Self-evolution engine** — Multi-armed bandit model selection, long-task planning, and prompt/memory shaping. The agent gets better the more you use it.
 
-🔌 **17 platforms, 30+ tools, 8 memory backends** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, and 11 more. File ops, browser, code execution, vision, voice, web search, Home Assistant, and beyond.
+🔌 **17 platforms, 70+ tools, 8 memory backends** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, and 11 more. File ops, browser, code execution, vision, voice, web search, Home Assistant, and beyond.
 
 ⚡ **True concurrency** — Rust's tokio runtime dispatches tool calls across OS threads. A 30-second browser scrape doesn't block a 50ms file read. No GIL.
 
@@ -115,7 +116,7 @@ hermes-agent-rs/
 │   ├── hermes-core             # Shared types, traits, error hierarchy
 │   ├── hermes-intelligence     # Model routing, prompt building, self-evolution
 │   ├── hermes-config           # Config loading, YAML/env merging
-│   ├── hermes-tools            # 30+ tool backends, approval engine
+│   ├── hermes-tools            # 70+ tool backends, approval engine
 │   ├── hermes-gateway          # 17 platform adapters, session management
 │   ├── hermes-server           # HTTP/WebSocket API server
 │   ├── hermes-runtime          # Unified runtime builder (server + gateway + cron)
@@ -134,7 +135,7 @@ hermes-agent-rs/
 └── scripts/                    # Install, CI, and convenience scripts
 ```
 
-**Key traits:** `LlmProvider` (13 providers) · `ToolHandler` (30+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
+**Key traits:** `LlmProvider` (13 providers) · `ToolHandler` (70+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
 
 **Tool call parsers:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 
