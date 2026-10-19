@@ -376,10 +376,16 @@ impl LlmProvider for StubProvider {
 #[cfg(test)]
 mod build_provider_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate process-global env vars (Rust runs tests
+    // in parallel by default; env vars are process-global).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bedrock_without_creds_falls_back_to_stub() {
         // Deterministic: no network involved.
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
         std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -407,6 +413,7 @@ mod build_provider_tests {
     #[test]
     fn bedrock_from_env_builds_real_provider() {
         // from_env is pure config parsing: no network involved.
+        let _guard = ENV_LOCK.lock().unwrap();
         let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
         let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
         let saved_region = std::env::var("AWS_REGION").ok();
