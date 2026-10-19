@@ -1,3 +1,4 @@
+#![allow(clippy::double_must_use)]
 //! # hermes-environments
 //!
 //! Terminal backend systems and environment management for Hermes Agent.

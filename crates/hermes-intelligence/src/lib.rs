@@ -4,7 +4,8 @@
     clippy::should_implement_trait,
     clippy::too_many_arguments,
     clippy::unnecessary_unwrap,
-    dead_code
+    dead_code,
+    clippy::double_must_use
 )]
 //! Hermes Intelligence Crate
 //!

@@ -1,3 +1,4 @@
+#![allow(clippy::double_must_use)]
 //! # hermes-core
 //!
 //! Foundation crate defining all shared types, traits, and error types

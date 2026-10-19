@@ -1,3 +1,4 @@
+#![allow(clippy::double_must_use)]
 pub mod in_process;
 pub mod messages;
 pub mod remote_agent_service;

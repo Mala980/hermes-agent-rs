@@ -3,7 +3,8 @@
     clippy::redundant_closure,
     clippy::trim_split_whitespace,
     clippy::unnecessary_map_or,
-    dropping_references
+    dropping_references,
+    clippy::double_must_use
 )]
 //! # hermes-cron
 //!
