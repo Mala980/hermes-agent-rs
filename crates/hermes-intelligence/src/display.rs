@@ -131,16 +131,14 @@ pub fn build_tool_preview(
     })?;
 
     let value = obj.get(key)?;
-    let text = if let Some(s) = value.as_str() {
-        s.to_string()
-    } else if let Some(arr) = value.as_array() {
-        arr.first()
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    } else {
-        return None;
-    };
+    let text: String = value.as_str().map(|s| s.to_string()).or_else(|| {
+        value.as_array().map(|arr| {
+            arr.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+    })?;
 
     let preview = oneline(&text);
     if preview.is_empty() {
