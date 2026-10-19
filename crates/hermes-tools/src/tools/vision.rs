@@ -75,6 +75,65 @@ impl ToolHandler for VisionAnalyzeHandler {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// VideoAnalyzeHandler
+// ---------------------------------------------------------------------------
+
+/// Tool for analyzing videos using multimodal video-capable models.
+pub struct VideoAnalyzeHandler {
+    backend: Arc<dyn VisionBackend>,
+}
+
+impl VideoAnalyzeHandler {
+    pub fn new(backend: Arc<dyn VisionBackend>) -> Self {
+        Self { backend }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for VideoAnalyzeHandler {
+    async fn execute(&self, params: Value) -> Result<String, ToolError> {
+        let video_url = params
+            .get("video_url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("Missing 'video_url' parameter".into()))?;
+
+        let question = params
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Describe this video.");
+
+        // Reuse the vision backend: video-capable models accept video URLs
+        // the same way (e.g. Gemini video understanding).
+        self.backend.analyze(video_url, question).await
+    }
+
+    fn schema(&self) -> ToolSchema {
+        let mut props = IndexMap::new();
+        props.insert(
+            "video_url".into(),
+            json!({
+                "type": "string",
+                "description": "Video URL (http/https) or local file path to analyze. Supports mp4, webm, mov, avi, mkv, mpeg."
+            }),
+        );
+        props.insert(
+            "question".into(),
+            json!({
+                "type": "string",
+                "description": "Question to ask about the video (default: 'Describe this video.')"
+            }),
+        );
+
+        tool_schema(
+            "video_analyze",
+            "Analyze a video from a URL or local file path using a multimodal AI model. Use this for video files — for images, use vision_analyze instead.",
+            JsonSchema::object(props, vec!["video_url".into()]),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

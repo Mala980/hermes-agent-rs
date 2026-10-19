@@ -119,21 +119,29 @@ pub fn register_builtin_tools(
 
     // -- Vision --------------------------------------------------------------
     {
-        let backend =
+        let backend: Arc<dyn crate::tools::vision::VisionBackend> = Arc::new(
             crate::backends::vision::OpenAiVisionBackend::from_env().unwrap_or_else(|_| {
                 crate::backends::vision::OpenAiVisionBackend::new(
                     String::new(),
                     "https://api.openai.com/v1".into(),
                     "gpt-4o".into(),
                 )
-            });
+            }),
+        );
         reg(
             registry,
             "vision",
-            Arc::new(crate::tools::vision::VisionAnalyzeHandler::new(Arc::new(
-                backend,
-            ))),
+            Arc::new(crate::tools::vision::VisionAnalyzeHandler::new(
+                backend.clone(),
+            )),
             "👁️",
+            vec!["OPENAI_API_KEY".into()],
+        );
+        reg(
+            registry,
+            "vision",
+            Arc::new(crate::tools::vision::VideoAnalyzeHandler::new(backend)),
+            "🎬",
             vec!["OPENAI_API_KEY".into()],
         );
     }
@@ -782,6 +790,13 @@ pub fn register_builtin_tools(
         "desktop_ui",
         Arc::new(crate::tools::desktop_ui::ReadWindowBelowHandler::new(None)),
         "🪟",
+        vec![],
+    );
+    reg(
+        registry,
+        "desktop_ui",
+        Arc::new(crate::tools::desktop_ui::ReactToMessageHandler::new(None)),
+        "❤️",
         vec![],
     );
 

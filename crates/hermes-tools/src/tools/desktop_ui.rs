@@ -808,6 +808,68 @@ impl ToolHandler for ReadWindowBelowHandler {
 }
 
 // ---------------------------------------------------------------------------
+// ReactToMessageHandler
+// ---------------------------------------------------------------------------
+
+/// React to a message with a single emoji (tapback), like in iMessage.
+pub struct ReactToMessageHandler {
+    bridge: Option<Arc<dyn DesktopUiBridge>>,
+}
+
+impl ReactToMessageHandler {
+    pub fn new(bridge: Option<Arc<dyn DesktopUiBridge>>) -> Self {
+        Self { bridge }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ReactToMessageHandler {
+    async fn execute(&self, params: Value) -> Result<String, ToolError> {
+        let emoji = params
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidParams("Missing 'emoji' parameter".into()))?;
+
+        let bridge = self
+            .bridge
+            .as_ref()
+            .ok_or_else(|| no_bridge("react_to_message"))?;
+        let mut call_params = json!({ "emoji": emoji });
+        if let Some(row_id) = params.get("message_row_id").and_then(|v| v.as_str()) {
+            call_params["message_row_id"] = json!(row_id);
+        }
+        let answer = bridge
+            .call("message.react", call_params)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to react to message: {e}")))?;
+        Ok(passthrough(answer))
+    }
+
+    fn schema(&self) -> ToolSchema {
+        let mut props = IndexMap::new();
+        props.insert(
+            "emoji".into(),
+            json!({
+                "type": "string",
+                "description": "Single emoji for the reaction",
+            }),
+        );
+        props.insert(
+            "message_row_id".into(),
+            json!({
+                "type": "string",
+                "description": "Row id of the message to react to. Defaults to the user's most recent message."
+            }),
+        );
+        tool_schema(
+            "react_to_message",
+            "React to a message with a single emoji, the way you'd tapback in iMessage. Reach for it when a reaction is what a person would do. If a reaction says it all, it can BE the reply. NEVER narrate or explain a reaction.",
+            JsonSchema::object(props, vec!["emoji".into()]),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (pure logic only — no bridge, no network)
 // ---------------------------------------------------------------------------
 
@@ -997,6 +1059,7 @@ mod tests {
         assert_eq!(SetThemeHandler::new(None).schema().name, "set_theme");
         assert_eq!(DesktopPreviewHandler::new(None).schema().name, "desktop_preview");
         assert_eq!(ReadWindowBelowHandler::new(None).schema().name, "read_window_below");
+        assert_eq!(ReactToMessageHandler::new(None).schema().name, "react_to_message");
     }
 
     #[test]
