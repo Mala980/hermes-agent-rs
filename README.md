@@ -23,8 +23,8 @@ Rust rewrite of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by 
 
 This repository is the Lumio Research Rust port of Hermes Agent. The reference
 implementation baseline is
-[`NousResearch/hermes-agent` `v2026.4.13`](https://github.com/NousResearch/hermes-agent/tree/v2026.4.13),
-resolved to commit `1af2e18d408a9dcc2c61d6fc1eef5c6667f8e254`.
+[`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent)
+at commit `8f5693af418256b89da17ddda18a9242f113dcf6` (2026-10-19, latest).
 
 The `main` branch includes OpenAI-compatible function tool payload normalization
 for strict providers such as DeepSeek, Moonshot/Kimi, SiliconFlow, and other
