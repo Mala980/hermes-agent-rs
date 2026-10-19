@@ -28,6 +28,7 @@ base64 = { workspace = true }
 serde_yaml = { workspace = true }
 rand = "0.8"
 url = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
