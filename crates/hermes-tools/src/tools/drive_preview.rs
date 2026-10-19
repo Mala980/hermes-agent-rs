@@ -19,8 +19,7 @@ use hermes_core::{tool_schema, JsonSchema, ToolError, ToolHandler, ToolSchema};
 
 /// Valid actions, in the reference implementation's order.
 pub const ACTIONS: &[&str] = &[
-    "elements", "click", "hover", "type", "scroll", "press", "strobe", "back", "forward",
-    "reload",
+    "elements", "click", "hover", "type", "scroll", "press", "strobe", "back", "forward", "reload",
 ];
 
 /// Valid `to` targets for `scroll`.
@@ -79,10 +78,7 @@ impl PreviewRequest {
         opt("submit", self.submit.map(Value::Bool));
         opt("full", self.full.map(Value::Bool));
         opt("to", self.to.clone().map(Value::String));
-        opt(
-            "allow_shortcut",
-            self.allow_shortcut.map(Value::Bool),
-        );
+        opt("allow_shortcut", self.allow_shortcut.map(Value::Bool));
         opt("amount", self.amount.map(|n| json!(n)));
         opt("max", self.max.map(|n| json!(n)));
         Value::Object(map)
@@ -119,7 +115,9 @@ pub fn validate_request(
         )));
     }
     if verb == "type" && text.is_none() {
-        return Err(ToolError::InvalidParams("type needs the text to enter.".into()));
+        return Err(ToolError::InvalidParams(
+            "type needs the text to enter.".into(),
+        ));
     }
     if verb == "press" && key.as_deref().map(str::is_empty).unwrap_or(true) {
         return Err(ToolError::InvalidParams(
@@ -137,10 +135,13 @@ pub fn validate_request(
     let parse_int = |v: Option<Value>, name: &str| -> Result<Option<i64>, ToolError> {
         match v {
             None | Some(Value::Null) => Ok(None),
-            Some(Value::Number(n)) => n.as_i64().ok_or_else(|| {
-                ToolError::InvalidParams(format!("{name} must be an integer."))
-            }).map(Some),
-            Some(_) => Err(ToolError::InvalidParams(format!("{name} must be an integer."))),
+            Some(Value::Number(n)) => n
+                .as_i64()
+                .ok_or_else(|| ToolError::InvalidParams(format!("{name} must be an integer.")))
+                .map(Some),
+            Some(_) => Err(ToolError::InvalidParams(format!(
+                "{name} must be an integer."
+            ))),
         }
     };
     let amount = parse_int(amount, "amount")?;
@@ -180,13 +181,28 @@ impl ToolHandler for DrivePreviewHandler {
     async fn execute(&self, params: Value) -> Result<String, ToolError> {
         let req = validate_request(
             params.get("action").and_then(|v| v.as_str()).unwrap_or(""),
-            params.get("ref").and_then(|v| v.as_str()).map(str::to_string),
-            params.get("selector").and_then(|v| v.as_str()).map(str::to_string),
-            params.get("text").and_then(|v| v.as_str()).map(str::to_string),
-            params.get("key").and_then(|v| v.as_str()).map(str::to_string),
+            params
+                .get("ref")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             params.get("submit").and_then(|v| v.as_bool()),
             params.get("amount").cloned(),
-            params.get("to").and_then(|v| v.as_str()).map(str::to_string),
+            params
+                .get("to")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             params.get("max").cloned(),
             params.get("full").and_then(|v| v.as_bool()),
             params.get("allow_shortcut").and_then(|v| v.as_bool()),
@@ -270,7 +286,9 @@ mod tests {
     use super::*;
 
     fn req(action: &str) -> Result<PreviewRequest, ToolError> {
-        validate_request(action, None, None, None, None, None, None, None, None, None, None)
+        validate_request(
+            action, None, None, None, None, None, None, None, None, None, None,
+        )
     }
 
     #[test]
@@ -283,7 +301,15 @@ mod tests {
         let r = validate_request(
             "  CLICK ",
             Some("btn-x".into()),
-            None, None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(r.action, "click");
@@ -293,7 +319,17 @@ mod tests {
     fn click_needs_ref_or_selector() {
         assert!(req("click").is_err());
         assert!(validate_request(
-            "click", None, Some("#x".into()), None, None, None, None, None, None, None, None
+            "click",
+            None,
+            Some("#x".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
         )
         .is_ok());
     }
@@ -301,7 +337,17 @@ mod tests {
     #[test]
     fn type_needs_text() {
         assert!(validate_request(
-            "type", Some("f".into()), None, None, None, None, None, None, None, None, None
+            "type",
+            Some("f".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
         )
         .is_err());
     }
@@ -309,7 +355,17 @@ mod tests {
     #[test]
     fn press_needs_key() {
         assert!(validate_request(
-            "press", Some("b".into()), None, None, None, None, None, None, None, None, None
+            "press",
+            Some("b".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
         )
         .is_err());
     }
@@ -317,11 +373,31 @@ mod tests {
     #[test]
     fn scroll_to_validated() {
         assert!(validate_request(
-            "scroll", None, None, None, None, None, None, Some("sideways".into()), None, None, None
+            "scroll",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("sideways".into()),
+            None,
+            None,
+            None
         )
         .is_err());
         assert!(validate_request(
-            "scroll", None, None, None, None, None, None, Some("top".into()), None, None, None
+            "scroll",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("top".into()),
+            None,
+            None,
+            None
         )
         .is_ok());
     }
@@ -329,7 +405,17 @@ mod tests {
     #[test]
     fn amount_must_be_integer() {
         assert!(validate_request(
-            "scroll", None, None, None, None, None, Some(json!("far")), None, None, None, None
+            "scroll",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(json!("far")),
+            None,
+            None,
+            None,
+            None
         )
         .is_err());
     }
@@ -345,6 +431,9 @@ mod tests {
 
     #[test]
     fn schema_name_matches_original() {
-        assert_eq!(DrivePreviewHandler::new(None).schema().name, "drive_preview");
+        assert_eq!(
+            DrivePreviewHandler::new(None).schema().name,
+            "drive_preview"
+        );
     }
 }

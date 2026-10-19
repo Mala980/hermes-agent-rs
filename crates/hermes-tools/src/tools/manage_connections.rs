@@ -57,8 +57,10 @@ pub fn normalize_targets(raw: Option<&Value>) -> Result<(Vec<HostedTarget>, Vec<
         let (name, is_mcp, alias, to) = match item {
             Value::Object(map) => {
                 let known = ["name", "mcp", "alias", "to"];
-                let unknown: Vec<&String> =
-                    map.keys().filter(|k| !known.contains(&k.as_str())).collect();
+                let unknown: Vec<&String> = map
+                    .keys()
+                    .filter(|k| !known.contains(&k.as_str()))
+                    .collect();
                 if !unknown.is_empty() {
                     return Err(format!(
                         "unknown target field(s) {}: a target is {{\"name\": \"<slug>\"}} or {{\"name\": \"<server>\", \"mcp\": true}}.",
@@ -95,11 +97,7 @@ pub fn normalize_targets(raw: Option<&Value>) -> Result<(Vec<HostedTarget>, Vec<
                 (name, is_mcp, alias, to)
             }
             Value::String(s) => (s.trim().to_lowercase(), false, None, None),
-            _ => {
-                return Err(
-                    "every target is a name string or a {name, mcp} object.".into(),
-                )
-            }
+            _ => return Err("every target is a name string or a {name, mcp} object.".into()),
         };
         if name.is_empty() {
             return Err("every target needs a non-empty 'name'.".into());
@@ -111,7 +109,10 @@ pub fn normalize_targets(raw: Option<&Value>) -> Result<(Vec<HostedTarget>, Vec<
             continue;
         }
         let target = HostedTarget { name, alias, to };
-        if !managed.iter().any(|t| t.name == target.name && t.alias == target.alias) {
+        if !managed
+            .iter()
+            .any(|t| t.name == target.name && t.alias == target.alias)
+        {
             managed.push(target);
         }
     }
@@ -120,11 +121,7 @@ pub fn normalize_targets(raw: Option<&Value>) -> Result<(Vec<HostedTarget>, Vec<
 
 /// Validate the action against the parsed targets.
 /// Mirrors `validate_action` in the reference implementation.
-pub fn validate_action(
-    action: &str,
-    managed: &[HostedTarget],
-    mcp: &[String],
-) -> Option<String> {
+pub fn validate_action(action: &str, managed: &[HostedTarget], mcp: &[String]) -> Option<String> {
     let all: Vec<&str> = CONNECTOR_ACTIONS
         .iter()
         .chain(MCP_ACTIONS.iter())
@@ -157,7 +154,9 @@ pub fn validate_action(
         ));
     }
     if action != "rename" && managed.iter().any(|t| t.to.is_some()) {
-        return Some("'to' is the new name of an account and applies to action rename only.".into());
+        return Some(
+            "'to' is the new name of an account and applies to action rename only.".into(),
+        );
     }
     None
 }
@@ -213,8 +212,8 @@ impl ToolHandler for ManageConnectionsHandler {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "status".to_string());
 
-        let (managed, mcp) = normalize_targets(params.get("connectors"))
-            .map_err(ToolError::InvalidParams)?;
+        let (managed, mcp) =
+            normalize_targets(params.get("connectors")).map_err(ToolError::InvalidParams)?;
         if let Some(err) = validate_action(&action, &managed, &mcp) {
             return Err(ToolError::InvalidParams(err));
         }
@@ -301,7 +300,9 @@ mod tests {
 
     #[test]
     fn normalize_rejects_alias_on_mcp() {
-        assert!(normalize_targets(Some(&json!([{"name": "x", "mcp": true, "alias": "a"}]))).is_err());
+        assert!(
+            normalize_targets(Some(&json!([{"name": "x", "mcp": true, "alias": "a"}]))).is_err()
+        );
     }
 
     #[test]
@@ -312,7 +313,11 @@ mod tests {
     #[test]
     fn validate_mcp_action_needs_mcp_targets() {
         // install with a hosted target -> error
-        let managed = vec![HostedTarget { name: "gmail".into(), alias: None, to: None }];
+        let managed = vec![HostedTarget {
+            name: "gmail".into(),
+            alias: None,
+            to: None,
+        }];
         assert!(validate_action("install", &managed, &[]).is_some());
         // install with no targets -> error
         assert!(validate_action("install", &[], &[]).is_some());
