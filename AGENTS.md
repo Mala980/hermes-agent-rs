@@ -491,9 +491,11 @@ on_delegation      — sub-agent delegation lineage
 ### ApprovalManager (hermes-tools/src/approval.rs)
 
 Three-tier command classification:
-- **Denied**: `rm -rf /`, `mkfs`, `dd of=/dev/`, `chmod 777` — blocked outright
+- **Denied**: `rm -rf /`, `mkfs`, `dd of=/dev/`, `chmod 777`, fork bombs, `shutdown`/`reboot`/`poweroff`/`halt`, `systemctl poweroff|reboot|halt` — blocked outright
 - **RequiresConfirmation**: `sudo`, `kill -9`, `docker rm`, `git push --force`, `curl | sh` — auto-approved in agent mode with warning log
 - **Approved**: everything else
+
+Hardened (Oct 2026, hermes-agent audit finding #1): before matching, the gate normalizes attached-quote flags, splits `;`/`&&`/`||`/`|` segments, recursively unwraps wrappers (`timeout`, `nice`, `env`, `sudo`/`su`, `eval`, …), and extracts hidden payloads (`sh -c`, `git -c` alias `!shell`, `find -exec`, `awk` `system()`, `su -c`). The most severe verdict across raw string, segments, unwrapped command and payloads wins.
 
 ### CredentialGuard (hermes-tools/src/credential_guard.rs)
 
