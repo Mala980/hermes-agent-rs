@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 use std::sync::Arc;
 
 use futures::stream::BoxStream;

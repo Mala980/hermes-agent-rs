@@ -3,7 +3,8 @@
     clippy::if_same_then_else,
     clippy::should_implement_trait,
     clippy::too_many_arguments,
-    dead_code
+    dead_code,
+    clippy::double_must_use
 )]
 //! # hermes-gateway
 //!

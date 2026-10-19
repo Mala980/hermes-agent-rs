@@ -72,10 +72,10 @@ pub fn merge_configs(yaml_config: &GatewayConfig, json_config: &GatewayConfig) -
     // Validate session reset policies
     let mut merged = merged;
     merged.session.reset_policy = merged.session.reset_policy.validate();
-    for (_platform, policy) in merged.session.platform_overrides.iter_mut() {
+    for policy in merged.session.platform_overrides.values_mut() {
         *policy = policy.validate();
     }
-    for (_stype, policy) in merged.session.session_type_overrides.iter_mut() {
+    for policy in merged.session.session_type_overrides.values_mut() {
         *policy = policy.validate();
     }
 

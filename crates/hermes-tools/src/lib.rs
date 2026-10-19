@@ -1,4 +1,5 @@
 #![allow(
+    clippy::double_must_use,
     clippy::field_reassign_with_default,
     clippy::manual_clamp,
     clippy::manual_strip,
