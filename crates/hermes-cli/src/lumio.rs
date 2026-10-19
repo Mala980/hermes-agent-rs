@@ -142,7 +142,7 @@ pub async fn login(open_browser: bool) -> LoginResult {
         lumio_base_url(),
         lumio_client_id(),
         urlencoding::encode(&redirect_uri),
-        &state,
+        state,
     );
 
     println!();
