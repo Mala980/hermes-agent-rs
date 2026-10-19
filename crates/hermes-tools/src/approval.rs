@@ -120,8 +120,7 @@ fn basename_of(token: &str) -> &str {
 /// Normalize attached-quote flags so `bash -c'payload'` is seen as
 /// `bash -c 'payload'` by the tokenizer.
 fn normalize_attached_quotes(cmd: &str) -> String {
-    static RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(-c|--command)(['"])"#).unwrap());
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(-c|--command)(['"])"#).unwrap());
     RE.replace_all(cmd, "$1 $2").into_owned()
 }
 
@@ -256,19 +255,32 @@ fn wrapper_value_opts(wrapper: &str) -> &'static [&'static str] {
         "ionice" => &["-c", "--class", "-n", "--classdata", "-p", "--pid"],
         "taskset" => &["-c", "--cpu-list", "-p", "--pid"],
         "xargs" => &[
-            "-a", "--arg-file", "-d", "--delimiter", "-I", "--replace", "-n", "--max-args", "-P",
-            "--max-procs", "-s", "--max-chars", "-E", "--eof",
+            "-a",
+            "--arg-file",
+            "-d",
+            "--delimiter",
+            "-I",
+            "--replace",
+            "-n",
+            "--max-args",
+            "-P",
+            "--max-procs",
+            "-s",
+            "--max-chars",
+            "-E",
+            "--eof",
         ],
         "flock" => &["-E", "--conflict-exit-code"],
-        "su" | "sudo" | "doas" | "runuser" => &["-u", "--user", "-g", "--group", "-C", "--close-from"],
+        "su" | "sudo" | "doas" | "runuser" => {
+            &["-u", "--user", "-g", "--group", "-C", "--close-from"]
+        }
         _ => &[],
     }
 }
 
 /// `timeout`-style duration argument: `10`, `5s`, `1.5m`, …
 fn is_duration(tok: &str) -> bool {
-    static RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^\d+(\.\d+)?[smhd]?$").unwrap());
+    static RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+(\.\d+)?[smhd]?$").unwrap());
     RE.is_match(tok)
 }
 
@@ -362,9 +374,8 @@ fn unwrap_wrappers(tokens: &[String]) -> (Vec<String>, Vec<String>, bool) {
 
 /// Extract `system("…")` / `os.system('…')` payloads from a code fragment.
 fn extract_system_payloads(code: &str) -> Vec<String> {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)(?:os\.|\b)system\s*\(\s*["']([^"']+)["']"#).unwrap()
-    });
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?i)(?:os\.|\b)system\s*\(\s*["']([^"']+)["']"#).unwrap());
     RE.captures_iter(code)
         .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
         .collect()
