@@ -12,6 +12,8 @@
 
 </div>
 
+> **v0.2:** ネイティブ Gemini（`GEMINI_API_KEY`）、Azure OpenAI（`AZURE_OPENAI_API_KEY`）、AWS Bedrock（Converse + SigV4）プロバイダを追加——ドキュメントに記載の C1 Bedrock パリティギャップを解消しました。合計 13 プロバイダ。
+
 ---
 
 ## なぜ Hermes？
@@ -96,7 +98,7 @@ hermes-cli                    # バイナリエントリポイント、TUI、ス
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**主要 trait：** `LlmProvider`（10 プロバイダ）· `ToolHandler`（30 以上のバックエンド）· `PlatformAdapter`（17 プラットフォーム）· `TerminalBackend`（6 バックエンド）· `MemoryProvider`（8 プラグイン）
+**主要 trait：** `LlmProvider`（13 プロバイダ）· `ToolHandler`（30 以上のバックエンド）· `PlatformAdapter`（17 プラットフォーム）· `TerminalBackend`（6 バックエンド）· `MemoryProvider`（8 プラグイン）
 
 **ツールコールパーサー：** Hermes、Anthropic、OpenAI、Qwen、Llama、DeepSeek、Auto
 

@@ -12,6 +12,8 @@
 
 </div>
 
+> **v0.2:** 네이티브 Gemini(`GEMINI_API_KEY`), Azure OpenAI(`AZURE_OPENAI_API_KEY`), AWS Bedrock(Converse + SigV4) 프로바이더 추가 — 문서에 기록된 C1 Bedrock 패리티 갭이 해소되었습니다. 총 13개 프로바이더.
+
 ---
 
 ## 왜 Hermes인가?
@@ -96,7 +98,7 @@ hermes-cli                    # 바이너리 진입점, TUI, 슬래시 명령
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**핵심 trait:** `LlmProvider` (10개 프로바이더) · `ToolHandler` (30개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
+**핵심 trait:** `LlmProvider` (13개 프로바이더) · `ToolHandler` (30개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
 
 **도구 호출 파서:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 

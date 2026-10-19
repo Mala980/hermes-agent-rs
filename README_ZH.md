@@ -12,6 +12,8 @@
 
 </div>
 
+> **v0.2：** 新增原生 Gemini（`GEMINI_API_KEY`）、Azure OpenAI（`AZURE_OPENAI_API_KEY`）与 AWS Bedrock（Converse + SigV4）提供商——文档中记录的 C1 Bedrock 兼容性缺口现已补齐，共 13 个提供商。
+
 ---
 
 ## 为什么选择 Hermes？
@@ -96,7 +98,7 @@ hermes-cli                    # 二进制入口、TUI、斜杠命令
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**核心 trait：** `LlmProvider`（10 个提供商）· `ToolHandler`（30+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
+**核心 trait：** `LlmProvider`（13 个提供商）· `ToolHandler`（30+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
 
 **工具调用解析器：** Hermes、Anthropic、OpenAI、Qwen、Llama、DeepSeek、Auto
 

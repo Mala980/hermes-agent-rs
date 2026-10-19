@@ -15,6 +15,8 @@ Rust rewrite of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by 
 ---
 
 > **v0.1 Status:** Core agent loop, 10 LLM providers, 30 tool backends, 17 platform adapters, memory system, and CLI/TUI are production-ready.
+>
+> **v0.2:** Native Gemini (`GEMINI_API_KEY`), Azure OpenAI (`AZURE_OPENAI_API_KEY`), and AWS Bedrock (Converse + SigV4) providers added — closing the documented C1 Bedrock parity gap. 13 providers total.
 
 ## Project Status
 
@@ -132,7 +134,7 @@ hermes-agent-rs/
 └── scripts/                    # Install, CI, and convenience scripts
 ```
 
-**Key traits:** `LlmProvider` (10 providers) · `ToolHandler` (30+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
+**Key traits:** `LlmProvider` (13 providers) · `ToolHandler` (30+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
 
 **Tool call parsers:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 
