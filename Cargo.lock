@@ -1301,6 +1301,7 @@ dependencies = [
  "hermes-config",
  "hermes-core",
  "indexmap",
+ "libc",
  "proptest",
  "rand 0.8.5",
  "regex",
