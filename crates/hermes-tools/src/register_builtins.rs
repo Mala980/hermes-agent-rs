@@ -412,7 +412,7 @@ pub fn register_builtin_tools(
         vec![],
     );
 
-    // -- Browser (10 tools) --------------------------------------------------
+    // -- Browser (14 tools) --------------------------------------------------
     {
         let browser_backend: Arc<dyn crate::tools::browser::BrowserBackend> =
             Arc::new(crate::backends::browser::AutoBrowserBackend::from_env());
@@ -501,11 +501,55 @@ pub fn register_builtin_tools(
             registry,
             "browser",
             Arc::new(crate::tools::browser::BrowserConsoleHandler::new(
-                browser_backend,
+                browser_backend.clone(),
             )),
             "🔧",
             vec![],
         );
+        reg(
+            registry,
+            "browser",
+            Arc::new(crate::tools::browser::BrowserCdpHandler::new(
+                browser_backend.clone(),
+            )),
+            "🔌",
+            vec![],
+        );
+        reg(
+            registry,
+            "browser",
+            Arc::new(crate::tools::browser::BrowserDialogHandler::new(
+                browser_backend.clone(),
+            )),
+            "💬",
+            vec![],
+        );
+        reg(
+            registry,
+            "browser",
+            Arc::new(crate::tools::browser::BrowserExecHandler::new(
+                browser_backend.clone(),
+            )),
+            "⚙️",
+            vec![],
+        );
+        {
+            let vault: Arc<dyn crate::tools::browser::VaultBackend> = Arc::new(
+                crate::tools::browser::FileVaultBackend::new(
+                    crate::tools::browser::FileVaultBackend::default_path(),
+                ),
+            );
+            reg(
+                registry,
+                "browser",
+                Arc::new(crate::tools::browser::BrowserVaultHandler::new(
+                    browser_backend,
+                    vault,
+                )),
+                "🔐",
+                vec![],
+            );
+        }
     }
 
     // -- Mixture of Agents ---------------------------------------------------
@@ -600,6 +644,92 @@ pub fn register_builtin_tools(
         "system",
         Arc::new(crate::tools::tool_result_storage::ToolResultStorageHandler::default()),
         "💾",
+        vec![],
+    );
+
+
+    // -- Ported from latest upstream (v0.2) ----------------------------------
+    reg(
+        registry,
+        "web",
+        Arc::new(crate::tools::x_search::XSearchHandler::new()),
+        "🐦",
+        vec!["XAI_API_KEY".to_string()],
+    );
+    reg(
+        registry,
+        "productivity",
+        Arc::new(crate::tools::feishu_doc::FeishuDocHandler::new()),
+        "📄",
+        vec!["FEISHU_APP_ID".to_string(), "FEISHU_APP_SECRET".to_string()],
+    );
+    reg(
+        registry,
+        "onboarding",
+        Arc::new(crate::tools::setup_beat::SetupBeatHandler::new()),
+        "🎛️",
+        vec![],
+    );
+    reg(
+        registry,
+        "computer_use",
+        Arc::new(crate::tools::computer_use::ComputerUseHandler::new()),
+        "🖥️",
+        vec![],
+    );
+    reg(
+        registry,
+        "terminal",
+        Arc::new(crate::tools::desktop_terminal::CloseTerminalHandler::new(None)),
+        "❌",
+        vec![],
+    );
+    reg(
+        registry,
+        "terminal",
+        Arc::new(crate::tools::desktop_terminal::ReadTerminalHandler::new(None)),
+        "📟",
+        vec![],
+    );
+    reg(
+        registry,
+        "productivity",
+        Arc::new(crate::tools::drive_preview::DrivePreviewHandler::new(None)),
+        "👁️",
+        vec![],
+    );
+    reg(
+        registry,
+        "productivity",
+        Arc::new(
+            crate::tools::desktop_project::DesktopProjectHandler::new(
+                crate::tools::desktop_project::ProjectStore::default_path(),
+                None,
+            ),
+        ),
+        "📁",
+        vec![],
+    );
+    {
+        let mcp_servers: Vec<crate::tools::manage_connections::LocalMcpServer> =
+            hermes_config::load_config(None)
+                .map(|cfg| cfg.mcp_servers.iter().map(crate::tools::manage_connections::LocalMcpServer::from).collect())
+                .unwrap_or_default();
+        reg(
+            registry,
+            "system",
+            Arc::new(crate::tools::manage_connections::ManageConnectionsHandler::new(
+                mcp_servers,
+            )),
+            "🔗",
+            vec![],
+        );
+    }
+    reg(
+        registry,
+        "system",
+        Arc::new(crate::tools::manage_catalog::ManageCatalogHandler::new()),
+        "📚",
         vec![],
     );
 
