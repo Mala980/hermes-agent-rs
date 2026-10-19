@@ -74,7 +74,10 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 pub fn classify_verdict(result: &Value) -> Value {
     let ok = result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let effect = result.get("effect").and_then(|v| v.as_str());
-    let verified = result.get("verified").and_then(|v| v.as_bool()).unwrap_or(false);
+    let verified = result
+        .get("verified")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let code = result.get("code").and_then(|v| v.as_str());
 
     if effect == Some("confirmed") || verified {
@@ -93,8 +96,12 @@ pub fn classify_verdict(result: &Value) -> Value {
         // rung of the delivery ladder can fix a target that drops events at the source —
         // the AX set_value path writes the value directly and bypasses event filtering.
         let meta = result.get("meta");
-        let delivered = meta.and_then(|m| m.get("delivered_chars")).and_then(|v| v.as_i64());
-        let requested = meta.and_then(|m| m.get("requested_chars")).and_then(|v| v.as_i64());
+        let delivered = meta
+            .and_then(|m| m.get("delivered_chars"))
+            .and_then(|v| v.as_i64());
+        let requested = meta
+            .and_then(|m| m.get("requested_chars"))
+            .and_then(|v| v.as_i64());
         if result.get("action").and_then(|v| v.as_str()) == Some("type")
             && code == Some("type_text_incomplete")
             && requested.unwrap_or(0) > 0
@@ -185,7 +192,10 @@ fn is_input_action(action: &str) -> bool {
 }
 
 fn get_str(params: &Value, key: &str) -> Option<String> {
-    params.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn get_int(params: &Value, key: &str) -> Option<i64> {
@@ -322,9 +332,8 @@ pub fn build_driver_call(action: &str, params: &Value) -> Result<(String, Value)
             "press_key"
         }
         "set_value" => {
-            let value = get_str(params, "value").ok_or_else(|| {
-                ToolError::InvalidParams("set_value requires `value`.".into())
-            })?;
+            let value = get_str(params, "value")
+                .ok_or_else(|| ToolError::InvalidParams("set_value requires `value`.".into()))?;
             args["value"] = json!(value);
             if let Some(el) = get_int(params, "element") {
                 args["element_index"] = json!(el);
@@ -332,9 +341,8 @@ pub fn build_driver_call(action: &str, params: &Value) -> Result<(String, Value)
             "set_value"
         }
         "focus_app" => {
-            let app = get_str(params, "app").ok_or_else(|| {
-                ToolError::InvalidParams("focus_app requires `app`.".into())
-            })?;
+            let app = get_str(params, "app")
+                .ok_or_else(|| ToolError::InvalidParams("focus_app requires `app`.".into()))?;
             args["app"] = json!(app);
             args["raise_window"] = json!(get_bool(params, "raise_window"));
             "focus_app"
@@ -349,7 +357,12 @@ pub fn build_driver_call(action: &str, params: &Value) -> Result<(String, Value)
             let hint = ACTION_SUGGESTIONS
                 .iter()
                 .find(|(k, _)| *k == other)
-                .map(|(_, v)| format!(" — did you mean '{}'? See the action enum in the tool schema.", v))
+                .map(|(_, v)| {
+                    format!(
+                        " — did you mean '{}'? See the action enum in the tool schema.",
+                        v
+                    )
+                })
                 .unwrap_or_default();
             return Err(ToolError::InvalidParams(format!(
                 "unknown action '{}'{}",
@@ -408,8 +421,9 @@ impl ComputerUseHandler {
     /// Run `cua-driver call <tool> <json-args>` and parse stdout as JSON.
     async fn call_driver(&self, tool: &str, args: &Value) -> Result<Value, ToolError> {
         let driver = self.driver()?;
-        let args_str = serde_json::to_string(args)
-            .map_err(|e| ToolError::InvalidParams(format!("failed to encode driver args: {}", e)))?;
+        let args_str = serde_json::to_string(args).map_err(|e| {
+            ToolError::InvalidParams(format!("failed to encode driver args: {}", e))
+        })?;
 
         let output = tokio::time::timeout(Duration::from_secs(DRIVER_TIMEOUT_SECS), async {
             tokio::process::Command::new(driver)
@@ -427,7 +441,14 @@ impl ComputerUseHandler {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim().lines().last().unwrap_or("").chars().take(300).collect::<String>();
+            let detail = stderr
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("")
+                .chars()
+                .take(300)
+                .collect::<String>();
             return Err(ToolError::ExecutionFailed(format!(
                 "cua-driver call {} failed (exit {}): {}",
                 tool,
@@ -449,9 +470,23 @@ impl ComputerUseHandler {
             "action": action,
         });
         // Pass through the driver's semantic fields when present.
-        for key in ["message", "verified", "effect", "escalation", "path", "degraded",
-                    "delivery_mode", "code", "meta", "apps", "windows", "elements",
-                    "image_base64", "image_mime_type", "screenshot_path"] {
+        for key in [
+            "message",
+            "verified",
+            "effect",
+            "escalation",
+            "path",
+            "degraded",
+            "delivery_mode",
+            "code",
+            "meta",
+            "apps",
+            "windows",
+            "elements",
+            "image_base64",
+            "image_mime_type",
+            "screenshot_path",
+        ] {
             if let Some(v) = result.get(key) {
                 if !v.is_null() {
                     out[key] = v.clone();
@@ -716,15 +751,21 @@ mod tests {
         assert_eq!(args["button"], json!("left"));
         assert_eq!(args["element_index"], json!(2));
 
-        let (tool, args) =
-            build_driver_call("right_click", &json!({"action": "right_click", "coordinate": [10, 20]})).unwrap();
+        let (tool, args) = build_driver_call(
+            "right_click",
+            &json!({"action": "right_click", "coordinate": [10, 20]}),
+        )
+        .unwrap();
         assert_eq!(tool, "click");
         assert_eq!(args["button"], json!("right"));
         assert_eq!(args["x"], json!(10));
         assert_eq!(args["y"], json!(20));
 
-        let (tool, _) =
-            build_driver_call("double_click", &json!({"action": "double_click", "element": 1})).unwrap();
+        let (tool, _) = build_driver_call(
+            "double_click",
+            &json!({"action": "double_click", "element": 1}),
+        )
+        .unwrap();
         assert_eq!(tool, "double_click");
     }
 
@@ -736,11 +777,8 @@ mod tests {
 
     #[test]
     fn test_drag_requires_both_ends() {
-        let err = build_driver_call(
-            "drag",
-            &json!({"action": "drag", "from_element": 1}),
-        )
-        .unwrap_err();
+        let err =
+            build_driver_call("drag", &json!({"action": "drag", "from_element": 1})).unwrap_err();
         assert!(matches!(err, ToolError::InvalidParams(_)));
 
         let (tool, args) = build_driver_call(
@@ -777,8 +815,11 @@ mod tests {
         assert_eq!(args["bring_to_front"], json!(true));
 
         // Read actions must NOT leak delivery kwargs.
-        let (_, args) =
-            build_driver_call("capture", &json!({"action": "capture", "delivery_mode": "foreground"})).unwrap();
+        let (_, args) = build_driver_call(
+            "capture",
+            &json!({"action": "capture", "delivery_mode": "foreground"}),
+        )
+        .unwrap();
         assert!(args.get("delivery_mode").is_none());
     }
 
