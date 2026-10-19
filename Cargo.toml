@@ -64,6 +64,10 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 tokio-tungstenite = "0.24"
 eventsource-stream = "0.2"
 
+# Crypto (AWS SigV4 signing for Bedrock)
+hmac = "0.12"
+sha2 = "0.10"
+
 # Error handling & logging
 thiserror = "2"
 tracing = "0.1"

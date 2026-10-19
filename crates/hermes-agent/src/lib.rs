@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod plugins;
 pub mod provider;
 pub mod providers_extra;
+pub mod providers_native;
 pub mod python_alignment;
 pub mod rate_limit;
 pub mod reasoning;

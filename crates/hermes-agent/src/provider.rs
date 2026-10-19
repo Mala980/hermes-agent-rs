@@ -317,7 +317,7 @@ impl GenericProvider {
             .unwrap_or(false)
     }
 
-    fn sanitize_messages_for_strict_api(messages: &[Message], enabled: bool) -> Value {
+    pub(crate) fn sanitize_messages_for_strict_api(messages: &[Message], enabled: bool) -> Value {
         let mut out = Vec::with_capacity(messages.len());
         for msg in messages {
             let mut api_msg = serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({}));
@@ -1629,7 +1629,7 @@ impl LlmProvider for OpenRouterProvider {
 // ---------------------------------------------------------------------------
 
 /// Parse a single SSE data JSON object into a StreamChunk (OpenAI format).
-fn parse_sse_chunk(json: &Value) -> Option<StreamChunk> {
+pub(crate) fn parse_sse_chunk(json: &Value) -> Option<StreamChunk> {
     let choices = json.get("choices").and_then(|c| c.as_array())?;
     let choice = choices.first()?;
 
@@ -1710,7 +1710,7 @@ fn parse_sse_chunk(json: &Value) -> Option<StreamChunk> {
 // ---------------------------------------------------------------------------
 
 /// Parse an OpenAI-style chat completion response.
-fn parse_openai_response(json: &Value) -> Result<LlmResponse, AgentError> {
+pub(crate) fn parse_openai_response(json: &Value) -> Result<LlmResponse, AgentError> {
     let choices = json
         .get("choices")
         .and_then(|c| c.as_array())

@@ -22,6 +22,7 @@ use crate::provider::{AnthropicProvider, GenericProvider, OpenAiProvider, OpenRo
 use crate::providers_extra::{
     CopilotProvider, KimiProvider, MiniMaxProvider, NousProvider, QwenProvider,
 };
+use crate::providers_native::{AzureOpenAiProvider, BedrockProvider, GeminiProvider};
 use crate::AgentConfig;
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,11 @@ pub fn bridge_tool_registry(tools: &ToolRegistry) -> AgentToolRegistry {
 /// Resolve an API key / token for a named LLM provider from well-known
 /// environment variables.
 pub fn provider_api_key_from_env(provider: &str) -> Option<String> {
+    // Gemini accepts two env var names; Bedrock uses the standard AWS vars and
+    // is handled separately in `build_provider`.
+    if provider == "gemini" {
+        return GeminiProvider::api_key_from_env();
+    }
     let var = match provider {
         "openai" => "OPENAI_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
@@ -139,9 +145,32 @@ pub fn provider_api_key_from_env(provider: &str) -> Option<String> {
         "minimax" => "MINIMAX_API_KEY",
         "nous" => "NOUS_API_KEY",
         "copilot" => "GITHUB_COPILOT_TOKEN",
+        "azure" => "AZURE_OPENAI_API_KEY",
         _ => return None,
     };
     std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+/// Parse an Azure OpenAI target from a model string.
+///
+/// Accepted model-string form: `azure:<resource>/<deployment>[/<model>]`.
+/// Falls back to `AZURE_OPENAI_RESOURCE` / `AZURE_OPENAI_DEPLOYMENT` env vars.
+/// Returns `(resource, deployment, model_label)`.
+fn parse_azure_target(model_name: &str) -> Option<(String, String, String)> {
+    let mut parts = model_name.splitn(3, '/');
+    let resource = parts.next().filter(|s| !s.is_empty());
+    let deployment = parts.next().filter(|s| !s.is_empty());
+    match (resource, deployment) {
+        (Some(r), Some(d)) => {
+            let label = parts.next().filter(|s| !s.is_empty()).unwrap_or(d);
+            Some((r.to_string(), d.to_string(), label.to_string()))
+        }
+        _ => {
+            let r = AzureOpenAiProvider::resource_from_env()?;
+            let d = AzureOpenAiProvider::deployment_from_env()?;
+            Some((r, d.clone(), d))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,16 +183,21 @@ pub fn provider_api_key_from_env(provider: &str) -> Option<String> {
 pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvider> {
     let (provider_name, model_name) = parse_model_string(model);
 
-    // AWS Bedrock / Converse + SigV4 is not implemented (Python v0.11.0 parity gap).
-    // Do not silently route to [`GenericProvider`] against an OpenAI-compatible URL.
+    // AWS Bedrock: credentials come from the standard AWS env vars
+    // (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION), not a single
+    // API key, so it is resolved before the generic key lookup below.
     if provider_name == "bedrock" {
-        tracing::warn!(
-            model = %model,
-            "build_provider: AWS Bedrock is not implemented in hermes-agent-rust; see deploy/PARITY_MODULE_C.md (C1)"
-        );
-        return Arc::new(BedrockUnsupportedProvider {
-            model: model.to_string(),
-        });
+        match BedrockProvider::from_env(model_name) {
+            Ok(p) => return Arc::new(p),
+            Err(e) => {
+                tracing::warn!(
+                    "Bedrock credentials not configured ({e}); falling back to StubProvider"
+                );
+                return Arc::new(StubProvider {
+                    model: model.to_string(),
+                });
+            }
+        }
     }
 
     let provider_config = config.llm_providers.get(provider_name);
@@ -253,55 +287,42 @@ pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvide
             let url = base_url.unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
             Arc::new(GenericProvider::new(url, &api_key, model_name))
         }
+        "gemini" => {
+            let mut p = GeminiProvider::new(&api_key).with_model(model_name);
+            if let Some(url) = base_url {
+                p = p.with_base_url(url);
+            }
+            Arc::new(p)
+        }
+        "azure" => match parse_azure_target(model_name) {
+            Some((resource, deployment, label)) => {
+                let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
+                    .unwrap_or_else(|_| "2024-12-01-preview".to_string());
+                let p = AzureOpenAiProvider::with_api_version(
+                    &api_key,
+                    resource,
+                    deployment,
+                    api_version,
+                )
+                .with_model(label);
+                Arc::new(p)
+            }
+            None => {
+                tracing::warn!(
+                    "Azure OpenAI needs resource/deployment \
+                     (model 'azure:<resource>/<deployment>' or \
+                     AZURE_OPENAI_RESOURCE/AZURE_OPENAI_DEPLOYMENT); \
+                     falling back to StubProvider"
+                );
+                Arc::new(StubProvider {
+                    model: model.to_string(),
+                })
+            }
+        },
         _ => {
             let url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
             Arc::new(GenericProvider::new(url, &api_key, model_name))
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BedrockUnsupportedProvider — explicit parity gap (module C1)
-// ---------------------------------------------------------------------------
-
-/// Placeholder when the model string uses `bedrock:…` — Converse/SigV4 not wired.
-pub struct BedrockUnsupportedProvider {
-    pub model: String,
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for BedrockUnsupportedProvider {
-    async fn chat_completion(
-        &self,
-        _messages: &[hermes_core::Message],
-        _tools: &[hermes_core::ToolSchema],
-        _max_tokens: Option<u32>,
-        _temperature: Option<f64>,
-        _model: Option<&str>,
-        _extra_body: Option<&Value>,
-    ) -> Result<hermes_core::LlmResponse, AgentError> {
-        Err(AgentError::LlmApi(format!(
-            "AWS Bedrock is not implemented in hermes-agent-rust (Python parity gap). \
-             Model '{}'. See deploy/PARITY_MODULE_C.md (C1).",
-            self.model
-        )))
-    }
-
-    fn chat_completion_stream(
-        &self,
-        _messages: &[hermes_core::Message],
-        _tools: &[hermes_core::ToolSchema],
-        _max_tokens: Option<u32>,
-        _temperature: Option<f64>,
-        _model: Option<&str>,
-        _extra_body: Option<&Value>,
-    ) -> futures::stream::BoxStream<'static, Result<hermes_core::StreamChunk, AgentError>> {
-        futures::stream::once(async move {
-            Err(AgentError::LlmApi(
-                "AWS Bedrock streaming is not implemented in hermes-agent-rust.".to_string(),
-            ))
-        })
-        .boxed()
     }
 }
 
@@ -357,17 +378,125 @@ mod build_provider_tests {
     use super::*;
 
     #[test]
-    fn bedrock_provider_is_explicit_gap() {
+    fn bedrock_without_creds_falls_back_to_stub() {
+        // Deterministic: no network involved.
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
         let cfg = GatewayConfig::default();
         let p = build_provider(&cfg, "bedrock:us.anthropic.claude-3-5-sonnet-20241022-v2:0");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let err = rt
             .block_on(async { p.chat_completion(&[], &[], None, None, None, None).await })
-            .expect_err("bedrock should error");
+            .expect_err("bedrock without creds should error");
+        assert!(
+            err.to_string().contains("StubProvider"),
+            "unexpected: {err}"
+        );
+
+        if let Some(k) = saved_key {
+            std::env::set_var("AWS_ACCESS_KEY_ID", k);
+        }
+        if let Some(s) = saved_secret {
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", s);
+        }
+    }
+
+    #[test]
+    fn bedrock_from_env_builds_real_provider() {
+        // from_env is pure config parsing: no network involved.
+        let saved_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let saved_secret = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let saved_region = std::env::var("AWS_REGION").ok();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret");
+        std::env::set_var("AWS_REGION", "eu-west-1");
+
+        let p = BedrockProvider::from_env("anthropic.claude-3-7-sonnet-20250219-v1:0")
+            .expect("from_env should succeed");
+        assert_eq!(p.region, "eu-west-1");
+
+        // And build_provider must route to it instead of the old gap placeholder.
+        let cfg = GatewayConfig::default();
+        let p = build_provider(&cfg, "bedrock:anthropic.claude-3-7-sonnet-20250219-v1:0");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // The real provider attempts a signed HTTPS request; without network it
+        // fails with a Bedrock transport error — never "not implemented".
+        let err = rt
+            .block_on(async { p.chat_completion(&[], &[], None, None, None, None).await })
+            .expect_err("no network in test");
         let s = err.to_string();
         assert!(
-            s.contains("Bedrock") || s.contains("bedrock"),
+            s.contains("Bedrock") && !s.contains("not implemented"),
             "unexpected: {s}"
         );
+
+        match saved_key {
+            Some(k) => std::env::set_var("AWS_ACCESS_KEY_ID", k),
+            None => std::env::remove_var("AWS_ACCESS_KEY_ID"),
+        }
+        match saved_secret {
+            Some(s) => std::env::set_var("AWS_SECRET_ACCESS_KEY", s),
+            None => std::env::remove_var("AWS_SECRET_ACCESS_KEY"),
+        }
+        match saved_region {
+            Some(r) => std::env::set_var("AWS_REGION", r),
+            None => std::env::remove_var("AWS_REGION"),
+        }
+    }
+
+    #[test]
+    fn azure_target_parsing() {
+        // Model-string form wins.
+        let (r, d, m) = parse_azure_target("myres/mydep/gpt-4o").unwrap();
+        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("myres", "mydep", "gpt-4o"));
+        // Deployment doubles as the model label when omitted.
+        let (r, d, m) = parse_azure_target("myres/mydep").unwrap();
+        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("myres", "mydep", "mydep"));
+
+        // Env fallback.
+        let saved_r = std::env::var("AZURE_OPENAI_RESOURCE").ok();
+        let saved_d = std::env::var("AZURE_OPENAI_DEPLOYMENT").ok();
+        std::env::set_var("AZURE_OPENAI_RESOURCE", "envres");
+        std::env::set_var("AZURE_OPENAI_DEPLOYMENT", "envdep");
+        let (r, d, m) = parse_azure_target("").unwrap();
+        assert_eq!((r.as_str(), d.as_str(), m.as_str()), ("envres", "envdep", "envdep"));
+        std::env::remove_var("AZURE_OPENAI_RESOURCE");
+        std::env::remove_var("AZURE_OPENAI_DEPLOYMENT");
+        assert!(parse_azure_target("").is_none());
+        match saved_r {
+            Some(v) => std::env::set_var("AZURE_OPENAI_RESOURCE", v),
+            None => std::env::remove_var("AZURE_OPENAI_RESOURCE"),
+        }
+        match saved_d {
+            Some(v) => std::env::set_var("AZURE_OPENAI_DEPLOYMENT", v),
+            None => std::env::remove_var("AZURE_OPENAI_DEPLOYMENT"),
+        }
+    }
+
+    #[test]
+    fn provider_api_key_from_env_covers_new_providers() {
+        let saved_g = std::env::var("GEMINI_API_KEY").ok();
+        let saved_a = std::env::var("AZURE_OPENAI_API_KEY").ok();
+        std::env::set_var("GEMINI_API_KEY", "g-key");
+        std::env::set_var("AZURE_OPENAI_API_KEY", "a-key");
+        assert_eq!(
+            provider_api_key_from_env("gemini").as_deref(),
+            Some("g-key")
+        );
+        assert_eq!(
+            provider_api_key_from_env("azure").as_deref(),
+            Some("a-key")
+        );
+        match saved_g {
+            Some(v) => std::env::set_var("GEMINI_API_KEY", v),
+            None => std::env::remove_var("GEMINI_API_KEY"),
+        }
+        match saved_a {
+            Some(v) => std::env::set_var("AZURE_OPENAI_API_KEY", v),
+            None => std::env::remove_var("AZURE_OPENAI_API_KEY"),
+        }
     }
 }
