@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
@@ -26,7 +26,7 @@ jobs:
         run: bash scripts/ci/keypath-e2e.sh
 
   cross-build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: release-smoke
     strategy:
       matrix:
@@ -45,7 +45,7 @@ jobs:
             binary: hermes.exe
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
@@ -85,7 +85,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -105,11 +105,11 @@ jobs:
           files: ${{ matrix.artifact }}
 
   publish-installers:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [cross-build, macos-build]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Generate Homebrew formula
         run: bash scripts/generate-homebrew-formula.sh "${GITHUB_REF_NAME}"
       - name: Upload helper scripts
