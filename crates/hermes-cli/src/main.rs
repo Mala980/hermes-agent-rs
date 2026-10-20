@@ -27,11 +27,9 @@ use hermes_core::AgentError;
 #[cfg(test)]
 use hermes_core::PlatformAdapter;
 use hermes_cron::{cron_scheduler_for_data_dir, CronError};
-#[cfg(test)]
 use hermes_gateway::Gateway;
 use hermes_telemetry::init_telemetry_from_env;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::Arc;
 
 mod oauth_store;
@@ -474,6 +472,43 @@ fn gateway_pid_terminate(_pid: u32) -> std::io::Result<()> {
     ))
 }
 
+/// Sidecar: forward cron completion events to every URL in `webhooks.json`.
+async fn run_cron_webhook_delivery_loop(
+    mut rx: tokio::sync::broadcast::Receiver<hermes_cron::CronCompletionEvent>,
+    webhooks_json: PathBuf,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let client = match hermes_cli::webhook_delivery::webhook_http_client() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("cron webhooks: HTTP client build failed: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let ev = match rx.recv().await {
+            Ok(ev) => ev,
+            Err(RecvError::Lagged(n)) => {
+                tracing::debug!(n, "cron webhook receiver lagged; skipped messages");
+                continue;
+            }
+            Err(RecvError::Closed) => break,
+        };
+
+        if let Err(e) = hermes_cli::webhook_delivery::deliver_cron_completion_to_webhooks(
+            &webhooks_json,
+            &ev,
+            &client,
+        )
+        .await
+        {
+            tracing::warn!("cron webhook delivery: {e}");
+        }
+    }
+}
+
 /// Handle `hermes gateway [action]`.
 async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError> {
     let config =
@@ -485,7 +520,31 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
         }
         None | Some("start") => {
             println!("Starting Hermes Gateway...");
-            println!("Gateway start in engine mode uses `hermes serve` pipeline.");
+
+            // List enabled platforms
+            let enabled: Vec<&String> = config
+                .platforms
+                .iter()
+                .filter(|(_, pc)| pc.enabled)
+                .map(|(name, _)| name)
+                .collect();
+
+            if enabled.is_empty() {
+                println!(
+                    "Note: no chat platforms enabled in config.yaml — gateway still runs cron + HTTP webhooks."
+                );
+            }
+            let requirement_issues = hermes_gateway::gateway_requirement_issues(&config);
+            if !requirement_issues.is_empty() {
+                let mut msg = String::from("Gateway requirement check failed:\n");
+                for issue in requirement_issues {
+                    msg.push_str("  - ");
+                    msg.push_str(&issue);
+                    msg.push('\n');
+                }
+                return Err(AgentError::Config(msg));
+            }
+
             let pid_path = gateway_pid_path_for_cli(&cli);
             if let Some(pid) = read_gateway_pid(&pid_path) {
                 if gateway_pid_is_alive(pid) {
@@ -498,17 +557,168 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
                 }
                 let _ = std::fs::remove_file(&pid_path);
             }
-            if let Some(parent) = pid_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            std::fs::write(&pid_path, format!("{}\n", std::process::id()))
-                .map_err(|e| AgentError::Io(format!("failed to write PID file: {}", e)))?;
 
-            println!("RuntimeBuilder is not enabled in engine-only mode.");
-            println!("Use `hermes serve start` to run API + gateway together.");
-            let res = Ok(());
+            if !enabled.is_empty() {
+                println!(
+                    "Enabled platforms: {}",
+                    enabled
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+
+            // Build the gateway runtime (session manager, DM policy, hooks).
+            let session_manager =
+                Arc::new(hermes_gateway::SessionManager::new(config.session.clone()));
+            let dm_manager = hermes_gateway::DmManager::with_pair_behavior();
+            let gateway = Arc::new(Gateway::new(
+                session_manager,
+                dm_manager,
+                hermes_gateway::gateway::GatewayConfig::default(),
+            ));
+            let mut hook_registry = hermes_gateway::hooks::HookRegistry::new();
+            hook_registry.register_builtins();
+            hook_registry.discover_and_load(&hermes_home().join("hooks"));
+            hook_registry.set_execution_limits(Some(16));
+            gateway.set_hook_registry(Arc::new(hook_registry)).await;
+            let enabled_refs: Vec<&str> = enabled.iter().map(|s| s.as_str()).collect();
+            gateway
+                .emit_hook_event(
+                    "gateway:startup",
+                    hermes_gateway::hook_payloads::gateway_startup(&enabled_refs),
+                )
+                .await;
+
+            // Tool registry shared by the gateway agent and the cron runner.
+            let tool_registry = Arc::new(hermes_tools::ToolRegistry::new());
+            let terminal_backend: Arc<dyn hermes_core::TerminalBackend> =
+                Arc::new(hermes_environments::LocalBackend::default());
+            let skill_store = Arc::new(hermes_skills::FileSkillStore::new(
+                hermes_skills::FileSkillStore::default_dir(),
+            ));
+            let skill_provider: Arc<dyn hermes_core::SkillProvider> =
+                Arc::new(hermes_skills::SkillManager::new(skill_store));
+            hermes_tools::register_builtin_tools(&tool_registry, terminal_backend, skill_provider);
+            let agent_tools = Arc::new(hermes_agent::agent_builder::bridge_tool_registry(
+                &tool_registry,
+            ));
+
+            // Incoming chat messages run through the agent loop.
+            let config_arc = Arc::new(config.clone());
+            let handler_tools = agent_tools.clone();
+            gateway
+                .set_message_handler_with_context(Arc::new(move |messages, ctx| {
+                    let config = config_arc.clone();
+                    let agent_tools = handler_tools.clone();
+                    Box::pin(async move {
+                        let model = ctx
+                            .model
+                            .clone()
+                            .or_else(|| config.model.clone())
+                            .unwrap_or_else(|| "gpt-4o".to_string());
+                        let provider = hermes_agent::agent_builder::build_provider(&config, &model);
+                        let mut agent_config = hermes_agent::AgentConfig::default();
+                        agent_config.model = model;
+                        let schemas = agent_tools.schemas();
+                        let agent_loop =
+                            hermes_agent::AgentLoop::new(agent_config, agent_tools, provider);
+                        let result = agent_loop
+                            .run(messages, Some(schemas))
+                            .await
+                            .map_err(|e| hermes_core::GatewayError::Platform(e.to_string()))?;
+                        let reply = result
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| matches!(m.role, hermes_core::MessageRole::Assistant))
+                            .and_then(|m| m.content.clone())
+                            .unwrap_or_default();
+                        Ok(reply)
+                    })
+                }))
+                .await;
+
+            // Cron: same on-disk dir as `hermes cron`, with the gateway's LLM/tools.
+            let cron_dir = hermes_state_root(&cli).join("cron");
+            std::fs::create_dir_all(&cron_dir)
+                .map_err(|e| AgentError::Io(format!("cron dir {}: {}", cron_dir.display(), e)))?;
+            let default_model = config.model.clone().unwrap_or_else(|| "gpt-4o".to_string());
+            let cron_persistence =
+                Arc::new(hermes_cron::FileJobPersistence::with_dir(cron_dir.clone()));
+            let cron_llm = hermes_agent::agent_builder::build_provider(&config, &default_model);
+            let cron_runner = Arc::new(hermes_cron::CronRunner::new(cron_llm, agent_tools.clone()));
+            let mut cron_scheduler = hermes_cron::CronScheduler::new(cron_persistence, cron_runner);
+            let (cron_tx, cron_rx) =
+                tokio::sync::broadcast::channel::<hermes_cron::CronCompletionEvent>(64);
+            cron_scheduler.set_completion_broadcast(cron_tx);
+            cron_scheduler
+                .load_persisted_jobs()
+                .await
+                .map_err(|e| AgentError::Config(format!("cron load: {e}")))?;
+            cron_scheduler.start().await;
+            let cron_scheduler = Arc::new(cron_scheduler);
+            let webhooks_path = hermes_state_root(&cli).join("webhooks.json");
+            println!(
+                "Cron jobs: {}  |  Webhook registry: {}",
+                cron_dir.display(),
+                webhooks_path.display()
+            );
+
+            let mut sidecar_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            sidecar_tasks.push(tokio::spawn(run_cron_webhook_delivery_loop(
+                cron_rx,
+                webhooks_path,
+            )));
+
+            register_gateway_adapters(&config, gateway.clone(), &mut sidecar_tasks).await?;
+
+            if gateway.adapter_names().await.is_empty() {
+                if enabled.is_empty() {
+                    println!("No chat adapters enabled; cron + webhooks still active.");
+                } else {
+                    return Err(AgentError::Config(
+                        "Gateway startup failed: platforms are enabled but no adapters registered."
+                            .to_string(),
+                    ));
+                }
+            }
+
+            gateway.start_all().await?;
+            {
+                let gw_reconnect = gateway.clone();
+                sidecar_tasks.push(tokio::spawn(async move {
+                    gw_reconnect.platform_reconnect_watcher(20).await;
+                }));
+                let gw_expiry = gateway.clone();
+                sidecar_tasks.push(tokio::spawn(async move {
+                    gw_expiry.session_expiry_watcher(300).await;
+                }));
+                let gw_cleanup = gateway.clone();
+                sidecar_tasks.push(tokio::spawn(async move {
+                    gw_cleanup.gateway_cleanup_watcher(300).await;
+                }));
+            }
+
+            let own_pid = std::process::id();
+            std::fs::write(&pid_path, format!("{own_pid}\n")).map_err(|e| {
+                AgentError::Io(format!("failed to write {}: {}", pid_path.display(), e))
+            })?;
+            println!("Gateway is ready. Press Ctrl+C to stop.");
+            // Keep the gateway alive until Ctrl+C / SIGINT.
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|e| AgentError::Io(format!("Failed to listen for Ctrl+C: {e}")))?;
+
+            println!("\nShutting down gateway...");
+            cron_scheduler.stop().await;
+            gateway.stop_all().await?;
             let _ = std::fs::remove_file(&pid_path);
-            return res;
+            for task in sidecar_tasks {
+                task.abort();
+            }
+            println!("Gateway stopped.");
         }
         Some("status") => {
             let pid_path = gateway_pid_path_for_cli(&cli);
@@ -1029,7 +1239,6 @@ async fn run_gateway_setup(cli: &Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
-#[cfg(test)]
 async fn register_gateway_adapters(
     config: &hermes_config::GatewayConfig,
     gateway: Arc<Gateway>,
