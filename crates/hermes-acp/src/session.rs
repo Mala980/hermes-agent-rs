@@ -194,6 +194,40 @@ impl SessionManager {
         }
     }
 
+    /// Set the session's model (`session/set_model`). Returns false when the
+    /// session does not exist.
+    pub fn set_model(&self, session_id: &str, model: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(state) = sessions.get_mut(session_id) {
+            state.model = Some(model.to_string());
+            state.touch();
+            let cloned = state.clone();
+            drop(sessions);
+            self.persist(&cloned);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a named config option for a session (`session/set_config_option`).
+    /// Returns false when the session does not exist.
+    pub fn set_config_option(&self, session_id: &str, key: &str, value: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(state) = sessions.get_mut(session_id) {
+            state
+                .config_options
+                .insert(key.to_string(), value.to_string());
+            state.touch();
+            let cloned = state.clone();
+            drop(sessions);
+            self.persist(&cloned);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Update session history.
     pub fn set_history(&self, session_id: &str, history: Vec<Value>) {
         let mut sessions = self.sessions.lock().unwrap();

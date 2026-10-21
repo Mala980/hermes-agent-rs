@@ -115,10 +115,12 @@ impl From<&str> for AcpMethod {
             "session/fork" | "fork_session" => Self::ForkSession,
             "session/list" | "list_sessions" => Self::ListSessions,
             "session/cancel" | "cancel" => Self::Cancel,
-            "prompt" => Self::Prompt,
+            "session/prompt" | "prompt" => Self::Prompt,
             "session/set_model" | "set_session_model" => Self::SetSessionModel,
             "session/set_mode" | "set_session_mode" => Self::SetSessionMode,
-            "session/set_config" | "set_config_option" => Self::SetConfigOption,
+            "session/set_config" | "session/set_config_option" | "set_config_option" => {
+                Self::SetConfigOption
+            }
 
             // Legacy methods
             "conversation.create" => Self::CreateConversation,
@@ -137,13 +139,38 @@ impl From<&str> for AcpMethod {
 // Capability declarations
 // ---------------------------------------------------------------------------
 
+use serde::de::Deserializer;
+use serde::ser::{SerializeMap, Serializer};
+
+/// Capability marker: serializes to `{}` when a capability is supported and
+/// is omitted entirely when it is not (`Option<Supported>` +
+/// `skip_serializing_if`). Matches the ACP schema (`"fork": {}`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Supported;
+
+impl serde::Serialize for Supported {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_map(Some(0))?.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Supported {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let _ = Value::deserialize(deserializer)?;
+        Ok(Supported)
+    }
+}
+
 /// Agent capabilities advertised during `initialize`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     #[serde(default)]
     pub load_session: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_capabilities: Option<SessionCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_capabilities: Option<PromptCapabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
     #[serde(default)]
@@ -155,12 +182,24 @@ pub struct AgentCapabilities {
 /// Session-level capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionCapabilities {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork: Option<Supported>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<Supported>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Supported>,
+}
+
+/// Prompt content capabilities.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCapabilities {
     #[serde(default)]
-    pub fork: bool,
+    pub image: bool,
     #[serde(default)]
-    pub list: bool,
+    pub audio: bool,
     #[serde(default)]
-    pub resume: bool,
+    pub embedded_context: bool,
 }
 
 /// Client capabilities received during `initialize`.
@@ -191,6 +230,7 @@ pub struct AuthMethod {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub protocol_version: u32,
     pub agent_info: Implementation,
@@ -442,15 +482,54 @@ mod tests {
         let caps = AgentCapabilities {
             load_session: true,
             session_capabilities: Some(SessionCapabilities {
-                fork: true,
-                list: true,
-                resume: true,
+                fork: Some(Supported),
+                list: Some(Supported),
+                resume: Some(Supported),
+            }),
+            prompt_capabilities: Some(PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: true,
             }),
             streaming: true,
             ..Default::default()
         };
         let json = serde_json::to_value(&caps).unwrap();
-        assert_eq!(json["load_session"], true);
+        assert_eq!(json["loadSession"], true);
         assert_eq!(json["streaming"], true);
+        // Session capabilities serialize as `{}` markers per the ACP schema.
+        assert_eq!(
+            json["sessionCapabilities"],
+            serde_json::json!({"fork": {}, "list": {}, "resume": {}})
+        );
+        assert_eq!(json["promptCapabilities"]["embeddedContext"], true);
+    }
+
+    #[test]
+    fn test_supported_marker_serde() {
+        let json = serde_json::to_value(Supported).unwrap();
+        assert_eq!(json, serde_json::json!({}));
+        let back: Supported = serde_json::from_value(json).unwrap();
+        let _ = back;
+    }
+
+    #[test]
+    fn test_all_canonical_session_method_names_mapped() {
+        // Every `session/*` method from the reference implementation must
+        // dispatch (not fall through to Unknown → -32601).
+        for (name, expected) in [
+            ("session/new", AcpMethod::NewSession),
+            ("session/load", AcpMethod::LoadSession),
+            ("session/resume", AcpMethod::ResumeSession),
+            ("session/fork", AcpMethod::ForkSession),
+            ("session/list", AcpMethod::ListSessions),
+            ("session/prompt", AcpMethod::Prompt),
+            ("session/cancel", AcpMethod::Cancel),
+            ("session/set_model", AcpMethod::SetSessionModel),
+            ("session/set_mode", AcpMethod::SetSessionMode),
+            ("session/set_config_option", AcpMethod::SetConfigOption),
+        ] {
+            assert_eq!(AcpMethod::from(name), expected, "method {name}");
+        }
     }
 }

@@ -94,7 +94,18 @@ impl AcpServer {
                 }
             };
 
-            let response = self.handler.handle_request(request).await;
+            let outcome = self.handler.handle_request_full(request).await;
+
+            // History-replay (and similar) notifications MUST precede the
+            // response on the wire — the ACP spec requires this order for
+            // session/load and session/resume.
+            for notification in &outcome.pre_notifications {
+                let json = serde_json::to_string(notification)?;
+                stdout.write_all(json.as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+            }
+
+            let response = outcome.response;
             let json = serde_json::to_string(&response)?;
             stdout.write_all(json.as_bytes()).await?;
             stdout.write_all(b"\n").await?;
@@ -140,7 +151,18 @@ impl AcpServer {
                 }
             };
 
-            let response = self.handler.handle_request(request).await;
+            let outcome = self.handler.handle_request_full(request).await;
+
+            // History-replay (and similar) notifications MUST precede the
+            // response on the wire — the ACP spec requires this order for
+            // session/load and session/resume.
+            for notification in &outcome.pre_notifications {
+                let json = serde_json::to_string(notification)?;
+                writer.write_all(json.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+            }
+
+            let response = outcome.response;
             let json = serde_json::to_string(&response)?;
             writer.write_all(json.as_bytes()).await?;
             writer.write_all(b"\n").await?;
@@ -186,4 +208,72 @@ pub fn generate_mcp_server_config(hermes_binary: &str) -> serde_json::Value {
             "env": {}
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::{AcpHandler, DefaultAcpHandler};
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn test_run_on_jsonrpc_framing() {
+        let handler: Arc<dyn AcpHandler> = Arc::new(DefaultAcpHandler::default());
+        let server = AcpServer::new(handler);
+        let (client, io) = tokio::io::duplex(64 * 1024);
+        let (client_r, mut client_w) = tokio::io::split(client);
+
+        let server_task = tokio::spawn(async move {
+            let (srv_r, srv_w) = tokio::io::split(io);
+            server.run_on(srv_r, srv_w).await.map_err(|e| e.to_string())
+        });
+
+        // initialize → session/new → session/list
+        for line in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"."}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"session/list"}"#,
+            "not json at all",
+        ] {
+            client_w.write_all(line.as_bytes()).await.unwrap();
+            client_w.write_all(b"\n").await.unwrap();
+        }
+        client_w.flush().await.unwrap();
+
+        let mut lines = BufReader::new(client_r).lines();
+        let mut responses = Vec::new();
+        for _ in 0..4 {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+                .await
+                .expect("timed out waiting for server response")
+                .unwrap()
+                .unwrap();
+            responses.push(line);
+        }
+        // Shut the server down by dropping the client.
+        drop(client_w);
+        drop(lines);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
+
+        let v: Vec<serde_json::Value> = responses
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Malformed input → -32700 parse error with null id.
+        assert_eq!(v[3]["error"]["code"], -32700);
+        assert!(v[3]["id"].is_null());
+        // initialize
+        assert_eq!(v[0]["id"], 1);
+        assert_eq!(v[0]["result"]["agentInfo"]["name"], "hermes-agent");
+        // session/new → camelCase sessionId
+        assert_eq!(v[1]["id"], 2);
+        let sid = v[1]["result"]["sessionId"].as_str().unwrap().to_string();
+        assert!(!sid.is_empty());
+        // session/list sees the new session
+        assert_eq!(v[2]["id"], 3);
+        let sessions = v[2]["result"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["sessionId"], sid);
+    }
 }

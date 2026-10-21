@@ -8,7 +8,13 @@ description = "Agent Communication Protocol adapter for Hermes Agent"
 
 [dependencies]
 hermes-core = { workspace = true }
+hermes-agent = { workspace = true }
+hermes-config = { workspace = true }
+hermes-tools = { workspace = true }
+hermes-environments = { workspace = true }
+hermes-skills = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
