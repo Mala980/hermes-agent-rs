@@ -84,6 +84,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+libc = "0.2"
 
 # Utils
 regex = "1"
