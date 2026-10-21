@@ -601,6 +601,34 @@ pub fn register_builtin_tools_with_approval_mode(
     );
 
     // -- Transcription -------------------------------------------------------
+    // -- Kanban (18 tools) -----------------------------------------------------
+    {
+        use crate::tools::{kanban_lifecycle as kbl, kanban_meta as kbm};
+        for handler in [
+            Arc::new(kbl::KanbanBoardCreateHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanBoardListHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanBoardRemoveHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanCreateHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanShowHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanListHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanCompleteHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanBlockHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanUnblockHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanScheduleHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbl::KanbanHeartbeatHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanRequestReviewHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanRequestChangesHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanCommentHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanAttachHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanAttachUrlHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanAttachmentsHandler) as Arc<dyn ToolHandler>,
+            Arc::new(kbm::KanbanLinkHandler) as Arc<dyn ToolHandler>,
+        ] {
+            reg(registry, "kanban", handler, "🗂️", vec![]);
+        }
+    }
+
+    // -- Transcription -------------------------------------------------------
     reg(
         registry,
         "voice",

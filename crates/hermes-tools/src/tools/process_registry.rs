@@ -1000,4 +1000,111 @@ mod tests {
         assert_eq!(schema.name, "process_registry");
         assert!(schema.description.contains("background processes"));
     }
+
+    // -- Reaper / kill behavioral tests --------------------------------------
+    //
+    // The reference fixed a reaper bug where `kill`/`close` could never
+    // actually terminate a process because the exit status was never reaped
+    // (a background task held the child across `wait()`, so `kill()` could
+    // never take `&mut`). This registry has no such background reaper:
+    // `refresh_status` polls `try_wait()` without holding the child across
+    // awaits, and `stop()` performs SIGTERM -> wait(timeout) -> SIGKILL
+    // itself. These tests prove both paths behaviorally.
+
+    /// A process that ignores SIGTERM must still be killable: `stop()` must
+    /// fall back to SIGKILL and report the process as stopped (reaped).
+    #[tokio::test]
+    async fn stop_kills_process_ignoring_sigterm() {
+        let mgr = ProcessManager::new().with_buffer_capacity(1024);
+        // `trap "" TERM` + exec: the ignore disposition survives exec, so
+        // `sleep` itself ignores SIGTERM.
+        mgr.spawn(
+            "term-ignorer",
+            "sh",
+            &["-c", "trap \"\" TERM; exec sleep 60"],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Sanity: it is running.
+        let info = mgr.status("term-ignorer").await.unwrap();
+        assert_eq!(info.status, ProcessStatus::Running);
+
+        // SIGTERM is ignored -> the 1s grace expires -> SIGKILL must land.
+        let info = mgr
+            .stop("term-ignorer", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            info.status,
+            ProcessStatus::Stopped,
+            "SIGKILL fallback must stop a SIGTERM-ignoring process"
+        );
+        assert!(info.stopped_at.is_some());
+
+        // A second stop is a no-op returning the stopped record.
+        let again = mgr
+            .stop("term-ignorer", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(again.status, ProcessStatus::Stopped);
+    }
+
+    /// A naturally-exited process must be reaped via `try_wait()` polling:
+    /// `status()` transitions Running -> Exited with the exit code recorded.
+    #[tokio::test]
+    async fn naturally_exited_process_is_reaped() {
+        let mgr = ProcessManager::new().with_buffer_capacity(1024);
+        mgr.spawn("quick-exit", "true", &[], None, None)
+            .await
+            .unwrap();
+
+        // Poll until the reaper observes the exit (deadline 5s).
+        let mut last = None;
+        for _ in 0..50 {
+            let info = mgr.status("quick-exit").await.unwrap();
+            if info.status != ProcessStatus::Running {
+                last = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let info = last.expect("process should have been reaped within 5s");
+        assert_eq!(info.status, ProcessStatus::Exited);
+        assert_eq!(info.exit_code, Some(0));
+        assert!(info.stopped_at.is_some());
+    }
+
+    /// A process killed externally is observed as failed/exited, not stuck
+    /// in `Running` forever.
+    #[tokio::test]
+    async fn externally_killed_process_is_reaped() {
+        let mgr = ProcessManager::new().with_buffer_capacity(1024);
+        let info = mgr
+            .spawn("victim", "sh", &["-c", "exec sleep 60"], None, None)
+            .await
+            .unwrap();
+
+        // Kill it from the outside (SIGKILL, like the OOM killer would).
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &info.pid.to_string()])
+            .output();
+
+        let mut last = None;
+        for _ in 0..50 {
+            let info = mgr.status("victim").await.unwrap();
+            if info.status != ProcessStatus::Running {
+                last = Some(info);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let info = last.expect("externally killed process should be reaped");
+        assert_ne!(info.status, ProcessStatus::Running);
+        // Killed by signal: no exit code, recorded as failed.
+        assert_eq!(info.status, ProcessStatus::Failed);
+        assert_eq!(info.exit_code, None);
+    }
 }

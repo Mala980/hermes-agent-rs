@@ -1,12 +1,56 @@
 //! Local terminal backend – executes commands on the same host.
 
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use tokio::process::Command as TokioCommand;
 
 use hermes_core::{redact_secrets, sanitize_spawn_env, AgentError, CommandOutput, TerminalBackend};
+
+/// Result of probing `bash --version`, computed once per process.
+static BASH_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Whether `bash` is installed (probed once per process via
+/// `bash --version`); used to pick the default shell for exec.
+fn bash_available() -> bool {
+    *BASH_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("bash")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Shell argv for spawn-per-call execution: `bash -c` like the original
+/// Hermes, falling back to `sh -c` (with a warning) when bash is not
+/// installed. The `available` parameter is the probed result; kept separate
+/// so the selection itself is unit-testable.
+fn shell_argv(command: &str) -> (String, Vec<String>) {
+    shell_argv_with(bash_available(), command)
+}
+
+fn shell_argv_with(available: bool, command: &str) -> (String, Vec<String>) {
+    if available {
+        (
+            "bash".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    } else {
+        tracing::warn!(
+            "bash not found on PATH; exec falls back to `sh -c` \
+             (bash-isms like [[ ]], arrays, (( )) are unsupported)"
+        );
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
+}
 
 /// A [`TerminalBackend`] that runs commands on the local machine.
 pub struct LocalBackend {
@@ -31,7 +75,8 @@ impl LocalBackend {
 
 impl Default for LocalBackend {
     fn default() -> Self {
-        Self::new(120, 1_048_576)
+        // Reference parity: the original's exec default timeout is 180s.
+        Self::new(180, 1_048_576)
     }
 }
 
@@ -111,9 +156,11 @@ impl TerminalBackend for LocalBackend {
             }
         }
 
-        let mut cmd = TokioCommand::new("sh");
-        cmd.arg("-c")
-            .arg(command)
+        // Default `bash -c` like the original Hermes, falling back to
+        // `sh -c` when bash is not installed.
+        let (shell_prog, shell_args) = shell_argv(command);
+        let mut cmd = TokioCommand::new(&shell_prog);
+        cmd.args(&shell_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -262,6 +309,41 @@ impl TerminalBackend for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shell_argv_prefers_bash() {
+        let (prog, args) = shell_argv_with(true, "echo hi");
+        assert_eq!(prog, "bash");
+        assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    #[test]
+    fn test_shell_argv_falls_back_to_sh() {
+        let (prog, args) = shell_argv_with(false, "echo hi");
+        assert_eq!(prog, "sh");
+        assert_eq!(args, vec!["-c".to_string(), "echo hi".to_string()]);
+    }
+
+    #[test]
+    fn test_shell_argv_matches_probe() {
+        let (prog, _) = shell_argv("echo hi");
+        assert_eq!(prog, if bash_available() { "bash" } else { "sh" });
+    }
+
+    /// A bash-ism (`[[ ]]`) only runs under the preferred `bash -c` shell.
+    #[tokio::test]
+    async fn test_local_backend_uses_bash_when_available() {
+        if !bash_available() {
+            return; // Degenerate environment: nothing to prove.
+        }
+        let backend = LocalBackend::default();
+        let output = backend
+            .execute_command("[[ 1 -eq 1 ]] && echo bash-ok", None, None, false, false)
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(output.stdout.contains("bash-ok"));
+    }
 
     #[tokio::test]
     async fn test_execute_command_echo() {
