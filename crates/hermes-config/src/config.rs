@@ -11,6 +11,21 @@ use crate::session::SessionConfig;
 use crate::streaming::StreamingConfig;
 
 // ---------------------------------------------------------------------------
+// TuiConfig
+// ---------------------------------------------------------------------------
+
+/// TUI (interactive terminal) display settings.
+///
+/// The active color theme is toggled with F2 in the TUI and persisted here
+/// so it survives restarts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TuiConfig {
+    /// Active theme name (`"dark"` or `"light"`); `None` = default (`"dark"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // GatewayConfig
 // ---------------------------------------------------------------------------
 
@@ -109,6 +124,10 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub agent: AgentLoopBehaviorConfig,
 
+    /// TUI (interactive terminal) display settings (theme, ...).
+    #[serde(default)]
+    pub tui: TuiConfig,
+
     /// Override for the hermes home directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_dir: Option<String>,
@@ -140,6 +159,7 @@ impl Default for GatewayConfig {
             mcp_servers: Vec::new(),
             profile: ProfileConfig::default(),
             agent: AgentLoopBehaviorConfig::default(),
+            tui: TuiConfig::default(),
             home_dir: None,
         }
     }
