@@ -24,6 +24,23 @@ pub fn register_builtin_tools(
     terminal_backend: Arc<dyn TerminalBackend>,
     skill_provider: Arc<dyn SkillProvider>,
 ) {
+    register_builtin_tools_with_approval_mode(
+        registry,
+        terminal_backend,
+        skill_provider,
+        crate::approval::resolve_approval_mode(),
+    );
+}
+
+/// Variant of [`register_builtin_tools`] with an explicit unattended mode
+/// for the terminal approval gate (`--readonly` / `--yes`). Used by
+/// long-running agent-driving commands (`hermes gateway`, `hermes serve`).
+pub fn register_builtin_tools_with_approval_mode(
+    registry: &ToolRegistry,
+    terminal_backend: Arc<dyn TerminalBackend>,
+    skill_provider: Arc<dyn SkillProvider>,
+    approval_mode: crate::approval::ApprovalMode,
+) {
     fn reg(
         registry: &ToolRegistry,
         toolset: &str,
@@ -72,8 +89,9 @@ pub fn register_builtin_tools(
     reg(
         registry,
         "terminal",
-        Arc::new(crate::tools::terminal::TerminalHandler::new(
+        Arc::new(crate::tools::terminal::TerminalHandler::with_approval_mode(
             terminal_backend.clone(),
+            approval_mode,
         )),
         "💻",
         vec![],

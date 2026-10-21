@@ -35,6 +35,7 @@ pub mod setup_beat;
 pub mod skill_commands;
 pub mod skill_utils;
 pub mod skills;
+pub mod ssrf_guard;
 pub mod terminal;
 pub mod todo;
 pub mod tool_result_storage;

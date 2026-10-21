@@ -12,7 +12,7 @@
 //! obfuscating a dangerous command can only escalate its verdict.
 
 use regex::Regex;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 // ---------------------------------------------------------------------------
 // ApprovalDecision
@@ -450,6 +450,78 @@ fn extract_payloads(tokens: &[String]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// ApprovalMode (unattended operation)
+// ---------------------------------------------------------------------------
+
+/// How `RequiresConfirmation` verdicts are treated by long-running,
+/// non-interactive commands (`gateway`, `serve`).
+///
+/// Risk mapping in this codebase: the approval gate classifies *command
+/// strings* (there is no per-tool risk tier), so for the unattended flags:
+/// - `Denied` ≈ high-risk — always blocked;
+/// - `RequiresConfirmation` ≈ medium/high-risk — the flag decides;
+/// - `Approved` ≈ low-risk — always allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalMode {
+    /// Default: confirmation-required commands are auto-approved with a
+    /// warning log (agent mode), exactly the historical behaviour.
+    #[default]
+    Interactive,
+    /// `--readonly`: confirmation-required commands are DENIED (fail-closed).
+    /// Only `Approved` (low-risk) commands run.
+    ReadOnly,
+    /// `--yes`: confirmation-required commands are auto-approved.
+    AutoApprove,
+}
+
+impl ApprovalMode {
+    /// Default from the environment: `HERMES_GATEWAY_APPROVAL`
+    /// (`strict` → ReadOnly, `allow` → AutoApprove, anything else →
+    /// Interactive).
+    pub fn from_env() -> Self {
+        match std::env::var("HERMES_GATEWAY_APPROVAL")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "strict" => ApprovalMode::ReadOnly,
+            "allow" => ApprovalMode::AutoApprove,
+            _ => ApprovalMode::Interactive,
+        }
+    }
+
+    /// Explicit CLI flags (`--readonly` / `--yes`) WIN over the env default.
+    /// When both flags are passed, `--readonly` wins (safety first).
+    pub fn from_flags(readonly: bool, yes: bool) -> Self {
+        if readonly {
+            ApprovalMode::ReadOnly
+        } else if yes {
+            ApprovalMode::AutoApprove
+        } else {
+            Self::from_env()
+        }
+    }
+}
+
+static GLOBAL_APPROVAL_MODE: OnceLock<ApprovalMode> = OnceLock::new();
+
+/// Process-wide override, set once per process (used by `hermes serve`, whose
+/// tool registry is built inside `hermes-server` where the CLI flags are not
+/// visible). Returns `false` if an override was already installed.
+pub fn set_global_approval_mode(mode: ApprovalMode) -> bool {
+    GLOBAL_APPROVAL_MODE.set(mode).is_ok()
+}
+
+/// Effective mode: the process-wide override if set, otherwise the env
+/// default. Used as the mode for `register_builtin_tools`.
+pub fn resolve_approval_mode() -> ApprovalMode {
+    GLOBAL_APPROVAL_MODE
+        .get()
+        .copied()
+        .unwrap_or_else(ApprovalMode::from_env)
+}
+
+// ---------------------------------------------------------------------------
 // ApprovalManager
 // ---------------------------------------------------------------------------
 
@@ -459,6 +531,8 @@ pub struct ApprovalManager {
     denied_patterns: Vec<Regex>,
     /// Custom confirm patterns (compiled regexes).
     confirm_patterns: Vec<Regex>,
+    /// How `RequiresConfirmation` verdicts are treated.
+    mode: ApprovalMode,
 }
 
 impl ApprovalManager {
@@ -467,7 +541,21 @@ impl ApprovalManager {
         Self {
             denied_patterns: Vec::new(),
             confirm_patterns: Vec::new(),
+            mode: ApprovalMode::Interactive,
         }
+    }
+
+    /// Create a new ApprovalManager with an explicit unattended mode
+    /// (`--readonly` / `--yes`).
+    pub fn with_mode(mode: ApprovalMode) -> Self {
+        let mut this = Self::new();
+        this.mode = mode;
+        this
+    }
+
+    /// The unattended mode this manager applies.
+    pub fn mode(&self) -> ApprovalMode {
+        self.mode
     }
 
     /// Add a custom denied pattern.
@@ -840,5 +928,84 @@ mod tests {
                 "must stay RequiresConfirmation: {cmd}"
             );
         }
+    }
+
+    // ── ApprovalMode (unattended flags) ─────────────────────────────
+
+    /// Serializes tests that mutate the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// (1) `--readonly` beats a permissive env: env unset would allow the
+    /// confirmation path, but the flag forces fail-closed.
+    #[test]
+    fn flag_readonly_beats_permissive_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL"); // default: Interactive
+        let mode = ApprovalMode::from_flags(true, false);
+        assert_eq!(mode, ApprovalMode::ReadOnly);
+        let mgr = ApprovalManager::with_mode(mode);
+        // Low-risk (Approved) still runs…
+        assert_eq!(mgr.check_approval("ls -la"), ApprovalDecision::Approved);
+        // …but the raw verdict for a medium/high-risk command is unchanged —
+        // the *handler* turns RequiresConfirmation into a denial in ReadOnly
+        // mode (tested in terminal.rs).
+        assert_eq!(
+            mgr.check_approval("sudo apt install something"),
+            ApprovalDecision::RequiresConfirmation
+        );
+        assert_eq!(mgr.mode(), ApprovalMode::ReadOnly);
+    }
+
+    /// (1b) `--yes` beats a strict env: even with `strict`, the flag
+    /// auto-approves.
+    #[test]
+    fn flag_yes_beats_strict_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("HERMES_GATEWAY_APPROVAL", "strict");
+        let mode = ApprovalMode::from_flags(false, true);
+        assert_eq!(mode, ApprovalMode::AutoApprove);
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL");
+    }
+
+    /// (2) No flags: the env default applies (unset → Interactive,
+    /// "strict" → ReadOnly, "allow" → AutoApprove).
+    #[test]
+    fn no_flags_uses_env_defaults() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL");
+        assert_eq!(
+            ApprovalMode::from_flags(false, false),
+            ApprovalMode::Interactive
+        );
+        std::env::set_var("HERMES_GATEWAY_APPROVAL", "strict");
+        assert_eq!(
+            ApprovalMode::from_flags(false, false),
+            ApprovalMode::ReadOnly
+        );
+        std::env::set_var("HERMES_GATEWAY_APPROVAL", "allow");
+        assert_eq!(
+            ApprovalMode::from_flags(false, false),
+            ApprovalMode::AutoApprove
+        );
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL");
+    }
+
+    /// (3) `--readonly` wins over `--yes` when both are passed (safety first).
+    #[test]
+    fn readonly_wins_over_yes() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL");
+        assert_eq!(ApprovalMode::from_flags(true, true), ApprovalMode::ReadOnly);
+    }
+
+    /// (4) `resolve_approval_mode` falls back to the env default when no
+    /// process-wide override is installed.
+    #[test]
+    fn resolve_falls_back_to_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        // No global override installed in this test process.
+        std::env::set_var("HERMES_GATEWAY_APPROVAL", "strict");
+        assert_eq!(resolve_approval_mode(), ApprovalMode::ReadOnly);
+        std::env::remove_var("HERMES_GATEWAY_APPROVAL");
     }
 }

@@ -24,6 +24,7 @@ pub mod backends;
 pub mod dispatch;
 pub mod register_builtins;
 pub mod registry;
+pub mod threat_scan;
 pub mod tools;
 pub mod toolset;
 pub mod toolset_distributions;
@@ -40,7 +41,10 @@ pub use toolset::{Toolset, ToolsetError, ToolsetManager};
 pub use dispatch::{dispatch_single, dispatch_tools, DispatchedResult};
 
 // Re-export approval types
-pub use approval::{check_approval, ApprovalDecision, ApprovalManager};
+pub use approval::{
+    check_approval, set_global_approval_mode, ApprovalDecision, ApprovalManager, ApprovalMode,
+};
+pub use threat_scan::{scan_threat, ThreatKind};
 
 // Re-export credential guard
 pub mod credential_guard;
@@ -77,6 +81,7 @@ pub use tools::session_search::{SessionSearchBackend, SessionSearchHandler};
 pub use tools::skill_commands;
 pub use tools::skill_utils;
 pub use tools::skills::{SkillManageHandler, SkillViewHandler, SkillsListHandler};
+pub use tools::ssrf_guard::{classify_url, ensure_url_allowed, UrlTarget};
 pub use tools::terminal::{ProcessBackend, ProcessHandler, TerminalHandler};
 pub use tools::todo::{TodoBackend, TodoHandler};
 pub use tools::tool_result_storage::ToolResultStorageHandler;
@@ -108,7 +113,7 @@ pub use backends::web::{
 };
 
 // Re-export builtin registration helper
-pub use register_builtins::register_builtin_tools;
+pub use register_builtins::{register_builtin_tools, register_builtin_tools_with_approval_mode};
 
 // Re-export core types needed by consumers
 pub use hermes_core::{BudgetConfig, ToolCall, ToolError, ToolHandler, ToolResult, ToolSchema};

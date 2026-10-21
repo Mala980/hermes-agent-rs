@@ -1,10 +1,22 @@
 //! Web tools: web_search (Exa) and web_extract (Firecrawl)
+//!
+//! The `web_extract` tool enforces an SSRF guard (see
+//! [`super::ssrf_guard`]): URLs with embedded credentials or pointing at
+//! private/internal addresses are rejected *before* any network access, and
+//! DNS names have every resolved address checked against the blocked ranges.
+//! An optional [`WebsitePolicy`] can be attached for user-configurable
+//! allow/deny rules on top of that security floor.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 
 use hermes_core::{tool_schema, JsonSchema, ToolError, ToolHandler, ToolSchema};
+
+use super::ssrf_guard;
+use super::url_safety::WebsitePolicy;
 
 // ---------------------------------------------------------------------------
 // Backend traits (injectable by the caller)
@@ -98,13 +110,29 @@ impl ToolHandler for WebSearchHandler {
 // ---------------------------------------------------------------------------
 
 /// Web extraction tool using Firecrawl API.
+///
+/// Enforces the SSRF guard on the target URL before delegating to the
+/// backend: credentialed URLs and private/internal addresses (literal or
+/// resolved via DNS) are rejected. An optional [`WebsitePolicy`] can be
+/// attached with [`Self::with_policy`] for additional user-configured
+/// allow/deny rules.
 pub struct WebExtractHandler {
     backend: Box<dyn WebExtractBackend>,
+    policy: Option<Arc<WebsitePolicy>>,
 }
 
 impl WebExtractHandler {
     pub fn new(backend: Box<dyn WebExtractBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            policy: None,
+        }
+    }
+
+    /// Attach a [`WebsitePolicy`] consulted after the SSRF guard.
+    pub fn with_policy(mut self, policy: Arc<WebsitePolicy>) -> Self {
+        self.policy = Some(policy);
+        self
     }
 }
 
@@ -115,6 +143,17 @@ impl ToolHandler for WebExtractHandler {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("Missing 'url' parameter".into()))?;
+
+        // SSRF guard (security floor): hard deny for credentialed URLs and
+        // private/internal targets, including DNS-resolved IPs.
+        ssrf_guard::ensure_url_allowed(url)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("SSRF guard blocked URL: {e}")))?;
+
+        // User-configured website policy, when attached.
+        if let Some(policy) = &self.policy {
+            policy.pre_check(url)?;
+        }
 
         let include_links = params
             .get("include_links")
@@ -144,7 +183,8 @@ impl ToolHandler for WebExtractHandler {
 
         tool_schema(
             "web_extract",
-            "Extract clean content from a web page using Firecrawl. Returns the page text and optional links.",
+            "Extract clean content from a web page using Firecrawl. Returns the page text and optional links. \
+             URLs pointing at private/internal addresses or carrying credentials are blocked by the SSRF guard.",
             JsonSchema::object(props, vec!["url".into()]),
         )
     }
@@ -203,11 +243,58 @@ mod tests {
     #[tokio::test]
     async fn test_web_extract_execute() {
         let handler = WebExtractHandler::new(Box::new(MockExtractBackend));
+        // Public IP literal: passes the SSRF guard without needing DNS.
         let result = handler
-            .execute(json!({"url": "https://example.com"}))
+            .execute(json!({"url": "http://93.184.216.34/"}))
             .await
             .unwrap();
-        assert!(result.contains("example.com"));
+        assert!(result.contains("93.184.216.34"));
+    }
+
+    #[tokio::test]
+    async fn test_web_extract_ssrf_blocked() {
+        let handler = WebExtractHandler::new(Box::new(MockExtractBackend));
+
+        // Private/internal targets are blocked before the backend runs.
+        for url in [
+            "http://127.0.0.1/",
+            "http://10.0.0.5/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://localhost:8080/",
+            "http://user:pass@93.184.216.34/",
+            "ftp://example.com/file",
+        ] {
+            let result = handler.execute(json!({"url": url})).await;
+            let err = result.expect_err(&format!("expected {url} to be blocked"));
+            assert!(
+                matches!(err, ToolError::ExecutionFailed(_)),
+                "expected ExecutionFailed for {url}, got: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_web_extract_policy_denied() {
+        use super::super::url_safety::{PolicyAction, WebsitePolicy, WebsitePolicyConfig};
+
+        // Deny-all policy: the public IP literal passes the SSRF guard
+        // (no DNS needed) but is denied by the attached policy.
+        let policy = WebsitePolicy::from_config(WebsitePolicyConfig {
+            default_action: PolicyAction::Deny,
+            rules: vec![],
+        });
+        let handler =
+            WebExtractHandler::new(Box::new(MockExtractBackend)).with_policy(Arc::new(policy));
+
+        let result = handler
+            .execute(json!({"url": "http://93.184.216.34/"}))
+            .await;
+        let err = result.expect_err("policy should deny the URL");
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(_)),
+            "expected ExecutionFailed, got: {err:?}"
+        );
     }
 
     #[tokio::test]

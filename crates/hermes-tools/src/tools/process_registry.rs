@@ -32,7 +32,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use hermes_core::{tool_schema, JsonSchema, ToolError, ToolHandler, ToolSchema};
+use hermes_core::{
+    apply_sanitized_env, redact_secrets, tool_schema, JsonSchema, ToolError, ToolHandler,
+    ToolSchema,
+};
 
 // ---------------------------------------------------------------------------
 // Ring buffer for captured output
@@ -191,11 +194,10 @@ impl ProcessManager {
             cmd.current_dir(dir);
         }
 
-        if let Some(env) = env_vars {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
-        }
+        // Security: credential env vars never reach the child — strip matches
+        // inherited from our own env and filter the explicitly passed
+        // `env_vars` map. Non-reallowable.
+        apply_sanitized_env(cmd.as_std_mut(), env_vars);
 
         let mut child = cmd.spawn().map_err(|e| {
             ToolError::ExecutionFailed(format!("Failed to spawn '{}': {}", command, e))
@@ -288,10 +290,12 @@ impl ProcessManager {
         };
 
         let buf = buf.lock().await;
-        Ok(match tail_bytes {
+        // Security: redact secrets before captured output reaches tool results.
+        let text = match tail_bytes {
             Some(n) => buf.tail(n),
             None => buf.read_string(),
-        })
+        };
+        Ok(redact_secrets(&text))
     }
 
     /// Gracefully stop a process: SIGTERM → wait → SIGKILL.
@@ -796,6 +800,58 @@ mod tests {
 
         let output = mgr.output("echo-test", "stdout", None).await.unwrap();
         assert!(output.contains("captured output"));
+    }
+
+    #[tokio::test]
+    async fn spawn_strips_credential_env_vars() {
+        let mgr = ProcessManager::new().with_buffer_capacity(1024);
+        let mut env = HashMap::new();
+        env.insert(
+            "HERMES_PR_TEST_API_KEY".to_string(),
+            "SHOULDNOTLEAK3".to_string(),
+        );
+        env.insert("HERMES_PR_TEST_NORMAL".to_string(), "keepme".to_string());
+        // printenv with explicit names keeps output tiny (no ring truncation).
+        mgr.spawn(
+            "env-strip",
+            "printenv",
+            &["HERMES_PR_TEST_NORMAL", "HERMES_PR_TEST_API_KEY"],
+            None,
+            Some(&env),
+        )
+        .await
+        .unwrap();
+
+        // Wait for process to finish and output to be captured
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let output = mgr.output("env-strip", "stdout", None).await.unwrap();
+        assert!(
+            !output.contains("SHOULDNOTLEAK3"),
+            "credential value leaked into child"
+        );
+        assert!(
+            output.lines().any(|l| l == "keepme"),
+            "normal env var must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_redacts_secrets() {
+        let mgr = ProcessManager::new().with_buffer_capacity(4096);
+        mgr.spawn("secret-echo", "echo", &["api_key=hunter2value"], None, None)
+            .await
+            .unwrap();
+
+        // Wait for process to finish and output to be captured
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let output = mgr.output("secret-echo", "stdout", None).await.unwrap();
+        assert!(
+            !output.contains("hunter2value"),
+            "secret leaked in process output"
+        );
+        assert!(output.contains("[REDACTED]"));
     }
 
     #[tokio::test]

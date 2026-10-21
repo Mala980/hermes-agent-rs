@@ -6,7 +6,7 @@ use std::process::Stdio;
 use tokio::process::Command as TokioCommand;
 
 use crate::tools::code_execution::CodeExecutionBackend;
-use hermes_core::ToolError;
+use hermes_core::{redact_secrets, sanitize_spawn_env, ToolError};
 
 /// Code execution backend using local interpreters.
 pub struct LocalCodeExecutionBackend {
@@ -66,6 +66,9 @@ impl CodeExecutionBackend for LocalCodeExecutionBackend {
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
+        // Security: strip credential env vars from the interpreter child.
+        sanitize_spawn_env(cmd.as_std_mut());
+
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
             let child = cmd.spawn().map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to spawn {}: {}", interpreter, e))
@@ -83,8 +86,10 @@ impl CodeExecutionBackend for LocalCodeExecutionBackend {
 
         match result {
             Ok(Ok((exit_code, stdout, stderr))) => {
-                let stdout_str = String::from_utf8_lossy(&stdout).to_string();
-                let stderr_str = String::from_utf8_lossy(&stderr).to_string();
+                // Security: redact any secrets before the output becomes a
+                // tool result.
+                let stdout_str = redact_secrets(&String::from_utf8_lossy(&stdout));
+                let stderr_str = redact_secrets(&String::from_utf8_lossy(&stderr));
                 Ok(json!({
                     "exit_code": exit_code,
                     "stdout": stdout_str,
@@ -99,5 +104,54 @@ impl CodeExecutionBackend for LocalCodeExecutionBackend {
                 timeout_secs
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run_bash(code: &str) -> String {
+        let backend = LocalCodeExecutionBackend::default();
+        backend
+            .execute(code, Some("bash"), Some(30))
+            .await
+            .expect("code execution failed")
+    }
+
+    #[tokio::test]
+    async fn code_execution_strips_credential_env_vars() {
+        // Unique names so parallel tests cannot collide with them.
+        std::env::set_var("HERMES_CE_TEST_STRIP_TOKEN", "SHOULDNOTLEAK2");
+        std::env::set_var("HERMES_CE_TEST_KEEP", "keepme");
+        let result = run_bash(
+            "echo \"v=${HERMES_CE_TEST_STRIP_TOKEN:-UNSET}\"; echo \"k=$HERMES_CE_TEST_KEEP\"",
+        )
+        .await;
+        std::env::remove_var("HERMES_CE_TEST_STRIP_TOKEN");
+        std::env::remove_var("HERMES_CE_TEST_KEEP");
+
+        assert!(
+            !result.contains("SHOULDNOTLEAK2"),
+            "credential value leaked into interpreter child"
+        );
+        assert!(
+            result.contains("v=UNSET"),
+            "credential var must be stripped"
+        );
+        assert!(result.contains("k=keepme"), "normal var must pass through");
+    }
+
+    #[tokio::test]
+    async fn code_execution_redacts_secrets_in_output() {
+        let result = run_bash("echo 'api_key=hunter2value'").await;
+        assert!(
+            !result.contains("hunter2value"),
+            "secret leaked in code output"
+        );
+        assert!(result.contains("[REDACTED]"));
+
+        let result = run_bash("echo hello").await;
+        assert!(result.contains("hello"));
     }
 }

@@ -5,10 +5,11 @@ use indexmap::IndexMap;
 use serde_json::{json, Value};
 
 use hermes_core::{
-    tool_schema, CommandOutput, JsonSchema, TerminalBackend, ToolError, ToolHandler, ToolSchema,
+    redact_secrets, tool_schema, CommandOutput, JsonSchema, TerminalBackend, ToolError,
+    ToolHandler, ToolSchema,
 };
 
-use crate::approval::{ApprovalDecision, ApprovalManager};
+use crate::approval::{ApprovalDecision, ApprovalManager, ApprovalMode};
 
 // ---------------------------------------------------------------------------
 // TerminalHandler
@@ -25,6 +26,17 @@ impl TerminalHandler {
         Self {
             backend,
             approval: ApprovalManager::new(),
+        }
+    }
+
+    /// Handler with an explicit unattended mode (`--readonly` / `--yes`).
+    pub fn with_approval_mode(
+        backend: std::sync::Arc<dyn TerminalBackend>,
+        mode: ApprovalMode,
+    ) -> Self {
+        Self {
+            backend,
+            approval: ApprovalManager::with_mode(mode),
         }
     }
 }
@@ -44,12 +56,31 @@ impl ToolHandler for TerminalHandler {
                     command
                 )));
             }
-            ApprovalDecision::RequiresConfirmation => {
-                tracing::warn!(
-                    command,
-                    "command requires confirmation — auto-approved in agent mode"
-                );
-            }
+            ApprovalDecision::RequiresConfirmation => match self.approval.mode() {
+                // --readonly: fail closed — medium/high-risk commands are
+                // denied outright, only Approved (low-risk) commands run.
+                ApprovalMode::ReadOnly => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Command denied by --readonly policy (requires confirmation): {}",
+                        command
+                    )));
+                }
+                // --yes: confirmation is granted without prompting.
+                ApprovalMode::AutoApprove => {
+                    tracing::warn!(
+                        command,
+                        "command requires confirmation — auto-approved via --yes"
+                    );
+                }
+                // Default: historical behaviour — auto-approved in agent mode
+                // with a warning log.
+                ApprovalMode::Interactive => {
+                    tracing::warn!(
+                        command,
+                        "command requires confirmation — auto-approved in agent mode"
+                    );
+                }
+            },
             ApprovalDecision::Approved => {}
         }
 
@@ -123,6 +154,10 @@ impl ToolHandler for TerminalHandler {
 }
 
 /// Format command output for display.
+///
+/// Secrets are redacted before the text becomes a tool result, so every
+/// [`TerminalBackend`] (local, docker, ssh, daytona, modal, singularity)
+/// gets output redaction at this single choke point.
 fn format_command_output(output: &CommandOutput) -> String {
     let mut result = String::new();
     if !output.stdout.is_empty() {
@@ -140,7 +175,7 @@ fn format_command_output(output: &CommandOutput) -> String {
     if result.is_empty() {
         result = format!("[exit code: {}]", output.exit_code);
     }
-    result
+    redact_secrets(&result)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,5 +400,82 @@ mod tests {
         assert!(formatted.contains("out"));
         assert!(formatted.contains("err"));
         assert!(formatted.contains("exit code: 1"));
+    }
+
+    #[test]
+    fn test_format_command_output_redacts_secrets() {
+        let output = CommandOutput {
+            exit_code: 0,
+            stdout: "api_key=hunter2value\nBearer abc123token".to_string(),
+            stderr: "token xoxb-1234-abcdef".to_string(),
+        };
+        let formatted = format_command_output(&output);
+        assert!(
+            !formatted.contains("hunter2value"),
+            "secret leaked in formatted output"
+        );
+        assert!(!formatted.contains("abc123token"));
+        assert!(!formatted.contains("xoxb-1234-abcdef"));
+        assert!(formatted.contains("[REDACTED]"));
+    }
+
+    /// `--readonly`: a command that would require confirmation is DENIED,
+    /// even though it is not a `Denied` command.
+    #[tokio::test]
+    async fn test_readonly_denies_confirmation_commands() {
+        let handler = TerminalHandler::with_approval_mode(
+            std::sync::Arc::new(MockBackend),
+            ApprovalMode::ReadOnly,
+        );
+        let err = handler
+            .execute(json!({"command": "sudo apt install something"}))
+            .await
+            .expect_err("--readonly must deny confirmation-required commands");
+        assert!(
+            err.to_string().contains("--readonly"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `--readonly`: low-risk (Approved) commands still run.
+    #[tokio::test]
+    async fn test_readonly_allows_low_risk_commands() {
+        let handler = TerminalHandler::with_approval_mode(
+            std::sync::Arc::new(MockBackend),
+            ApprovalMode::ReadOnly,
+        );
+        let result = handler
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("low-risk command must run in readonly mode");
+        assert!(result.contains("echo hello"));
+    }
+
+    /// `--readonly`: outright-denied commands stay denied.
+    #[tokio::test]
+    async fn test_readonly_denied_commands_stay_denied() {
+        let handler = TerminalHandler::with_approval_mode(
+            std::sync::Arc::new(MockBackend),
+            ApprovalMode::ReadOnly,
+        );
+        handler
+            .execute(json!({"command": "rm -rf /"}))
+            .await
+            .expect_err("denied commands must stay denied");
+    }
+
+    /// `--yes`: a command that would require confirmation is auto-approved
+    /// and actually runs against the backend.
+    #[tokio::test]
+    async fn test_yes_auto_approves_confirmation_commands() {
+        let handler = TerminalHandler::with_approval_mode(
+            std::sync::Arc::new(MockBackend),
+            ApprovalMode::AutoApprove,
+        );
+        let result = handler
+            .execute(json!({"command": "sudo apt install something"}))
+            .await
+            .expect("--yes must auto-approve confirmation-required commands");
+        assert!(result.contains("sudo apt install something"));
     }
 }
