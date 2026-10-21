@@ -254,6 +254,8 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     phone_number_id: extra_string(platform_cfg, "phone_number_id"),
                     business_account_id: extra_string(platform_cfg, "business_account_id"),
                     verify_token: extra_string(platform_cfg, "verify_token"),
+                    // Falls back to WHATSAPP_APP_SECRET env inside the adapter.
+                    app_secret: extra_string(platform_cfg, "app_secret"),
                     proxy: Default::default(),
                 };
                 match WhatsAppAdapter::new(wa_cfg) {

@@ -81,6 +81,14 @@ pub enum CliCommand {
         /// Disable cron subsystem.
         #[arg(long)]
         no_cron: bool,
+        /// Read-only mode: deny any command that would require confirmation
+        /// (fail-closed). Beats HERMES_GATEWAY_APPROVAL.
+        #[arg(long)]
+        readonly: bool,
+        /// Auto-approve confirmation prompts (non-interactive). Beats
+        /// HERMES_GATEWAY_APPROVAL.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Interact with cloud tasks from the terminal.
@@ -150,6 +158,14 @@ pub enum CliCommand {
         /// Platform name for setup (e.g. "whatsapp", "telegram").
         #[arg(long)]
         platform: Option<String>,
+        /// Read-only mode: deny any command that would require confirmation
+        /// (fail-closed). Beats HERMES_GATEWAY_APPROVAL.
+        #[arg(long)]
+        readonly: bool,
+        /// Auto-approve confirmation prompts (non-interactive). Beats
+        /// HERMES_GATEWAY_APPROVAL.
+        #[arg(long)]
+        yes: bool,
     },
 
     // ── Configuration & Model ───────────────────────────────────────
@@ -451,6 +467,7 @@ mod tests {
                 port,
                 no_gateway,
                 no_cron,
+                ..
             }) => {
                 assert!(action.is_none());
                 assert_eq!(host, "0.0.0.0");
@@ -483,6 +500,7 @@ mod tests {
                 port,
                 no_gateway,
                 no_cron,
+                ..
             }) => {
                 assert_eq!(action.as_deref(), Some("start"));
                 assert_eq!(host, "127.0.0.1");
@@ -588,5 +606,57 @@ mod tests {
         assert!(Cli::try_parse_from(vec!["hermes", "memory-setup"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "pairing"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "webhook"]).is_err());
+    }
+
+    #[test]
+    fn gateway_readonly_yes_flags_parse() {
+        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "start", "--readonly"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Gateway {
+                action,
+                readonly,
+                yes,
+                ..
+            }) => {
+                assert_eq!(action.as_deref(), Some("start"));
+                assert!(readonly);
+                assert!(!yes);
+            }
+            _ => panic!("Expected Gateway command"),
+        }
+
+        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "--yes"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Gateway { readonly, yes, .. }) => {
+                assert!(!readonly);
+                assert!(yes);
+            }
+            _ => panic!("Expected Gateway command"),
+        }
+    }
+
+    #[test]
+    fn gateway_flags_default_off() {
+        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "start"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Gateway { readonly, yes, .. }) => {
+                assert!(!readonly);
+                assert!(!yes);
+            }
+            _ => panic!("Expected Gateway command"),
+        }
+    }
+
+    #[test]
+    fn serve_readonly_yes_flags_parse() {
+        let cli =
+            Cli::try_parse_from(vec!["hermes", "serve", "start", "--readonly", "--yes"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Serve { readonly, yes, .. }) => {
+                assert!(readonly);
+                assert!(yes);
+            }
+            _ => panic!("Expected Serve command"),
+        }
     }
 }

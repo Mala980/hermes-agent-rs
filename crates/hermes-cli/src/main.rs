@@ -71,17 +71,22 @@ async fn main() {
                 run_config(cli, action, key, value).await
             }
         }
-        CliCommand::Gateway { action, platform } => {
+        CliCommand::Gateway {
+            action,
+            platform,
+            readonly,
+            yes,
+        } => {
             // "hermes gateway setup whatsapp" → delegate to whatsapp handler
             if let (Some("setup"), Some(plat)) = (action.as_deref(), platform.as_deref()) {
                 match plat {
                     "whatsapp" | "wa" => {
                         hermes_cli::commands::handle_cli_whatsapp(Some("setup".to_string())).await
                     }
-                    _ => run_gateway(cli, action).await,
+                    _ => run_gateway(cli, action, readonly, yes).await,
                 }
             } else {
-                run_gateway(cli, action).await
+                run_gateway(cli, action, readonly, yes).await
             }
         }
         CliCommand::Setup => run_setup().await,
@@ -164,7 +169,23 @@ async fn main() {
             port,
             no_gateway,
             no_cron,
-        } => run_serve(cli, action, host, port, no_gateway, no_cron).await,
+            readonly,
+            yes,
+        } => {
+            run_serve(
+                cli,
+                ServeOptions {
+                    action,
+                    host,
+                    port,
+                    no_gateway,
+                    no_cron,
+                    readonly,
+                    yes,
+                },
+            )
+            .await
+        }
         CliCommand::Cloud {
             action,
             agent_id,
@@ -510,7 +531,12 @@ async fn run_cron_webhook_delivery_loop(
 }
 
 /// Handle `hermes gateway [action]`.
-async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError> {
+async fn run_gateway(
+    cli: Cli,
+    action: Option<String>,
+    readonly: bool,
+    yes: bool,
+) -> Result<(), AgentError> {
     let config =
         load_config(cli.config_dir.as_deref()).map_err(|e| AgentError::Config(e.to_string()))?;
 
@@ -600,7 +626,17 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
             ));
             let skill_provider: Arc<dyn hermes_core::SkillProvider> =
                 Arc::new(hermes_skills::SkillManager::new(skill_store));
-            hermes_tools::register_builtin_tools(&tool_registry, terminal_backend, skill_provider);
+            // Unattended approval: explicit CLI flags beat the env default.
+            let approval_mode = hermes_tools::ApprovalMode::from_flags(readonly, yes);
+            if readonly {
+                println!("Gateway running in --readonly mode: confirmation-required commands are denied.");
+            }
+            hermes_tools::register_builtin_tools_with_approval_mode(
+                &tool_registry,
+                terminal_backend,
+                skill_provider,
+                approval_mode,
+            );
             let agent_tools = Arc::new(hermes_agent::agent_builder::bridge_tool_registry(
                 &tool_registry,
             ));
@@ -2314,16 +2350,41 @@ async fn resolve_llm_login_token(cli: &Cli, provider: &str) -> Result<String, Ag
     Ok(pasted)
 }
 
-async fn run_serve(
-    cli: Cli,
+/// Options for `hermes serve` (bundled to keep the arg count lint-clean).
+struct ServeOptions {
     action: Option<String>,
     host: String,
     port: u16,
     no_gateway: bool,
     no_cron: bool,
-) -> Result<(), AgentError> {
+    readonly: bool,
+    yes: bool,
+}
+
+async fn run_serve(cli: Cli, opts: ServeOptions) -> Result<(), AgentError> {
+    let ServeOptions {
+        action,
+        host,
+        port,
+        no_gateway,
+        no_cron,
+        readonly,
+        yes,
+    } = opts;
     match action.as_deref() {
         None | Some("start") => {
+            // Unattended approval flags: the tool registry is built inside
+            // hermes-server, so install the mode as a process-wide override
+            // (flags beat HERMES_GATEWAY_APPROVAL).
+            let mode = hermes_tools::ApprovalMode::from_flags(readonly, yes);
+            if readonly || yes {
+                hermes_tools::set_global_approval_mode(mode);
+            }
+            if readonly {
+                println!(
+                    "Serve running in --readonly mode: confirmation-required commands are denied."
+                );
+            }
             let config = hermes_config::load_config(cli.config_dir.as_deref())
                 .map_err(|e| AgentError::Config(e.to_string()))?;
             let addr: std::net::SocketAddr = format!("{}:{}", host, port)
