@@ -11,17 +11,13 @@ use hermes_core::ToolError;
 // LocalPatchBackend
 // ---------------------------------------------------------------------------
 
-/// Real file patch backend using fuzzy string matching.
+/// Real file patch backend with reference `patch` semantics.
 ///
-/// Implements an 8-strategy matching chain (ported from Python `fuzzy_match.py`):
-/// 1. Exact match
-/// 2. Line-trimmed (strip leading/trailing whitespace per line)
-/// 3. Whitespace normalized (collapse multiple spaces/tabs)
-/// 4. Indentation flexible (ignore indentation differences)
-/// 5. Escape normalized (convert \\n literals to newlines)
-/// 6. Trimmed boundary (trim first/last line only)
-/// 7. Block anchor (match first+last lines, similarity for middle)
-/// 8. Context-aware (50% line similarity threshold)
+/// Matching: exact search first (must match exactly once), then a
+/// whitespace-normalized fuzzy fallback (the whitespace-separated tokens of
+/// the needle joined by `\s+`; must also match exactly once). Zero or
+/// multiple matches is an error and the file is left untouched. A successful
+/// patch reports a unified diff (context radius 3) of the change.
 pub struct LocalPatchBackend;
 
 impl LocalPatchBackend {
@@ -29,315 +25,125 @@ impl LocalPatchBackend {
         Self
     }
 
-    /// Find the best fuzzy match for `needle` in `haystack`.
-    /// Returns (start_index, end_index) of the best match, or None.
-    fn fuzzy_find(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        // Strategy 1: Exact match
-        if let Some(pos) = haystack.find(needle) {
-            return Some((pos, pos + needle.len()));
-        }
-
-        // Strategy 2: Line-trimmed match
-        if let Some(result) = Self::strategy_line_trimmed(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 3: Whitespace normalized
-        if let Some(result) = Self::strategy_whitespace_normalized(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 4: Indentation flexible
-        if let Some(result) = Self::strategy_indentation_flexible(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 5: Escape normalized
-        if let Some(result) = Self::strategy_escape_normalized(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 6: Trimmed boundary
-        if let Some(result) = Self::strategy_trimmed_boundary(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 7: Block anchor
-        if let Some(result) = Self::strategy_block_anchor(haystack, needle) {
-            return Some(result);
-        }
-
-        // Strategy 8: Context-aware
-        Self::strategy_context_aware(haystack, needle)
-    }
-
-    /// Strategy 2: Match with line-by-line whitespace trimming.
-    fn strategy_line_trimmed(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let needle_lines: Vec<&str> = needle.lines().map(|l| l.trim()).collect();
-        let haystack_lines: Vec<&str> = haystack.lines().collect();
-
-        if needle_lines.is_empty() {
-            return None;
-        }
-
-        for i in 0..haystack_lines.len().saturating_sub(needle_lines.len() - 1) {
-            let mut matches = true;
-            for (j, nl) in needle_lines.iter().enumerate() {
-                if i + j >= haystack_lines.len() || haystack_lines[i + j].trim() != *nl {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                return Some(Self::line_positions(
-                    haystack,
-                    &haystack_lines,
-                    i,
-                    i + needle_lines.len(),
-                ));
-            }
-        }
-        None
-    }
-
-    /// Strategy 3: Collapse multiple whitespace to single space.
-    fn strategy_whitespace_normalized(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let norm_needle = Self::normalize_whitespace(needle);
-        let norm_haystack = Self::normalize_whitespace(haystack);
-
-        if let Some(pos) = norm_haystack.find(&norm_needle) {
-            let start = Self::map_normalized_pos(haystack, &norm_haystack, pos);
-            let end = Self::map_normalized_pos(haystack, &norm_haystack, pos + norm_needle.len());
-            return Some((start, end));
-        }
-        None
-    }
-
-    /// Strategy 4: Ignore indentation differences entirely.
-    fn strategy_indentation_flexible(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let needle_lines: Vec<&str> = needle.lines().map(|l| l.trim_start()).collect();
-        let haystack_lines: Vec<&str> = haystack.lines().collect();
-
-        if needle_lines.is_empty() {
-            return None;
-        }
-
-        for i in 0..haystack_lines.len().saturating_sub(needle_lines.len() - 1) {
-            let mut matches = true;
-            for (j, nl) in needle_lines.iter().enumerate() {
-                if i + j >= haystack_lines.len() || haystack_lines[i + j].trim_start() != *nl {
-                    matches = false;
-                    break;
-                }
-            }
-            if matches {
-                return Some(Self::line_positions(
-                    haystack,
-                    &haystack_lines,
-                    i,
-                    i + needle_lines.len(),
-                ));
-            }
-        }
-        None
-    }
-
-    /// Strategy 5: Convert escape sequences to actual characters.
-    fn strategy_escape_normalized(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let unescaped = needle
-            .replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace("\\r", "\r");
-
-        if unescaped == needle {
-            return None; // No escapes to convert
-        }
-
-        haystack
-            .find(&unescaped)
-            .map(|pos| (pos, pos + unescaped.len()))
-    }
-
-    /// Strategy 6: Trim whitespace from first and last lines only.
-    fn strategy_trimmed_boundary(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let mut needle_lines: Vec<String> = needle.lines().map(|l| l.to_string()).collect();
-        if needle_lines.is_empty() {
-            return None;
-        }
-
-        needle_lines[0] = needle_lines[0].trim().to_string();
-        if needle_lines.len() > 1 {
-            let last = needle_lines.len() - 1;
-            needle_lines[last] = needle_lines[last].trim().to_string();
-        }
-
-        let haystack_lines: Vec<&str> = haystack.lines().collect();
-        let n = needle_lines.len();
-
-        for i in 0..haystack_lines.len().saturating_sub(n - 1) {
-            let mut check_lines: Vec<String> = haystack_lines[i..i + n]
-                .iter()
-                .map(|l| l.to_string())
-                .collect();
-            check_lines[0] = check_lines[0].trim().to_string();
-            if check_lines.len() > 1 {
-                let last = check_lines.len() - 1;
-                check_lines[last] = check_lines[last].trim().to_string();
-            }
-
-            if check_lines == needle_lines {
-                return Some(Self::line_positions(haystack, &haystack_lines, i, i + n));
-            }
-        }
-        None
-    }
-
-    /// Strategy 7: Match by anchoring on first and last lines.
-    fn strategy_block_anchor(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let needle_lines: Vec<&str> = needle.lines().collect();
-        if needle_lines.len() < 2 {
-            return None;
-        }
-
-        let first_line = needle_lines[0].trim();
-        let last_line = needle_lines[needle_lines.len() - 1].trim();
-        let haystack_lines: Vec<&str> = haystack.lines().collect();
-        let n = needle_lines.len();
-
-        let mut candidates = Vec::new();
-        for i in 0..haystack_lines.len().saturating_sub(n - 1) {
-            if haystack_lines[i].trim() == first_line
-                && haystack_lines[i + n - 1].trim() == last_line
-            {
-                candidates.push(i);
-            }
-        }
-
-        // Use lower threshold for unique matches
-        let threshold = if candidates.len() == 1 { 0.10 } else { 0.30 };
-
-        for i in candidates {
-            let similarity = if n <= 2 {
-                1.0
-            } else {
-                let content_middle: String = haystack_lines[i + 1..i + n - 1].join("\n");
-                let pattern_middle: String = needle_lines[1..n - 1].join("\n");
-                Self::sequence_similarity(&content_middle, &pattern_middle)
-            };
-
-            if similarity >= threshold {
-                return Some(Self::line_positions(haystack, &haystack_lines, i, i + n));
-            }
-        }
-        None
-    }
-
-    /// Strategy 8: Line-by-line similarity with 50% threshold.
-    fn strategy_context_aware(haystack: &str, needle: &str) -> Option<(usize, usize)> {
-        let needle_lines: Vec<&str> = needle.lines().collect();
-        let haystack_lines: Vec<&str> = haystack.lines().collect();
-
-        if needle_lines.is_empty() {
-            return None;
-        }
-
-        let n = needle_lines.len();
-
-        for i in 0..haystack_lines.len().saturating_sub(n - 1) {
-            let block = &haystack_lines[i..i + n];
-            let mut high_sim_count = 0;
-
-            for (pl, cl) in needle_lines.iter().zip(block.iter()) {
-                let sim = Self::sequence_similarity(pl.trim(), cl.trim());
-                if sim >= 0.80 {
-                    high_sim_count += 1;
-                }
-            }
-
-            if high_sim_count >= (n as f64 * 0.5) as usize {
-                return Some(Self::line_positions(haystack, &haystack_lines, i, i + n));
-            }
-        }
-        None
-    }
-
-    fn normalize_whitespace(s: &str) -> String {
-        s.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    fn map_normalized_pos(original: &str, _normalized: &str, norm_pos: usize) -> usize {
-        let mut orig_idx = 0;
-        let mut norm_idx = 0;
-        let orig_bytes = original.as_bytes();
-
-        while norm_idx < norm_pos && orig_idx < orig_bytes.len() {
-            if orig_bytes[orig_idx].is_ascii_whitespace() {
-                orig_idx += 1;
-                if norm_idx < norm_pos {
-                    while orig_idx < orig_bytes.len() && orig_bytes[orig_idx].is_ascii_whitespace()
-                    {
-                        orig_idx += 1;
-                    }
-                    norm_idx += 1;
-                }
-            } else {
-                orig_idx += 1;
-                norm_idx += 1;
-            }
-        }
-
-        orig_idx.min(original.len())
-    }
-
-    /// Calculate start and end byte positions from line indices.
-    fn line_positions(
+    /// Whitespace-normalized fuzzy replacement semantics, mirroring the reference
+    /// `patch`/`edit_file` (`apply_replace`): exact match first (must be unique),
+    /// then a fuzzy fallback where the whitespace-separated tokens of `old` may be
+    /// separated by any whitespace run (tokens joined by `\s+`; must be unique).
+    /// Returns the new content and whether the match was `"exact"` or `"fuzzy"`.
+    fn apply_single_replace(
         content: &str,
-        lines: &[&str],
-        start_line: usize,
-        end_line: usize,
-    ) -> (usize, usize) {
-        let start: usize = lines[..start_line].iter().map(|l| l.len() + 1).sum();
-        let end: usize = lines[..end_line].iter().map(|l| l.len() + 1).sum();
-        let end = (end.saturating_sub(1)).min(content.len());
-        (start, end)
-    }
-
-    /// Simple sequence similarity ratio (0.0 to 1.0).
-    fn sequence_similarity(a: &str, b: &str) -> f64 {
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
+        old: &str,
+        new: &str,
+    ) -> Result<(String, &'static str), String> {
+        let exact = content.matches(old).count();
+        if exact == 1 {
+            return Ok((content.replacen(old, new, 1), "exact"));
         }
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
+        if exact > 1 {
+            return Err(format!(
+                "ambiguous: old_string matched {exact} times exactly; \
+             include surrounding context lines to make it unique"
+            ));
         }
-
-        // Use longest common subsequence ratio
-        let a_chars: Vec<char> = a.chars().collect();
-        let b_chars: Vec<char> = b.chars().collect();
-        let lcs_len = Self::lcs_length(&a_chars, &b_chars);
-        (2.0 * lcs_len as f64) / (a_chars.len() + b_chars.len()) as f64
-    }
-
-    /// Longest common subsequence length.
-    fn lcs_length(a: &[char], b: &[char]) -> usize {
-        let m = a.len();
-        let n = b.len();
-        // Use two rows to save memory
-        let mut prev = vec![0usize; n + 1];
-        let mut curr = vec![0usize; n + 1];
-
-        for i in 1..=m {
-            for j in 1..=n {
-                if a[i - 1] == b[j - 1] {
-                    curr[j] = prev[j - 1] + 1;
-                } else {
-                    curr[j] = prev[j].max(curr[j - 1]);
-                }
+        // No exact match: fuzzy fallback — tokens of old_string may be separated
+        // by any run of whitespace (spaces, tabs, newlines).
+        let tokens: Vec<&str> = old.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Err(
+                "no match found: old_string not found in file, neither exactly \
+                    nor with whitespace-normalized fuzzy matching"
+                    .to_string(),
+            );
+        }
+        let pattern = tokens
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join(r"\s+");
+        let re = Regex::new(&pattern).map_err(|e| format!("invalid fuzzy pattern: {e}"))?;
+        let spans: Vec<_> = re.find_iter(content).collect();
+        match spans.len() {
+            0 => Err(
+                "no match found: old_string not found in file, neither exactly \
+                  nor with whitespace-normalized fuzzy matching"
+                    .to_string(),
+            ),
+            1 => {
+                let m = spans[0];
+                let mut out = String::with_capacity(content.len() + new.len());
+                out.push_str(&content[..m.start()]);
+                out.push_str(new);
+                out.push_str(&content[m.end()..]);
+                Ok((out, "fuzzy"))
             }
-            std::mem::swap(&mut prev, &mut curr);
-            curr.iter_mut().for_each(|x| *x = 0);
+            n => Err(format!(
+                "ambiguous: old_string matched {n} times with whitespace-normalized \
+             fuzzy matching; include surrounding context lines to make it unique"
+            )),
         }
-        *prev.iter().max().unwrap_or(&0)
+    }
+
+    /// Render a unified diff (`---`/`+++` + `@@` hunks) between the old and new
+    /// file contents, with context radius 3. A patch always replaces a single
+    /// contiguous span, so exactly one hunk is emitted.
+    fn unified_diff(old: &str, new: &str, name: &str) -> String {
+        const RADIUS: usize = 3;
+        let old_lines: Vec<&str> = old.lines().collect();
+        let new_lines: Vec<&str> = new.lines().collect();
+
+        let mut prefix = 0;
+        while prefix < old_lines.len()
+            && prefix < new_lines.len()
+            && old_lines[prefix] == new_lines[prefix]
+        {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < old_lines.len() - prefix
+            && suffix < new_lines.len() - prefix
+            && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let ctx_before = prefix.min(RADIUS);
+        let ctx_after = suffix.min(RADIUS);
+        let old_start = prefix - ctx_before; // 0-indexed
+        let old_changed = old_lines.len() - prefix - suffix;
+        let new_changed = new_lines.len() - prefix - suffix;
+
+        let mut out = String::new();
+        out.push_str(&format!("--- a/{name}\n+++ b/{name}\n"));
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start + 1,
+            ctx_before + old_changed + ctx_after,
+            old_start + 1,
+            ctx_before + new_changed + ctx_after,
+        ));
+        for line in &old_lines[old_start..prefix] {
+            out.push_str(&format!(" {line}\n"));
+        }
+        for line in &old_lines[prefix..old_lines.len() - suffix] {
+            out.push_str(&format!("-{line}\n"));
+        }
+        for line in &new_lines[prefix..new_lines.len() - suffix] {
+            out.push_str(&format!("+{line}\n"));
+        }
+        let after = old_lines.len() - suffix;
+        for line in &old_lines[after..after + ctx_after] {
+            out.push_str(&format!(" {line}\n"));
+        }
+        out
+    }
+
+    /// Short preview of a needle for error messages.
+    fn truncate_preview(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            s.to_string()
+        } else {
+            s.chars().take(max_chars).collect()
+        }
     }
 }
 
@@ -373,42 +179,59 @@ impl PatchBackend for LocalPatchBackend {
             return Ok(json!({"status": "ok", "message": "Content appended"}).to_string());
         }
 
+        if old_string == new_string {
+            return Err(ToolError::InvalidParams(
+                "new_string must differ from old_string (use empty string to delete)".to_string(),
+            ));
+        }
+
+        let display_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+
         if replace_all {
-            // Simple replace all occurrences
-            if !content.contains(old_string) {
+            // Replace every exact occurrence (explicit opt-in; uniqueness is
+            // not required in this mode).
+            let count = content.matches(old_string).count();
+            if count == 0 {
                 return Err(ToolError::ExecutionFailed(format!(
                     "Could not find '{}' in '{}'",
-                    &old_string[..old_string.len().min(100)],
+                    Self::truncate_preview(old_string, 100),
                     path
                 )));
             }
             let new_content = content.replace(old_string, new_string);
-            let count = content.matches(old_string).count();
             tokio::fs::write(path, &new_content).await.map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to write '{}': {}", path, e))
             })?;
-            return Ok(json!({"status": "ok", "replacements": count}).to_string());
+            return Ok(json!({
+                "status": "ok",
+                "replacements": count,
+                "match": "exact",
+                "diff": Self::unified_diff(&content, &new_content, display_name),
+            })
+            .to_string());
         }
 
-        // Single replacement with fuzzy matching
-        match Self::fuzzy_find(&content, old_string) {
-            Some((start, end)) => {
-                let mut new_content = String::with_capacity(content.len());
-                new_content.push_str(&content[..start]);
-                new_content.push_str(new_string);
-                new_content.push_str(&content[end..]);
+        // Single replacement: old_string must match EXACTLY once (reference
+        // semantics). Exact search first, then the whitespace-normalized fuzzy
+        // fallback; zero or multiple matches is an error and the file is
+        // left untouched.
+        let (new_content, kind) = Self::apply_single_replace(&content, old_string, new_string)
+            .map_err(ToolError::ExecutionFailed)?;
 
-                tokio::fs::write(path, &new_content).await.map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to write '{}': {}", path, e))
-                })?;
+        tokio::fs::write(path, &new_content).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to write '{}': {}", path, e))
+        })?;
 
-                Ok(json!({"status": "ok", "replacements": 1}).to_string())
-            }
-            None => Err(ToolError::ExecutionFailed(format!(
-                "Could not find a match for the specified text in '{}'",
-                path
-            ))),
-        }
+        Ok(json!({
+            "status": "ok",
+            "replacements": 1,
+            "match": kind,
+            "diff": Self::unified_diff(&content, &new_content, display_name),
+        })
+        .to_string())
     }
 }
 
@@ -627,5 +450,218 @@ impl LocalSearchBackend {
         Regex::new(&format!("^{}$", re_pattern))
             .map(|re| re.is_match(name))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(dir: &tempfile::TempDir, name: &str, content: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    fn patch_ok(path: &str, old: &str, new: &str, replace_all: bool) -> serde_json::Value {
+        let backend = LocalPatchBackend::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt
+            .block_on(backend.patch_file(path, old, new, replace_all))
+            .expect("patch_file failed");
+        serde_json::from_str(&out).expect("patch result must be JSON")
+    }
+
+    fn patch_err(path: &str, old: &str, new: &str) -> String {
+        let backend = LocalPatchBackend::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(backend.patch_file(path, old, new, false))
+            .expect_err("patch_file should fail")
+            .to_string()
+    }
+
+    #[test]
+    fn patch_exact_unique_replaces_and_reports_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "line1\nline2\nhello world\nline4\nline5\nline6\nline7\n";
+        let path = write_tmp(&dir, "a.txt", original);
+
+        let v = patch_ok(&path, "hello world", "halo dunia", false);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["replacements"], 1);
+        assert_eq!(v["match"], "exact");
+
+        let diff = v["diff"].as_str().expect("diff must be a string");
+        assert!(diff.contains("---"), "diff:\n{diff}");
+        assert!(diff.contains("+++"), "diff:\n{diff}");
+        assert!(diff.contains("@@"), "diff:\n{diff}");
+        assert!(diff.contains("-hello world"), "diff:\n{diff}");
+        assert!(diff.contains("+halo dunia"), "diff:\n{diff}");
+        // Radius-3 context: 3 unchanged lines on each side of the hunk.
+        assert!(diff.contains(" line2"), "diff:\n{diff}");
+        assert!(diff.contains(" line5"), "diff:\n{diff}");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\nline2\nhalo dunia\nline4\nline5\nline6\nline7\n"
+        );
+    }
+
+    #[test]
+    fn patch_ambiguous_exact_errors_with_count_and_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "foo\nbar\nfoo\nbaz\nfoo\n";
+        let path = write_tmp(&dir, "a.txt", original);
+
+        let err = patch_err(&path, "foo", "qux");
+        assert!(err.contains('3'), "error must state the match count: {err}");
+        assert!(err.contains("ambiguous"), "error must say ambiguous: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn patch_zero_match_errors_and_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "line1\nline2\n";
+        let path = write_tmp(&dir, "a.txt", original);
+
+        let err = patch_err(&path, "nothing like this", "x");
+        assert!(err.contains("no match"), "error: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn patch_fuzzy_whitespace_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        // Double space in the file, single space in old_string.
+        let path = write_tmp(&dir, "a.txt", "fn main() {\n    let x =  1;\n}\n");
+
+        let v = patch_ok(&path, "let x = 1;", "let x = 2;", false);
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["match"], "fuzzy");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {\n    let x = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn patch_fuzzy_ambiguous_errors_with_count() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two whitespace variants of the same tokens: both match fuzzily.
+        let path = write_tmp(&dir, "a.txt", "let  x = 1;\nlet x =  1;\n");
+
+        let err = patch_err(&path, "let x = 1;", "let x = 2;");
+        assert!(err.contains('2'), "error must state the count: {err}");
+        assert!(err.contains("ambiguous"), "error: {err}");
+        assert!(err.contains("fuzzy"), "error: {err}");
+    }
+
+    #[test]
+    fn patch_old_equals_new_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tmp(&dir, "a.txt", "same\n");
+
+        let err = patch_err(&path, "same", "same");
+        assert!(err.contains("differ"), "error: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "same\n");
+    }
+
+    #[test]
+    fn patch_replace_all_counts_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tmp(&dir, "a.txt", "foo one\nfoo two\nfoo three\n");
+
+        let v = patch_ok(&path, "foo", "bar", true);
+        assert_eq!(v["replacements"], 3);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "bar one\nbar two\nbar three\n"
+        );
+    }
+
+    #[test]
+    fn patch_replace_all_without_match_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tmp(&dir, "a.txt", "nothing here\n");
+
+        let backend = LocalPatchBackend::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(backend.patch_file(&path, "zzz", "y", true))
+            .expect_err("should fail")
+            .to_string();
+        assert!(err.contains("Could not find"), "error: {err}");
+    }
+
+    #[test]
+    fn unified_diff_uses_radius_three_context() {
+        // 10 lines, change line 5 (1-indexed): 3 context lines each side.
+        let old: String = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut new_lines: Vec<String> = (1..=10).map(|i| format!("line{i}")).collect();
+        new_lines[4] = "CHANGED".to_string();
+        let new = new_lines.join("\n");
+
+        let diff = LocalPatchBackend::unified_diff(&old, &new, "f.txt");
+        assert!(diff.contains("--- a/f.txt"), "diff:\n{diff}");
+        assert!(diff.contains("+++ b/f.txt"), "diff:\n{diff}");
+        assert!(diff.contains("@@ -2,7 +2,7 @@"), "diff:\n{diff}");
+        assert!(diff.contains("-line5"), "diff:\n{diff}");
+        assert!(diff.contains("+CHANGED"), "diff:\n{diff}");
+        // Exactly 3 context lines before and after.
+        for l in ["line2", "line3", "line4", "line6", "line7", "line8"] {
+            assert!(
+                diff.contains(&format!(" {l}\n")),
+                "missing context {l}:\n{diff}"
+            );
+        }
+        assert!(!diff.contains(" line1\n"), "radius exceeded:\n{diff}");
+        assert!(!diff.contains(" line9\n"), "radius exceeded:\n{diff}");
+    }
+
+    #[test]
+    fn unified_diff_single_line_change() {
+        let diff = LocalPatchBackend::unified_diff("a\n", "b\n", "f.txt");
+        assert!(diff.contains("-a"), "diff:\n{diff}");
+        assert!(diff.contains("+b"), "diff:\n{diff}");
+        assert!(diff.contains("@@ -1,1 +1,1 @@"), "diff:\n{diff}");
+    }
+
+    #[test]
+    fn local_search_backend_content_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_string_lossy().to_string();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n// hello\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "hello again\n").unwrap();
+
+        let backend = LocalSearchBackend::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let out = rt
+            .block_on(backend.search_content("hello", &base, None, None))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], 2);
+        assert!(v["matches"].is_array());
+
+        let out = rt.block_on(backend.search_files("*.rs", &base)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["total"], 1);
+        assert!(v["files"].is_array());
     }
 }
