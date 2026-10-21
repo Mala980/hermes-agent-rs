@@ -20,6 +20,7 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::platforms::helpers::send_with_rate_limit_retry;
 use crate::platforms::helpers::{media_category, mime_from_extension};
 
 // ---------------------------------------------------------------------------
@@ -285,12 +286,16 @@ impl MatrixAdapter {
             _ => serde_json::json!({ "msgtype": "m.text", "body": text }),
         };
 
-        let resp = self
-            .client
-            .put(&url)
-            .header("Authorization", self.auth_header())
-            .json(&body)
-            .send()
+        let send_request = || {
+            self.client
+                .put(&url)
+                .header("Authorization", self.auth_header())
+                .json(&body)
+                .send()
+        };
+        // Retries once after an HTTP 429 (Matrix returns `retry_after_ms`
+        // in the JSON body, e.g. `M_LIMIT_EXCEEDED`).
+        let resp = send_with_rate_limit_retry(send_request)
             .await
             .map_err(|e| GatewayError::SendFailed(format!("Matrix send failed: {e}")))?;
 
@@ -846,6 +851,49 @@ impl MatrixAdapter {
     // Sync
     // -----------------------------------------------------------------------
 
+    /// State-file name (inside [`hermes_config::paths::hermes_home`]) used to
+    /// persist the `/sync` `next_batch` token across restarts.
+    pub const SINCE_TOKEN_FILENAME: &str = "matrix-sync-since.json";
+
+    /// Path of the since-token state file.
+    ///
+    /// Follows the gateway state-dir convention (`hermes_home()`, overridable
+    /// via `HERMES_HOME`) — never a hardcoded `~/.hermes` path.
+    pub fn since_token_path() -> std::path::PathBuf {
+        hermes_config::paths::hermes_home().join(Self::SINCE_TOKEN_FILENAME)
+    }
+
+    /// Load a previously persisted `next_batch` token.
+    ///
+    /// Fail-open: `None` when the file is missing, unreadable, or malformed —
+    /// the sync loop then starts from scratch and recovers the token from the
+    /// first successful response.
+    pub fn load_since_token() -> Option<String> {
+        let raw = std::fs::read(Self::since_token_path()).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let token = value.get("next_batch")?.as_str()?.to_owned();
+        if token.is_empty() {
+            None
+        } else {
+            Some(token)
+        }
+    }
+
+    /// Persist the `next_batch` token after a successful `/sync`.
+    ///
+    /// Best effort: on failure a warn is logged and the loop keeps the
+    /// in-memory token only (fail-open).
+    pub fn save_since_token(token: &str) {
+        let body = serde_json::json!({ "next_batch": token }).to_string();
+        match std::fs::write(Self::since_token_path(), &body) {
+            Ok(()) => debug!(token = %token, "Persisted Matrix since-token"),
+            Err(e) => warn!(
+                error = %e,
+                "Failed to persist Matrix since-token; continuing with in-memory token"
+            ),
+        }
+    }
+
     /// Perform a single `/sync` call and return new messages plus the next batch token.
     pub async fn sync_once(
         &self,
@@ -918,10 +966,14 @@ impl MatrixAdapter {
         F: FnMut(Vec<IncomingMatrixMessage>) + Send,
     {
         self.sync_running.store(true, Ordering::SeqCst);
-        let mut since: Option<String> = None;
+        let mut since: Option<String> = Self::load_since_token();
         let mut backoff_idx: usize = 0;
 
-        info!("Matrix sync loop starting");
+        if since.is_some() {
+            info!("Matrix sync loop: resuming from persisted since-token");
+        } else {
+            info!("Matrix sync loop starting");
+        }
 
         loop {
             if !self.base.is_running() {
@@ -932,7 +984,12 @@ impl MatrixAdapter {
             match self.sync_once(since.as_deref()).await {
                 Ok((messages, next_batch)) => {
                     backoff_idx = 0;
-                    since = next_batch;
+                    if next_batch != since {
+                        if let Some(ref token) = next_batch {
+                            Self::save_since_token(token);
+                        }
+                        since = next_batch;
+                    }
                     if !messages.is_empty() {
                         debug!(count = messages.len(), "Sync delivered messages");
                         callback(messages);
@@ -1446,5 +1503,55 @@ mod tests {
         assert!(!e2ee.is_encrypted_room("!room:test"));
         assert!(e2ee.verify_device_keys("@user:test").is_ok());
         assert!(e2ee.share_room_keys("!room:test").is_ok());
+    }
+
+    /// Point the hermes state dir at a scratch tempdir for these tests.
+    /// Caller must hold `crate::allowlist::ENV_LOCK` (env mutation is
+    /// process-wide; tests share it).
+    struct HermHomeGuard {
+        old: Option<String>,
+    }
+
+    impl HermHomeGuard {
+        fn redirect_to(dir: &std::path::Path) -> Self {
+            let old = std::env::var("HERMES_HOME").ok();
+            std::env::set_var("HERMES_HOME", dir);
+            Self { old }
+        }
+    }
+
+    impl Drop for HermHomeGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var("HERMES_HOME", v),
+                None => std::env::remove_var("HERMES_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn since_token_save_load_roundtrip() {
+        // Serialize against other env-mutating tests.
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = HermHomeGuard::redirect_to(tmp.path());
+
+        // Missing file → None (fail-open; sync starts from scratch).
+        assert_eq!(MatrixAdapter::load_since_token(), None);
+
+        MatrixAdapter::save_since_token("s42_7_9_1");
+        assert!(MatrixAdapter::since_token_path().is_file());
+        assert_eq!(
+            MatrixAdapter::load_since_token(),
+            Some("s42_7_9_1".to_string())
+        );
+
+        // Corrupt file → None (fail-open).
+        std::fs::write(MatrixAdapter::since_token_path(), "not json").unwrap();
+        assert_eq!(MatrixAdapter::load_since_token(), None);
+
+        // Valid JSON but no token field → None.
+        std::fs::write(MatrixAdapter::since_token_path(), r#"{"foo":"bar"}"#).unwrap();
+        assert_eq!(MatrixAdapter::load_since_token(), None);
     }
 }

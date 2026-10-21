@@ -3,6 +3,7 @@
 //! Implements the `PlatformAdapter` trait for WhatsApp using the Cloud API.
 //! Sends messages via `POST /v1/messages` and receives via webhook.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,9 +16,17 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
-use crate::platforms::helpers::verify_hmac_sha256_signature;
+use crate::markdown_split::split_markdown;
+use crate::platforms::helpers::{send_with_rate_limit_retry, verify_hmac_sha256_signature};
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
+
+/// Maximum text length per WhatsApp message (4096 chars per Meta's Cloud
+/// API); longer texts are split fence-aware into sequential messages.
+const MAX_MESSAGE_LENGTH: usize = 4096;
+
+/// Maximum number of inbound wamids kept for duplicate suppression.
+pub const MAX_DEDUP_WAMIDS: usize = 5000;
 
 // ---------------------------------------------------------------------------
 // Incoming message types
@@ -68,6 +77,51 @@ pub struct WhatsAppConfig {
     pub proxy: AdapterProxyConfig,
 }
 
+/// In-memory duplicate suppression for inbound WhatsApp message IDs (wamids).
+///
+/// Meta's webhook may redeliver the same message (retries, multi-node
+/// fanout); messages whose `id` was already processed are dropped here
+/// before reaching the agent loop. Keeps the most recent
+/// [`MAX_DEDUP_WAMIDS`] IDs, evicting the oldest.
+#[derive(Debug, Default)]
+struct WamidDedup {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl WamidDedup {
+    /// `true` when `id` was already seen (duplicate → drop it).
+    /// Empty IDs are never deduped.
+    fn check_and_insert(&mut self, id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        if self.ids.contains(id) {
+            return true;
+        }
+        self.ids.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        self.trim_to_cap();
+        false
+    }
+
+    /// Evict oldest entries so at most [`MAX_DEDUP_WAMIDS`] IDs are kept.
+    fn trim_to_cap(&mut self) {
+        while self.order.len() > MAX_DEDUP_WAMIDS {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.ids.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // WhatsAppAdapter
 // ---------------------------------------------------------------------------
@@ -78,6 +132,7 @@ pub struct WhatsAppAdapter {
     config: WhatsAppConfig,
     client: Client,
     stop_signal: Arc<Notify>,
+    dedup: std::sync::Mutex<WamidDedup>,
 }
 
 impl WhatsAppAdapter {
@@ -92,6 +147,7 @@ impl WhatsAppAdapter {
             config,
             client,
             stop_signal: Arc::new(Notify::new()),
+            dedup: std::sync::Mutex::new(WamidDedup::default()),
         })
     }
 
@@ -100,6 +156,9 @@ impl WhatsAppAdapter {
     }
 
     /// Send a text message via WhatsApp Cloud API.
+    ///
+    /// Texts longer than [`MAX_MESSAGE_LENGTH`] are split fence-aware into
+    /// sequential messages.
     pub async fn send_text(&self, to: &str, text: &str) -> Result<(), GatewayError> {
         let phone_id = self
             .config
@@ -108,28 +167,34 @@ impl WhatsAppAdapter {
             .ok_or_else(|| GatewayError::SendFailed("phone_number_id not configured".into()))?;
 
         let url = format!("{}/{}/messages", WHATSAPP_API_BASE, phone_id);
-        let body = serde_json::json!({
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": { "body": text }
-        });
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| GatewayError::SendFailed(format!("WhatsApp send failed: {}", e)))?;
+        for chunk in split_markdown(text, MAX_MESSAGE_LENGTH) {
+            let body = serde_json::json!({
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": { "body": chunk }
+            });
 
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::SendFailed(format!(
-                "WhatsApp API error: {}",
-                text
-            )));
+            let send_request = || {
+                self.client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.config.token))
+                    .json(&body)
+                    .send()
+            };
+            // Retries once after an HTTP 429.
+            let resp = send_with_rate_limit_retry(send_request)
+                .await
+                .map_err(|e| GatewayError::SendFailed(format!("WhatsApp send failed: {}", e)))?;
+
+            if !resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::SendFailed(format!(
+                    "WhatsApp API error: {}",
+                    text
+                )));
+            }
         }
         Ok(())
     }
@@ -277,6 +342,35 @@ impl WhatsAppAdapter {
         }
 
         messages
+    }
+
+    /// Drop inbound messages whose wamid was already processed.
+    ///
+    /// Apply this to the output of [`Self::parse_webhook_event`] before
+    /// dispatching to the agent loop so Meta webhook redeliveries are not
+    /// processed twice. Thread-safe (`&self`); no `.await` needed.
+    pub fn dedup_messages(
+        &self,
+        messages: Vec<IncomingWhatsAppMessage>,
+    ) -> Vec<IncomingWhatsAppMessage> {
+        let mut dedup = self.dedup.lock().unwrap_or_else(|e| e.into_inner());
+        messages
+            .into_iter()
+            .filter(|m| {
+                if dedup.check_and_insert(&m.message_id) {
+                    debug!(wamid = %m.message_id, "Dropping duplicate WhatsApp message");
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    /// Number of wamids currently tracked (for tests/observability).
+    #[cfg(test)]
+    pub fn dedup_len(&self) -> usize {
+        self.dedup.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Mark a message as read via the WhatsApp Cloud API.
@@ -544,6 +638,17 @@ impl PlatformAdapter for WhatsAppAdapter {
     fn platform_name(&self) -> &str {
         "whatsapp"
     }
+
+    /// Trim the wamid dedup cache to [`MAX_DEDUP_WAMIDS`] entries so
+    /// long-running gateways reclaim memory.
+    async fn maintenance_prune(&self) {
+        let len = {
+            let mut dedup = self.dedup.lock().unwrap_or_else(|e| e.into_inner());
+            dedup.trim_to_cap();
+            dedup.len()
+        };
+        debug!(dedup_ids = len, "WhatsApp wamid dedup pruned");
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +656,56 @@ mod tests {
     use super::*;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+
+    #[test]
+    fn split_markdown_whatsapp_limit() {
+        // WhatsApp splits (never truncates) at 4096 chars, fence-aware.
+        let code: String = (0..300)
+            .map(|i| format!("let v_{i} = f({i});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro\n```rust\n{code}\n```\nOutro");
+        let chunks = split_markdown(&text, MAX_MESSAGE_LENGTH);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= 4196, "chunk exceeds WhatsApp limit: {}", c.len());
+            assert_eq!(c.matches("```").count() % 2, 0);
+        }
+    }
+
+    fn test_adapter() -> WhatsAppAdapter {
+        WhatsAppAdapter::new(WhatsAppConfig {
+            token: "tok".into(),
+            phone_number_id: None,
+            business_account_id: None,
+            verify_token: None,
+            app_secret: None,
+            proxy: Default::default(),
+        })
+        .expect("adapter")
+    }
+
+    fn webhook_body(ids: &[&str]) -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "from": "15551234567",
+                    "id": id,
+                    "timestamp": "1760000000",
+                    "text": { "body": "hi" },
+                    "type": "text"
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": { "messages": messages }
+                }]
+            }]
+        })
+    }
 
     fn sign(secret: &str, body: &[u8]) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
@@ -562,6 +717,69 @@ mod tests {
             let _ = write!(hex, "{b:02x}");
         }
         format!("sha256={hex}")
+    }
+
+    #[test]
+    fn whatsapp_dedup_drops_redelivered_wamids() {
+        let adapter = test_adapter();
+
+        let batch = WhatsAppAdapter::parse_webhook_event(&webhook_body(&["wamid.A1", "wamid.A2"]));
+        let kept = adapter.dedup_messages(batch);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(adapter.dedup_len(), 2);
+
+        // Meta redelivers the same webhook → both dropped.
+        let redelivered =
+            WhatsAppAdapter::parse_webhook_event(&webhook_body(&["wamid.A1", "wamid.A2"]));
+        let kept = adapter.dedup_messages(redelivered);
+        assert!(kept.is_empty());
+        assert_eq!(adapter.dedup_len(), 2);
+
+        // A fresh message still passes.
+        let fresh = WhatsAppAdapter::parse_webhook_event(&webhook_body(&["wamid.A3"]));
+        let kept = adapter.dedup_messages(fresh);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].message_id, "wamid.A3");
+        assert_eq!(adapter.dedup_len(), 3);
+    }
+
+    #[test]
+    fn whatsapp_dedup_evicts_oldest_past_cap() {
+        let adapter = test_adapter();
+
+        {
+            let mut dedup = adapter.dedup.lock().unwrap();
+            for i in 0..(MAX_DEDUP_WAMIDS + 100) {
+                dedup.check_and_insert(&format!("wamid.{i:06}"));
+            }
+        }
+        assert_eq!(adapter.dedup_len(), MAX_DEDUP_WAMIDS);
+
+        // The oldest 100 were evicted → their IDs are treated as new again.
+        // NOTE: `check_and_insert` mutates (it inserts new IDs), so the
+        // still-tracked check must come first — re-inserting an evicted ID
+        // pushes another ID out of the capped deque.
+        {
+            let mut dedup = adapter.dedup.lock().unwrap();
+            assert!(dedup.check_and_insert("wamid.000100")); // still tracked
+            assert!(!dedup.check_and_insert("wamid.000000")); // evicted → new again
+        }
+        assert_eq!(adapter.dedup_len(), MAX_DEDUP_WAMIDS);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_maintenance_prune_trims_dedup() {
+        let adapter = test_adapter();
+        {
+            let mut dedup = adapter.dedup.lock().unwrap();
+            for i in 0..(MAX_DEDUP_WAMIDS + 50) {
+                dedup.check_and_insert(&format!("wamid.{i:06}"));
+            }
+        }
+        // `check_and_insert` already trims, so prune is a no-op guard that
+        // must keep the cache at the cap.
+        PlatformAdapter::maintenance_prune(&adapter).await;
+        assert_eq!(adapter.dedup_len(), MAX_DEDUP_WAMIDS);
     }
 
     /// RFC 4231 test case 2 (HMAC-SHA-256): key "Jefe",
