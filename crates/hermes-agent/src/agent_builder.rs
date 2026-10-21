@@ -146,9 +146,52 @@ pub fn provider_api_key_from_env(provider: &str) -> Option<String> {
         "nous" => "NOUS_API_KEY",
         "copilot" => "GITHUB_COPILOT_TOKEN",
         "azure" => "AZURE_OPENAI_API_KEY",
+        "azure-foundry" | "azure_foundry" => "AZURE_FOUNDRY_API_KEY",
         _ => return None,
     };
     std::env::var(var).ok().filter(|s| !s.is_empty())
+}
+
+/// Env var name for per-provider base URL overrides: `<NAME>_BASE_URL`
+/// (parity with hermes-rs factory.rs `base_url_env_var_name`, mirroring the
+/// original's per-provider `base_url_env` pattern). Non-alphanumeric
+/// characters in the provider name become `_` separators, e.g.
+/// `openai-codex` -> `OPENAI_CODEX_BASE_URL`.
+fn base_url_env_var_name(provider_name: &str) -> String {
+    let mut out = String::new();
+    for c in provider_name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_uppercase());
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    out.push_str("_BASE_URL");
+    out
+}
+
+/// Per-provider base URL override from the environment. Env wins over the
+/// provider's shipped default, but an explicit `base_url` in the provider
+/// config wins over env (hermes-rs factory.rs `resolve_base_url` parity).
+fn provider_base_url_from_env(provider_name: &str) -> Option<String> {
+    std::env::var(base_url_env_var_name(provider_name))
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolve the base URL for a provider: an explicit `base_url` in the
+/// provider config wins; otherwise honor the per-provider `<NAME>_BASE_URL`
+/// env override; `None` means the provider constructor's shipped default.
+pub(crate) fn resolve_provider_base_url(
+    config: &GatewayConfig,
+    provider_name: &str,
+) -> Option<String> {
+    config
+        .llm_providers
+        .get(provider_name)
+        .and_then(|c| c.base_url.clone())
+        .or_else(|| provider_base_url_from_env(provider_name))
 }
 
 /// Parse an Azure OpenAI target from a model string.
@@ -218,7 +261,10 @@ pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvide
         }
     };
 
-    let base_url = provider_config.and_then(|c| c.base_url.clone());
+    // Explicit config base_url wins; otherwise honor the per-provider
+    // `<NAME>_BASE_URL` env override (hermes-rs factory.rs parity); the
+    // provider constructors' shipped defaults apply when neither is set.
+    let base_url = resolve_provider_base_url(config, provider_name);
 
     match provider_name {
         "openai" => {
@@ -319,6 +365,26 @@ pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvide
                 })
             }
         },
+        "azure-foundry" | "azure_foundry" => {
+            // Azure Foundry: full user-supplied base URL used verbatim
+            // (config base_url or AZURE_FOUNDRY_BASE_URL).
+            let url = base_url.or_else(AzureOpenAiProvider::foundry_base_url_from_env);
+            match url {
+                Some(u) => {
+                    Arc::new(AzureOpenAiProvider::new_foundry(&api_key, u).with_model(model_name))
+                }
+                None => {
+                    tracing::warn!(
+                        "Azure Foundry needs a base URL \
+                         (config base_url or AZURE_FOUNDRY_BASE_URL); \
+                         falling back to StubProvider"
+                    );
+                    Arc::new(StubProvider {
+                        model: model.to_string(),
+                    })
+                }
+            }
+        }
         _ => {
             let url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
             Arc::new(GenericProvider::new(url, &api_key, model_name))
@@ -503,6 +569,67 @@ mod build_provider_tests {
         match saved_a {
             Some(v) => std::env::set_var("AZURE_OPENAI_API_KEY", v),
             None => std::env::remove_var("AZURE_OPENAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn base_url_env_var_name_matches_original_pattern() {
+        assert_eq!(base_url_env_var_name("openai"), "OPENAI_BASE_URL");
+        assert_eq!(base_url_env_var_name("openrouter"), "OPENROUTER_BASE_URL");
+        assert_eq!(base_url_env_var_name("anthropic"), "ANTHROPIC_BASE_URL");
+        assert_eq!(base_url_env_var_name("deepseek"), "DEEPSEEK_BASE_URL");
+        assert_eq!(
+            base_url_env_var_name("openai-codex"),
+            "OPENAI_CODEX_BASE_URL"
+        );
+    }
+
+    #[test]
+    fn provider_base_url_from_env_trims_and_skips_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("OPENAI_BASE_URL").ok();
+        std::env::set_var("OPENAI_BASE_URL", "https://proxy.lokal/v1/");
+        assert_eq!(
+            provider_base_url_from_env("openai").as_deref(),
+            Some("https://proxy.lokal/v1")
+        );
+        std::env::set_var("OPENAI_BASE_URL", "   ");
+        assert_eq!(provider_base_url_from_env("openai"), None);
+        std::env::remove_var("OPENAI_BASE_URL");
+        assert_eq!(provider_base_url_from_env("openai"), None);
+        match saved {
+            Some(v) => std::env::set_var("OPENAI_BASE_URL", v),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+    }
+
+    #[test]
+    fn build_provider_env_base_url_beats_shipped_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_url = std::env::var("DEEPSEEK_BASE_URL").ok();
+        std::env::set_var("DEEPSEEK_BASE_URL", "https://proxy.lokal/v1/");
+        // No config entry: env override resolves (trailing slash trimmed).
+        let cfg = GatewayConfig::default();
+        assert_eq!(
+            resolve_provider_base_url(&cfg, "deepseek").as_deref(),
+            Some("https://proxy.lokal/v1")
+        );
+        // Explicit config base_url beats env.
+        let mut cfg2 = GatewayConfig::default();
+        cfg2.llm_providers.insert(
+            "deepseek".to_string(),
+            hermes_config::LlmProviderConfig {
+                base_url: Some("https://explicit.example/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            resolve_provider_base_url(&cfg2, "deepseek").as_deref(),
+            Some("https://explicit.example/v1")
+        );
+        match saved_url {
+            Some(v) => std::env::set_var("DEEPSEEK_BASE_URL", v),
+            None => std::env::remove_var("DEEPSEEK_BASE_URL"),
         }
     }
 }
