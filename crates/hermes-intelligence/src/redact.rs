@@ -91,6 +91,46 @@ static BUILTIN_PATTERNS: LazyLock<Vec<RedactionPattern>> = LazyLock::new(|| {
             regex: Regex::new(r#"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"#).unwrap(),
             replacement: "[REDACTED_IP]".into(),
         },
+        // --- Exec-output secret shapes (parity with hermes-core::redact_secrets) ---
+        // Generic key=value / key: value assignments (key name kept).
+        RedactionPattern {
+            name: "exec_key_value".into(),
+            regex: Regex::new(
+                r#"(?i)([\w.-]*?(?:api[_-]?key|token|secret|password|passwd|bearer))(\s*[=:]\s*)("[^"]*"|'[^']*'|\S+)"#,
+            )
+            .unwrap(),
+            replacement: "${1}${2}[REDACTED]".into(),
+        },
+        // Standalone "Bearer <token>" Authorization header.
+        RedactionPattern {
+            name: "bearer_header".into(),
+            regex: Regex::new(r"(?i)\b(bearer)(\s+)(\S+)").unwrap(),
+            replacement: "${1}${2}[REDACTED]".into(),
+        },
+        // AWS access key ID: AKIA + 16 characters.
+        RedactionPattern {
+            name: "aws_access_key".into(),
+            regex: Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(),
+            replacement: "[REDACTED]".into(),
+        },
+        // JWT: eyJ.<base64url>.<base64url>.
+        RedactionPattern {
+            name: "jwt_token".into(),
+            regex: Regex::new(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b").unwrap(),
+            replacement: "[REDACTED]".into(),
+        },
+        // Slack tokens: xox[bap]-...
+        RedactionPattern {
+            name: "slack_token".into(),
+            regex: Regex::new(r"\bxox[bap]-[A-Za-z0-9-]+\b").unwrap(),
+            replacement: "[REDACTED]".into(),
+        },
+        // GitHub tokens: ghp_/gho_/ghu_/ghs_/ghr_...
+        RedactionPattern {
+            name: "github_token".into(),
+            regex: Regex::new(r"\bgh[pousr]_[A-Za-z0-9_]+\b").unwrap(),
+            replacement: "[REDACTED]".into(),
+        },
     ]
 });
 
@@ -305,5 +345,36 @@ mod tests {
         let redactor = Redactor::empty();
         let text = "Nothing to redact here";
         assert_eq!(redactor.redact(text), text);
+    }
+
+    #[test]
+    fn test_redact_exec_secret_shapes() {
+        let redactor = Redactor::new();
+        // key=value / key: value assignments (key name kept).
+        let r = redactor.redact("api_key=hunter2value");
+        assert!(r.contains("api_key=[REDACTED]"));
+        assert!(!r.contains("hunter2value"));
+        let r = redactor.redact("token: abc123");
+        assert!(r.contains("token: [REDACTED]"));
+        // Standalone Bearer header.
+        let r = redactor.redact("Authorization: Bearer abc123token");
+        assert!(r.contains("Bearer [REDACTED]"));
+        assert!(!r.contains("abc123token"));
+        // AWS access key ID.
+        let r = redactor.redact("key is AKIAIOSFODNN7EXAMPLE here");
+        assert!(r.contains("[REDACTED]"));
+        assert!(!r.contains("AKIAIOSFODNN7EXAMPLE"));
+        // JWT shape.
+        let r = redactor.redact("jwt eyJzdWI.eyJzdWI.c2ln end");
+        assert!(r.contains("[REDACTED]"));
+        assert!(!r.contains("eyJzdWI"));
+        // Slack token.
+        let r = redactor.redact("token xoxb-1234-abcdef");
+        assert!(r.contains("[REDACTED]"));
+        assert!(!r.contains("xoxb-1234-abcdef"));
+        // GitHub token.
+        let r = redactor.redact("using ghp_abcdef1234567890");
+        assert!(r.contains("[REDACTED]"));
+        assert!(!r.contains("ghp_abcdef1234567890"));
     }
 }

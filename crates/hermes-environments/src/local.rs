@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::process::Command as TokioCommand;
 
-use hermes_core::{AgentError, CommandOutput, TerminalBackend};
+use hermes_core::{redact_secrets, sanitize_spawn_env, AgentError, CommandOutput, TerminalBackend};
 
 /// A [`TerminalBackend`] that runs commands on the local machine.
 pub struct LocalBackend {
@@ -68,13 +68,17 @@ impl TerminalBackend for LocalBackend {
                     pty_cmd.current_dir(dir);
                 }
 
+                // Security: strip credential env vars from the child and
+                // redact any secrets from its captured output.
+                sanitize_spawn_env(pty_cmd.as_std_mut());
+
                 let result =
                     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
                         let output = pty_cmd.output().await.map_err(|e| {
                             AgentError::Io(format!("Failed to spawn PTY command: {}", e))
                         })?;
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                        let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
+                        let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
                         Ok(CommandOutput {
                             exit_code: output.status.code().unwrap_or(-1),
                             stdout: if stdout.len() > self.max_output_size {
@@ -122,6 +126,10 @@ impl TerminalBackend for LocalBackend {
             cmd.stdin(Stdio::null());
         }
 
+        // Security: strip credential env vars from the child and redact any
+        // secrets from its captured output.
+        sanitize_spawn_env(cmd.as_std_mut());
+
         let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
             let child = cmd
                 .spawn()
@@ -150,8 +158,8 @@ impl TerminalBackend for LocalBackend {
                 .await
                 .map_err(|e| AgentError::Io(format!("Failed to wait for command: {}", e)))?;
 
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = redact_secrets(&String::from_utf8_lossy(&output.stdout));
+            let stderr = redact_secrets(&String::from_utf8_lossy(&output.stderr));
 
             // Truncate output if it exceeds max_output_size
             let stdout = if stdout.len() > self.max_output_size {
@@ -344,5 +352,62 @@ mod tests {
             .file_exists("/tmp/hermes_nonexistent_test_file_xyz")
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_strips_credential_env_vars() {
+        // Unique names so parallel tests cannot collide with them.
+        std::env::set_var("HERMES_LOCAL_TEST_STRIP_API_KEY", "SHOULDNOTLEAK1");
+        std::env::set_var("HERMES_LOCAL_TEST_KEEP", "keepme");
+        let backend = LocalBackend::default();
+        let output = backend
+            .execute_command("env", None, None, false, false)
+            .await
+            .unwrap();
+        std::env::remove_var("HERMES_LOCAL_TEST_STRIP_API_KEY");
+        std::env::remove_var("HERMES_LOCAL_TEST_KEEP");
+
+        assert!(
+            !output
+                .stdout
+                .lines()
+                .any(|l| l.starts_with("HERMES_LOCAL_TEST_STRIP_API_KEY=")),
+            "credential env var leaked into child"
+        );
+        assert!(
+            !output.stdout.contains("SHOULDNOTLEAK1"),
+            "credential value leaked into child"
+        );
+        assert!(
+            output
+                .stdout
+                .lines()
+                .any(|l| l == "HERMES_LOCAL_TEST_KEEP=keepme"),
+            "normal env var must pass through"
+        );
+        assert!(
+            output.stdout.lines().any(|l| l.starts_with("PATH=")),
+            "PATH must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_redacts_secrets_in_output() {
+        let backend = LocalBackend::default();
+        let output = backend
+            .execute_command("echo 'api_key=hunter2value'", None, None, false, false)
+            .await
+            .unwrap();
+        assert!(
+            !output.stdout.contains("hunter2value"),
+            "secret leaked in stdout"
+        );
+        assert!(output.stdout.contains("[REDACTED]"));
+
+        let output = backend
+            .execute_command("echo hello", None, None, false, false)
+            .await
+            .unwrap();
+        assert!(output.stdout.contains("hello"));
     }
 }

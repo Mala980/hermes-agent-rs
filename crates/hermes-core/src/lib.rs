@@ -5,6 +5,7 @@
 //! used across the hermes-agent-rust workspace.
 
 pub mod errors;
+pub mod exec_security;
 pub mod tool_call_parser;
 pub mod tool_schema;
 pub mod traits;
@@ -12,6 +13,11 @@ pub mod types;
 
 #[cfg(test)]
 pub mod test_generators;
+
+// Re-export exec security helpers (credential env blocklist, secret redaction)
+pub use exec_security::{
+    apply_sanitized_env, is_credential_env_var, redact_secrets, sanitize_spawn_env,
+};
 
 // Re-export all error types
 pub use errors::{AgentError, ConfigError, GatewayError, ToolError};
