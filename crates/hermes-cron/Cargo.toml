@@ -16,6 +16,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 cron = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+iana-time-zone = { workspace = true }
+libc = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

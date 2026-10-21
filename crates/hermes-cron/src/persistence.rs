@@ -28,6 +28,13 @@ pub trait JobPersistence: Send + Sync {
 
     /// Delete a single job by ID.
     async fn delete_job(&self, id: &str) -> Result<(), CronPersistenceError>;
+
+    /// Directory holding this backend's state, used for the cross-process
+    /// tick lock. `None` when the backend has no suitable directory (the
+    /// scheduler then skips tick locking).
+    fn data_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +156,10 @@ impl JobPersistence for FileJobPersistence {
             fs::remove_file(path).await?;
         }
         Ok(())
+    }
+
+    fn data_dir(&self) -> Option<PathBuf> {
+        Some(self.data_dir.clone())
     }
 }
 
@@ -298,6 +309,10 @@ impl JobPersistence for SqliteJobPersistence {
             .map_err(|e| CronPersistenceError::Sqlite(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn data_dir(&self) -> Option<PathBuf> {
+        self.db_path.parent().map(|p| p.to_path_buf())
     }
 }
 

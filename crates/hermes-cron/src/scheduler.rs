@@ -4,8 +4,20 @@
 //! updating, pausing, resuming, removal, and execution. It runs a background
 //! loop that polls for due jobs (default every 60s, overridable via
 //! `HERMES_CRON_TICK_SECS`) and dispatches them to the `CronRunner`.
+//!
+//! Each tick:
+//! - acquires the cross-process [`TickLock`][crate::tick_lock] so two
+//!   schedulers (e.g. after a watchdog relaunch) never double-fire a job;
+//! - runs every due job in its own async task (concurrently), so one slow
+//!   job does not block the others;
+//! - applies the job's [`OverlapPolicy`][crate::job::OverlapPolicy]
+//!   (`skip` by default): a tick arriving while the same job's previous run
+//!   is still in flight is skipped with a warning;
+//! - runs each job through the [`run_job_with_retries`][crate::retry] ladder
+//!   (transient failures retried up to 3x with jittered backoff);
+//! - removes one-shot (`at …`) jobs from the store after they fire once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -14,9 +26,14 @@ use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::time::{self, Duration};
 
 use crate::completion::CronCompletionEvent;
-use crate::job::{CronJob, JobStatus};
+use crate::job::{CronJob, JobStatus, OverlapPolicy};
 use crate::persistence::JobPersistence;
+use crate::retry::run_job_with_retries;
 use crate::runner::CronRunner;
+use crate::tick_lock::TickLock;
+
+/// IDs of jobs with a run currently in flight (for skip-if-running).
+pub type RunningJobs = Arc<std::sync::Mutex<HashSet<String>>>;
 
 /// Background poll interval for due jobs. Default **60** seconds.
 ///
@@ -82,6 +99,8 @@ pub struct CronScheduler {
     stop_notify: Arc<Notify>,
     /// Whether the scheduler loop is running.
     running: Arc<Mutex<bool>>,
+    /// Job IDs with a run currently in flight (skip-if-running policy).
+    in_flight: RunningJobs,
 }
 
 impl CronScheduler {
@@ -94,6 +113,7 @@ impl CronScheduler {
             completion_tx: None,
             stop_notify: Arc::new(Notify::new()),
             running: Arc::new(Mutex::new(false)),
+            in_flight: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -103,7 +123,7 @@ impl CronScheduler {
     }
 
     fn emit_completion(
-        tx: &Option<broadcast::Sender<CronCompletionEvent>>,
+        tx: Option<&broadcast::Sender<CronCompletionEvent>>,
         job: &CronJob,
         trigger: &'static str,
         outcome: Result<&AgentResult, String>,
@@ -162,6 +182,7 @@ impl CronScheduler {
         let completion_tx = self.completion_tx.clone();
         let stop_notify = self.stop_notify.clone();
         let running_flag = self.running.clone();
+        let in_flight = self.in_flight.clone();
 
         tokio::spawn(async move {
             loop {
@@ -181,68 +202,165 @@ impl CronScheduler {
                     }
                 }
 
-                let now = Utc::now();
-                let mut guard = jobs.lock().await;
-                let due_job_ids: Vec<String> = guard
-                    .iter()
-                    .filter(|(_, job)| job.is_due(now))
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
-                for job_id in due_job_ids {
-                    let job = guard.get(&job_id).cloned();
-                    if let Some(mut job) = job {
-                        drop(&mut guard);
-
-                        // Run the job
-                        tracing::info!(
-                            "Executing cron job '{}' ({})",
-                            job.name.as_deref().unwrap_or(&job.id),
-                            job.id
-                        );
-                        match runner.run_job(&job).await {
-                            Ok(result) => {
-                                tracing::info!(
-                                    "Cron job '{}' completed successfully (turns: {})",
-                                    job.id,
-                                    result.total_turns
-                                );
-                                Self::emit_completion(
-                                    &completion_tx,
-                                    &job,
-                                    "schedule",
-                                    Ok(&result),
-                                );
-                                job.mark_executed(now);
-                            }
-                            Err(e) => {
-                                tracing::error!("Cron job '{}' failed: {}", job.id, e);
-                                Self::emit_completion(
-                                    &completion_tx,
-                                    &job,
-                                    "schedule",
-                                    Err(e.to_string()),
-                                );
-                                job.mark_failed();
-                            }
-                        }
-
-                        // Update the job in memory and persist
-                        guard = jobs.lock().await;
-                        guard.insert(job.id.clone(), job.clone());
-                        drop(&mut guard);
-
-                        if let Err(e) = persistence.save_job(&job).await {
-                            tracing::error!("Failed to persist job '{}': {}", job.id, e);
-                        }
-
-                        guard = jobs.lock().await;
-                    }
-                }
+                Self::tick(&jobs, &persistence, &runner, &completion_tx, &in_flight).await;
             }
 
             tracing::info!("Scheduler loop exited");
         });
+    }
+
+    /// Process a single tick: run every due job (public so tests and
+    /// embedders can drive ticks deterministically without the background
+    /// loop).
+    pub async fn process_due_jobs(&self) {
+        Self::tick(
+            &self.jobs,
+            &self.persistence,
+            &self.runner,
+            &self.completion_tx,
+            &self.in_flight,
+        )
+        .await;
+    }
+
+    /// One tick: acquire the cross-process tick lock, then run every due job
+    /// in its own async task (concurrently).
+    async fn tick(
+        jobs: &Arc<Mutex<HashMap<String, CronJob>>>,
+        persistence: &Arc<dyn JobPersistence>,
+        runner: &Arc<CronRunner>,
+        completion_tx: &Option<broadcast::Sender<CronCompletionEvent>>,
+        in_flight: &RunningJobs,
+    ) {
+        // Cross-process tick lock: when another scheduler (e.g. a leftover
+        // process after a watchdog relaunch) holds it, skip the whole tick
+        // with a warning — never double-fire.
+        let _tick_lock = match persistence.data_dir() {
+            Some(dir) => match TickLock::acquire(&dir) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    tracing::warn!("tick skipped: another scheduler holds the cron tick lock");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("tick skipped: failed to acquire cron tick lock: {e}");
+                    return;
+                }
+            },
+            None => {
+                tracing::debug!(
+                    "cron persistence has no data dir; tick proceeds without a tick lock"
+                );
+                None
+            }
+        };
+
+        let now = Utc::now();
+        let due_jobs: Vec<CronJob> = {
+            let guard = jobs.lock().await;
+            guard
+                .values()
+                .filter(|job| job.is_due(now))
+                .cloned()
+                .collect()
+        };
+
+        for job in due_jobs {
+            // Skip-if-running: atomic check-and-mark under one lock.
+            if job.overlap == OverlapPolicy::Skip {
+                let already_running = {
+                    let mut set = in_flight.lock().unwrap();
+                    !set.insert(job.id.clone()) // insert=false when the id is already present
+                };
+                if already_running {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        "tick skipped: previous run still in flight (skip-if-running)"
+                    );
+                    let mut skipped = job.clone();
+                    skipped.advance_past_due(Utc::now());
+                    Self::store_job(jobs, persistence, &skipped).await;
+                    continue;
+                }
+            }
+            let tracked = job.overlap == OverlapPolicy::Skip;
+            let jobs = jobs.clone();
+            let persistence = persistence.clone();
+            let runner = runner.clone();
+            let completion_tx = completion_tx.clone();
+            let in_flight = in_flight.clone();
+            tokio::spawn(async move {
+                // Guard releases the id from the in-flight set when the task
+                // ends — including on panic — so the job never wedges.
+                let _guard = RunningGuard::new(in_flight, tracked.then(|| job.id.clone()));
+                let job_id = job.id.clone();
+                let job_name = job.name.clone().unwrap_or_else(|| job_id.clone());
+                tracing::info!("Executing cron job '{job_name}' ({job_id})");
+                let mut job = job;
+                let now = Utc::now();
+                // Run-level retry ladder: transient failures (unreachable
+                // model/provider) are retried; deterministic ones fail fast.
+                match run_job_with_retries(&runner, &job).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            "Cron job '{job_id}' completed successfully (turns: {})",
+                            result.total_turns
+                        );
+                        Self::emit_completion(
+                            completion_tx.as_ref(),
+                            &job,
+                            "schedule",
+                            Ok(&result),
+                        );
+                        job.mark_executed(now);
+                    }
+                    Err(e) => {
+                        tracing::error!("Cron job '{job_id}' failed: {e}");
+                        Self::emit_completion(
+                            completion_tx.as_ref(),
+                            &job,
+                            "schedule",
+                            Err(e.to_string()),
+                        );
+                        job.mark_failed();
+                    }
+                }
+
+                if job.is_oneshot() {
+                    // One-shot: remove from the store after firing exactly
+                    // once, whatever the run's outcome — it has "fired".
+                    {
+                        let mut guard = jobs.lock().await;
+                        guard.remove(&job_id);
+                    }
+                    match persistence.delete_job(&job_id).await {
+                        Ok(()) => tracing::info!(
+                            "one-shot cron job '{job_id}' finished; removed from store"
+                        ),
+                        Err(e) => {
+                            tracing::warn!("failed to remove one-shot cron job '{job_id}': {e}")
+                        }
+                    }
+                } else {
+                    Self::store_job(&jobs, &persistence, &job).await;
+                }
+            });
+        }
+    }
+
+    /// Update a job in memory and persist it.
+    async fn store_job(
+        jobs: &Arc<Mutex<HashMap<String, CronJob>>>,
+        persistence: &Arc<dyn JobPersistence>,
+        job: &CronJob,
+    ) {
+        {
+            let mut guard = jobs.lock().await;
+            guard.insert(job.id.clone(), job.clone());
+        }
+        if let Err(e) = persistence.save_job(job).await {
+            tracing::error!("Failed to persist job '{}': {}", job.id, e);
+        }
     }
 
     /// Stop the scheduler loop.
@@ -447,10 +565,15 @@ impl CronScheduler {
         tracing::info!("Manually triggering cron job '{}'", id);
         let run_result = self.runner.run_job(&job).await;
         match &run_result {
-            Ok(result) => Self::emit_completion(&self.completion_tx, &job, "manual", Ok(result)),
-            Err(e) => {
-                Self::emit_completion(&self.completion_tx, &job, "manual", Err(e.to_string()))
+            Ok(result) => {
+                Self::emit_completion(self.completion_tx.as_ref(), &job, "manual", Ok(result))
             }
+            Err(e) => Self::emit_completion(
+                self.completion_tx.as_ref(),
+                &job,
+                "manual",
+                Err(e.to_string()),
+            ),
         }
         let result = run_result?;
 
@@ -478,18 +601,245 @@ impl CronScheduler {
     }
 }
 
+/// Releases a job id from the in-flight set when the run task ends.
+struct RunningGuard {
+    running: RunningJobs,
+    id: Option<String>,
+}
+
+impl RunningGuard {
+    fn new(running: RunningJobs, id: Option<String>) -> Self {
+        Self { running, id }
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            // Poisoned-mutex resilience: a poisoned lock still lets us clean up.
+            if let Ok(mut set) = self.running.lock() {
+                set.remove(&id);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use tempfile::tempdir;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration as StdDuration;
+
+    use async_trait::async_trait;
+    use futures::stream::{self, StreamExt};
+    use hermes_agent::agent_loop::ToolRegistry;
+    use hermes_core::{AgentError, LlmProvider, LlmResponse, Message, StreamChunk, ToolSchema};
+    use tempfile::{tempdir, TempDir};
 
     use crate::cli_support::cron_scheduler_for_data_dir;
-    use crate::job::CronJob;
+    use crate::job::{CronJob, OverlapPolicy};
+    use crate::persistence::FileJobPersistence;
+    use crate::runner::CronRunner;
+    use crate::tick_lock::TickLock;
 
     fn make_test_scheduler() -> CronScheduler {
         let dir = tempdir().expect("tempdir");
         cron_scheduler_for_data_dir(dir.path().to_path_buf())
+    }
+
+    /// Scheduler with a custom runner over `dir`.
+    fn scheduler_with_runner(dir: &TempDir, runner: CronRunner) -> CronScheduler {
+        let persistence = Arc::new(FileJobPersistence::with_dir(dir.path().to_path_buf()));
+        CronScheduler::new(persistence, Arc::new(runner))
+    }
+
+    fn runner_with_provider(provider: Arc<dyn LlmProvider>) -> CronRunner {
+        CronRunner::new(provider, Arc::new(ToolRegistry::new()))
+    }
+
+    /// Force a persisted job to be due now: rewrite its JSON `next_run`,
+    /// then reload into the scheduler's memory.
+    async fn force_due(sched: &CronScheduler, dir: &TempDir, id: &str) {
+        let path = dir.path().join(format!("{id}.json"));
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["next_run"] = serde_json::json!((Utc::now() - chrono::Duration::seconds(5)).to_rfc3339());
+        std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        sched.load_persisted_jobs().await.unwrap();
+    }
+
+    /// Poll until `cond()` is true (timeout keeps the suite hang-free).
+    async fn poll_until(cond: impl Fn() -> bool, what: &str) {
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            while !cond() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+    }
+
+    /// Synchronous run_count read for use inside poll_until's Fn closure.
+    fn run_count_blocking(sched: &CronScheduler, id: &str) -> u32 {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { sched.get_job(id).await.map(|j| j.run_count).unwrap_or(0) })
+        })
+    }
+
+    /// Provider that counts calls and returns "done" immediately.
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn chat_completion(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_tokens: Option<u32>,
+            _temperature: Option<f64>,
+            model: Option<&str>,
+            _extra_body: Option<&serde_json::Value>,
+        ) -> Result<LlmResponse, AgentError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResponse {
+                message: Message::assistant("done"),
+                usage: None,
+                model: model.unwrap_or("mock").to_string(),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        fn chat_completion_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_tokens: Option<u32>,
+            _temperature: Option<f64>,
+            _model: Option<&str>,
+            _extra_body: Option<&serde_json::Value>,
+        ) -> futures::stream::BoxStream<'static, Result<StreamChunk, AgentError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    /// Provider whose FIRST call per unique prompt blocks on `release` until
+    /// the test fires it; later calls return immediately. Lets tests hold a
+    /// run in flight deterministically. `first_calls` counts blocked first
+    /// calls; `calls` counts every call.
+    struct BlockingProvider {
+        first_calls: AtomicUsize,
+        calls: AtomicUsize,
+        seen: std::sync::Mutex<HashSet<String>>,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingProvider {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                first_calls: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                seen: std::sync::Mutex::new(HashSet::new()),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn prompt_key(messages: &[Message]) -> String {
+            messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, hermes_core::MessageRole::User))
+                .and_then(|m| m.content.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingProvider {
+        async fn chat_completion(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_tokens: Option<u32>,
+            _temperature: Option<f64>,
+            model: Option<&str>,
+            _extra_body: Option<&serde_json::Value>,
+        ) -> Result<LlmResponse, AgentError> {
+            let key = Self::prompt_key(messages);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let first = {
+                let mut seen = self.seen.lock().unwrap();
+                seen.insert(key)
+            };
+            if first {
+                self.first_calls.fetch_add(1, Ordering::SeqCst);
+                // Block (with a backstop so a broken test cannot hang the suite).
+                let _ =
+                    tokio::time::timeout(StdDuration::from_secs(15), self.release.notified()).await;
+            }
+            Ok(LlmResponse {
+                message: Message::assistant("done"),
+                usage: None,
+                model: model.unwrap_or("mock").to_string(),
+                finish_reason: Some("stop".to_string()),
+            })
+        }
+
+        fn chat_completion_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_tokens: Option<u32>,
+            _temperature: Option<f64>,
+            _model: Option<&str>,
+            _extra_body: Option<&serde_json::Value>,
+        ) -> futures::stream::BoxStream<'static, Result<StreamChunk, AgentError>> {
+            stream::empty().boxed()
+        }
+    }
+
+    /// Newtype so the same `Arc<BlockingProvider>` can be moved into the
+    /// runner while tests keep a handle to it.
+    struct BlockingProviderClone(Arc<BlockingProvider>);
+
+    #[async_trait]
+    impl LlmProvider for BlockingProviderClone {
+        async fn chat_completion(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            max_tokens: Option<u32>,
+            temperature: Option<f64>,
+            model: Option<&str>,
+            extra_body: Option<&serde_json::Value>,
+        ) -> Result<LlmResponse, AgentError> {
+            self.0
+                .chat_completion(messages, tools, max_tokens, temperature, model, extra_body)
+                .await
+        }
+
+        fn chat_completion_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            max_tokens: Option<u32>,
+            temperature: Option<f64>,
+            model: Option<&str>,
+            extra_body: Option<&serde_json::Value>,
+        ) -> futures::stream::BoxStream<'static, Result<StreamChunk, AgentError>> {
+            self.0.chat_completion_stream(
+                messages,
+                tools,
+                max_tokens,
+                temperature,
+                model,
+                extra_body,
+            )
+        }
     }
 
     #[tokio::test]
@@ -514,5 +864,219 @@ mod tests {
         let loaded = sched.get_job(&id).await.expect("get");
         assert_eq!(loaded.prompt, "hello");
         assert_eq!(sched.list_jobs().await.len(), 1);
+    }
+
+    // --- Wave 6 parity: tick lock / overlap / concurrency / one-shot ---
+
+    #[tokio::test]
+    async fn tick_skipped_when_lock_held_by_other_scheduler() {
+        let dir = tempdir().unwrap();
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let sched = scheduler_with_runner(&dir, runner_with_provider(provider.clone()));
+
+        let id = sched
+            .create_job(CronJob::new("every 1s", "lock me"))
+            .await
+            .unwrap();
+        force_due(&sched, &dir, &id).await;
+
+        // Simulate another scheduler holding the tick lock.
+        let _other = TickLock::acquire(dir.path())
+            .unwrap()
+            .expect("lock must be acquirable");
+        sched.process_due_jobs().await;
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "job must not run while another scheduler holds the tick lock"
+        );
+
+        // After the lock is released the next tick runs normally.
+        drop(_other);
+        sched.process_due_jobs().await;
+        poll_until(
+            || provider.calls.load(Ordering::SeqCst) >= 1,
+            "job runs after lock release",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn due_jobs_run_concurrently_not_sequentially() {
+        let dir = tempdir().unwrap();
+        let provider = BlockingProvider::new();
+        let sched = scheduler_with_runner(
+            &dir,
+            runner_with_provider(Arc::new(BlockingProviderClone(provider.clone()))),
+        );
+
+        let id_a = sched
+            .create_job(CronJob::new("every 1s", "job-a"))
+            .await
+            .unwrap();
+        let id_b = sched
+            .create_job(CronJob::new("every 1s", "job-b"))
+            .await
+            .unwrap();
+        force_due(&sched, &dir, &id_a).await;
+        force_due(&sched, &dir, &id_b).await;
+
+        sched.process_due_jobs().await;
+        // Both runs must be in flight at the same time: each blocks on its
+        // first provider call, so first_calls only reaches 2 when both have
+        // started (a sequential scheduler could never start the second).
+        poll_until(
+            || provider.first_calls.load(Ordering::SeqCst) == 2,
+            "both jobs in flight concurrently",
+        )
+        .await;
+
+        provider.release.notify_waiters();
+        poll_until(
+            || run_count_blocking(&sched, &id_a) == 1 && run_count_blocking(&sched, &id_b) == 1,
+            "both jobs completed",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlap_skip_skips_tick_while_running() {
+        let dir = tempdir().unwrap();
+        let provider = BlockingProvider::new();
+        let sched = scheduler_with_runner(
+            &dir,
+            runner_with_provider(Arc::new(BlockingProviderClone(provider.clone()))),
+        );
+
+        let mut job = CronJob::new("every 1s", "skip-me");
+        job.overlap = OverlapPolicy::Skip;
+        let id = sched.create_job(job).await.unwrap();
+        force_due(&sched, &dir, &id).await;
+
+        // Tick 1: the run starts and blocks in the provider.
+        sched.process_due_jobs().await;
+        poll_until(
+            || provider.first_calls.load(Ordering::SeqCst) == 1,
+            "first run started",
+        )
+        .await;
+
+        // Tick 2 while the first run is still in flight: must be skipped
+        // (the job is still due because the blocked run was never marked).
+        sched.process_due_jobs().await;
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        assert_eq!(
+            provider.first_calls.load(Ordering::SeqCst),
+            1,
+            "second tick must be skipped while the first run is in flight"
+        );
+
+        // Release the first run; it completes.
+        provider.release.notify_waiters();
+        poll_until(
+            || run_count_blocking(&sched, &id) == 1,
+            "first run completed",
+        )
+        .await;
+
+        // The in-flight set must have been released: force due again and the
+        // next tick starts a second run. Snapshot total calls first — the
+        // second run reuses the seen prompt, so it shows up as a new call
+        // rather than a new first-call.
+        let calls_before = provider.calls.load(Ordering::SeqCst);
+        force_due(&sched, &dir, &id).await;
+        sched.process_due_jobs().await;
+        poll_until(
+            || provider.calls.load(Ordering::SeqCst) > calls_before,
+            "second run starts after release",
+        )
+        .await;
+        provider.release.notify_waiters();
+        poll_until(
+            || run_count_blocking(&sched, &id) == 2,
+            "second run completed",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn overlap_allow_runs_despite_inflight() {
+        let dir = tempdir().unwrap();
+        let provider = BlockingProvider::new();
+        let mut sched = scheduler_with_runner(
+            &dir,
+            runner_with_provider(Arc::new(BlockingProviderClone(provider.clone()))),
+        );
+        // Completion events prove each run finished (run_count is racy when
+        // two runs of the same job complete out of order).
+        let (completion_tx, mut completion_rx) = tokio::sync::broadcast::channel(16);
+        sched.set_completion_broadcast(completion_tx);
+
+        let mut job = CronJob::new("every 1s", "allow-me");
+        job.overlap = OverlapPolicy::Allow;
+        let id = sched.create_job(job).await.unwrap();
+        force_due(&sched, &dir, &id).await;
+
+        // Tick 1: first run starts and blocks.
+        sched.process_due_jobs().await;
+        poll_until(
+            || provider.first_calls.load(Ordering::SeqCst) == 1,
+            "first run started",
+        )
+        .await;
+
+        // Tick 2 while the first run is in flight: overlap=allow starts a
+        // second run (next_run is still in the past: the blocked run was
+        // never marked executed). The first run is blocked in the provider,
+        // so any new provider call must belong to the second run.
+        sched.process_due_jobs().await;
+        poll_until(
+            || provider.calls.load(Ordering::SeqCst) >= 2,
+            "second run starts despite in-flight first run",
+        )
+        .await;
+
+        // Both runs complete: exactly two completion events arrive.
+        provider.release.notify_waiters();
+        for n in 1..=2 {
+            tokio::time::timeout(StdDuration::from_secs(10), completion_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for completion event {n}"))
+                .expect("completion channel must stay open");
+        }
+    }
+
+    #[tokio::test]
+    async fn oneshot_job_removed_after_single_fire() {
+        let dir = tempdir().unwrap();
+        let sched = scheduler_with_runner(
+            &dir,
+            runner_with_provider(Arc::new(CountingProvider {
+                calls: AtomicUsize::new(0),
+            })),
+        );
+
+        // One-shot an hour out, then force it due now.
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let job = CronJob::new(format!("at {}", future.to_rfc3339()), "once");
+        assert!(job.is_oneshot());
+        let id = sched.create_job(job).await.unwrap();
+        force_due(&sched, &dir, &id).await;
+
+        sched.process_due_jobs().await;
+
+        // The one-shot must disappear from the store after firing once.
+        poll_until(
+            || !Path::new(&dir.path().join(format!("{id}.json"))).exists(),
+            "one-shot job removed from store",
+        )
+        .await;
+        assert!(
+            sched.get_job(&id).await.is_none(),
+            "one-shot job must not linger in memory"
+        );
     }
 }
