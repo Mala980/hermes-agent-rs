@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::adapter::{BenchmarkAdapter, TaskSpec};
 use crate::error::{EvalError, EvalResult};
-use crate::result::{AggregateMetrics, RunRecord, TaskResult, TaskStatus};
+use crate::result::{
+    clamp_threshold, eval_passes, AggregateMetrics, RunRecord, TaskResult, TaskStatus,
+};
 use crate::verifier::VerificationOutcome;
 
 /// Configuration for a benchmark run.
@@ -32,6 +34,12 @@ pub struct RunnerConfig {
     pub seed: u64,
     /// Whether to continue on per-task error (true) or fail the whole run (false).
     pub continue_on_error: bool,
+    /// Optional pass/fail threshold in percent (0–100), the library-level
+    /// equivalent of the reference port's `hermes eval run --threshold` flag:
+    /// when set, the run's score (`pass_at_1 * 100`) must reach the clamped
+    /// threshold for `AggregateMetrics::suite_passed` to be true. `None`
+    /// (default) means no pass/fail verdict is computed.
+    pub pass_threshold_pct: Option<f64>,
 }
 
 impl Default for RunnerConfig {
@@ -43,6 +51,7 @@ impl Default for RunnerConfig {
             task_filter: None,
             seed: 0,
             continue_on_error: true,
+            pass_threshold_pct: None,
         }
     }
 }
@@ -124,7 +133,10 @@ impl Runner {
             }
         }
 
-        let metrics = aggregate_metrics(&task_results);
+        let metrics = apply_threshold(
+            aggregate_metrics(&task_results),
+            self.config.pass_threshold_pct,
+        );
         let finished_at = chrono::Utc::now();
 
         Ok(RunRecord {
@@ -295,6 +307,7 @@ fn aggregate_metrics(tasks: &[TaskResult]) -> AggregateMetrics {
         total_tokens_input: total_tokens_in,
         total_tokens_output: total_tokens_out,
         total_cost_usd: total_cost,
+        ..Default::default()
     }
 }
 
@@ -302,6 +315,24 @@ fn num_cpus_fallback() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(4)
+}
+
+/// Attach the pass/fail verdict when a threshold was configured.
+///
+/// Mirrors the reference port's `hermes eval run --threshold` semantics:
+/// score = `pass_at_1 * 100`, threshold clamped to 0–100, verdict via
+/// [`eval_passes`]. `None` leaves the metrics untouched (no verdict).
+fn apply_threshold(
+    mut metrics: AggregateMetrics,
+    pass_threshold_pct: Option<f64>,
+) -> AggregateMetrics {
+    if let Some(t) = pass_threshold_pct {
+        let threshold = clamp_threshold(t);
+        let score_pct = metrics.pass_at_1 * 100.0;
+        metrics.threshold_pct = Some(threshold);
+        metrics.suite_passed = Some(eval_passes(score_pct, threshold));
+    }
+    metrics
 }
 
 #[cfg(test)]
@@ -363,5 +394,106 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EvalError::DatasetLoad(_)));
+    }
+
+    /// Adapter with two tasks; the verifier passes task "pass" and fails
+    /// task "fail" → score 50%.
+    struct HalfPassAdapter;
+
+    #[async_trait]
+    impl BenchmarkAdapter for HalfPassAdapter {
+        fn metadata(&self) -> BenchmarkMetadata {
+            BenchmarkMetadata {
+                id: "half".into(),
+                name: "half".into(),
+                source: "test".into(),
+                version: "0".into(),
+            }
+        }
+
+        async fn load_tasks(&self) -> EvalResult<Vec<TaskSpec>> {
+            Ok(vec!["pass", "fail"]
+                .into_iter()
+                .map(|id| TaskSpec {
+                    task_id: id.into(),
+                    category: None,
+                    instruction: id.into(),
+                    context: serde_json::json!({}),
+                    timeout: std::time::Duration::from_secs(5),
+                })
+                .collect())
+        }
+
+        fn verifier(&self) -> Box<dyn Verifier> {
+            struct V;
+            #[async_trait]
+            impl Verifier for V {
+                async fn verify(
+                    &self,
+                    task: &TaskSpec,
+                    _: &serde_json::Value,
+                ) -> EvalResult<VerificationOutcome> {
+                    if task.task_id == "pass" {
+                        Ok(VerificationOutcome::pass())
+                    } else {
+                        Ok(VerificationOutcome::fail("boom"))
+                    }
+                }
+            }
+            Box::new(V)
+        }
+    }
+
+    async fn half_run(threshold: Option<f64>) -> RunRecord {
+        Runner::new(RunnerConfig {
+            pass_threshold_pct: threshold,
+            ..Default::default()
+        })
+        .run(Arc::new(HalfPassAdapter), Arc::new(OkRollout))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn threshold_passes_at_score() {
+        let record = half_run(Some(50.0)).await;
+        assert_eq!(record.metrics.pass_at_1, 0.5);
+        assert_eq!(record.metrics.threshold_pct, Some(50.0));
+        assert_eq!(record.metrics.suite_passed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn threshold_fails_below_score() {
+        let record = half_run(Some(50.1)).await;
+        assert_eq!(record.metrics.suite_passed, Some(false));
+    }
+
+    #[tokio::test]
+    async fn threshold_clamped_to_valid_range() {
+        let record = half_run(Some(150.0)).await;
+        assert_eq!(record.metrics.threshold_pct, Some(100.0));
+        assert_eq!(record.metrics.suite_passed, Some(false));
+    }
+
+    #[tokio::test]
+    async fn no_threshold_no_verdict() {
+        let record = half_run(None).await;
+        assert_eq!(record.metrics.threshold_pct, None);
+        assert_eq!(record.metrics.suite_passed, None);
+    }
+
+    #[test]
+    fn apply_threshold_pure() {
+        let metrics = AggregateMetrics {
+            pass_at_1: 0.75,
+            ..Default::default()
+        };
+        let out = apply_threshold(metrics.clone(), Some(80.0));
+        assert_eq!(out.suite_passed, Some(false));
+        let out = apply_threshold(metrics.clone(), Some(75.0));
+        assert_eq!(out.suite_passed, Some(true));
+        let out = apply_threshold(metrics, None);
+        assert_eq!(out.suite_passed, None);
+        assert_eq!(out.threshold_pct, None);
     }
 }

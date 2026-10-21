@@ -50,6 +50,27 @@ pub struct AggregateMetrics {
     pub total_tokens_input: u64,
     pub total_tokens_output: u64,
     pub total_cost_usd: f64,
+    /// Pass/fail threshold in percent (0–100) applied to this run, when the
+    /// run was configured with one (`RunnerConfig::pass_threshold_pct`).
+    /// `None` when no threshold was configured.
+    #[serde(default)]
+    pub threshold_pct: Option<f64>,
+    /// Whether the run's score reached `threshold_pct`. `None` when no
+    /// threshold was configured.
+    #[serde(default)]
+    pub suite_passed: Option<bool>,
+}
+
+/// Pass/fail verdict for an eval run: true when `score_pct` reaches
+/// `threshold_pct` (parity with the reference port's `hermes eval run`
+/// semantics; the tiny epsilon absorbs float rounding).
+pub fn eval_passes(score_pct: f64, threshold_pct: f64) -> bool {
+    score_pct + 1e-9 >= threshold_pct
+}
+
+/// Clamp a threshold to the valid 0–100 percent range.
+pub fn clamp_threshold(t: f64) -> f64 {
+    t.clamp(0.0, 100.0)
 }
 
 /// A complete evaluation run record. Written to disk for reproducibility
@@ -68,4 +89,30 @@ pub struct RunRecord {
     pub model: String,
     pub tasks: Vec<TaskResult>,
     pub metrics: AggregateMetrics,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eval_passes_at_threshold() {
+        assert!(eval_passes(80.0, 80.0));
+        assert!(eval_passes(80.0000001, 80.0));
+        assert!(!eval_passes(79.9, 80.0));
+    }
+
+    #[test]
+    fn clamp_threshold_bounds() {
+        assert_eq!(clamp_threshold(150.0), 100.0);
+        assert_eq!(clamp_threshold(-5.0), 0.0);
+        assert_eq!(clamp_threshold(72.5), 72.5);
+    }
+
+    #[test]
+    fn metrics_default_has_no_verdict() {
+        let m = AggregateMetrics::default();
+        assert_eq!(m.threshold_pct, None);
+        assert_eq!(m.suite_passed, None);
+    }
 }

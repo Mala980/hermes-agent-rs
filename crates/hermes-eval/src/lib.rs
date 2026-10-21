@@ -54,7 +54,9 @@ pub use adapter::{BenchmarkAdapter, BenchmarkMetadata, TaskSpec};
 pub use agent_rollout::AgentLoopRollout;
 pub use error::{EvalError, EvalResult};
 pub use reporter::{JsonReporter, Reporter};
-pub use result::{AggregateMetrics, RunRecord, TaskResult, TaskStatus};
+pub use result::{
+    clamp_threshold, eval_passes, AggregateMetrics, RunRecord, TaskResult, TaskStatus,
+};
 pub use runner::{Runner, RunnerConfig, TaskRollout};
 pub use tblite::{tblite_smoke_tasks, NoopRollout, SmokePassVerifier, TbliteSmokeAdapter};
 pub use verifier::{VerificationOutcome, Verifier};
