@@ -103,12 +103,18 @@ async fn contract_startup_and_routing_for_primary_platforms() {
     // Wave-1 security: discord/slack inbound is fail-closed via per-platform
     // allowlists (`<PLATFORM>_ALLOWED_USERS`, unset = deny all). Admit
     // everyone for this routing contract, restoring the env afterwards.
-    let saved_env: Vec<(&str, Option<String>)> = ["DISCORD_ALLOWED_USERS", "SLACK_ALLOWED_USERS"]
-        .iter()
-        .map(|&k| (k, std::env::var(k).ok()))
-        .collect();
+    // Wave-2: telegram joined the fail-closed gate, so it needs admitting too.
+    let saved_env: Vec<(&str, Option<String>)> = [
+        "DISCORD_ALLOWED_USERS",
+        "SLACK_ALLOWED_USERS",
+        "TELEGRAM_ALLOWED_USERS",
+    ]
+    .iter()
+    .map(|&k| (k, std::env::var(k).ok()))
+    .collect();
     std::env::set_var("DISCORD_ALLOWED_USERS", "*");
     std::env::set_var("SLACK_ALLOWED_USERS", "*");
+    std::env::set_var("TELEGRAM_ALLOWED_USERS", "*");
 
     let session_manager = Arc::new(SessionManager::new(SessionConfig::default()));
     let mut dm = DmManager::with_pair_behavior();

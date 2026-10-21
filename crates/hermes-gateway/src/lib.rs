@@ -81,8 +81,10 @@ pub use ssrf::{is_safe_url, validate_url};
 // Re-export DM management
 pub use allowlist::{
     discord_allow_all, discord_allowlist, email_allow_all, email_allowlist,
-    is_platform_user_allowed, matrix_allow_all, matrix_allowlist, platform_allow_all,
-    platform_allowlist, platform_env_prefix, slack_allow_all, slack_allowlist,
+    is_platform_user_allowed, is_signal_group_allowed, matrix_allow_all, matrix_allowlist,
+    platform_allow_all, platform_allowlist, platform_env_prefix, signal_group_allow_all,
+    signal_group_allowlist, slack_allow_all, slack_allowlist, telegram_allow_all,
+    telegram_allowlist,
 };
 pub use channel_directory::{ChannelDirectory, ChannelEntry};
 pub use delivery::{parse_target, DeliveryItem, DeliveryQueue, DeliveryRouter, DeliveryTarget};

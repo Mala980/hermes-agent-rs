@@ -13,9 +13,11 @@
 //! is allowed and inbound messages are skipped with a warn log. Configure one
 //! of the env vars (or the allow-all dev switch) to admit users.
 //!
-//! Supported platforms: `discord`, `slack`, `matrix`, `email`. Other platform
-//! names are not gated here (legacy behavior preserved); adding a new
-//! platform only requires a new entry in [`platform_env_prefix`].
+//! Supported platforms: `discord`, `slack`, `matrix`, `email`, `telegram`.
+//! Signal is gated separately by groupId (see [`signal_group_allowlist`];
+//! DMs are never gated). Other platform names are not gated here (legacy
+//! behavior preserved); adding a new user-gated platform only requires a
+//! new entry in [`platform_env_prefix`].
 //!
 //! Interaction with [`crate::dm::DmManager`]: this gate runs FIRST in
 //! [`crate::gateway::Gateway::route_message`], before the DM pairing check,
@@ -69,6 +71,7 @@ pub fn platform_env_prefix(platform: &str) -> Option<&'static str> {
         "slack" => Some("SLACK"),
         "matrix" => Some("MATRIX"),
         "email" => Some("EMAIL"),
+        "telegram" => Some("TELEGRAM"),
         _ => None,
     }
 }
@@ -162,6 +165,64 @@ pub fn email_allow_all() -> bool {
     platform_allow_all("email")
 }
 
+// ---------------------------------------------------------------------------
+// Signal group gating (batch-2 decision: gate by groupId, not user)
+// ---------------------------------------------------------------------------
+
+/// Signal group allowlist: `SIGNAL_GROUP_ALLOWED_USERS` ∪
+/// `GATEWAY_ALLOWED_USERS` (comma-separated group IDs; `"*"` = all groups).
+///
+/// Returns `None` when neither var carries entries → fail-closed for groups
+/// (no group message passes). Signal is intentionally NOT in
+/// [`platform_env_prefix`]: DMs are unaffected by any gate.
+pub fn signal_group_allowlist() -> Option<HashSet<String>> {
+    let mut ids = read_allow_csv("SIGNAL_GROUP_ALLOWED_USERS");
+    ids.extend(read_allow_csv("GATEWAY_ALLOWED_USERS"));
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
+}
+
+/// "Allow every group" dev switch: `SIGNAL_GROUP_ALLOW_ALL_USERS` or the
+/// global `GATEWAY_ALLOW_ALL_USERS` set to true/1/yes.
+pub fn signal_group_allow_all() -> bool {
+    env_truthy("SIGNAL_GROUP_ALLOW_ALL_USERS") || env_truthy("GATEWAY_ALLOW_ALL_USERS")
+}
+
+/// Pure decision: may a Signal message with `group_id` proceed to dispatch?
+///
+/// - DMs (`group_id = None`) always return `true` — never gated.
+/// - Group messages return `true` only when the allow-all switch is set or
+///   the groupId is in the allowlist; `"*"` matches every group.
+/// - Fail-closed: when neither allowlist var carries entries, every group
+///   message is denied.
+pub fn is_signal_group_allowed(group_id: Option<&str>) -> bool {
+    let gid = match group_id {
+        None => return true, // DM passthrough — gate by groupId, not user.
+        Some(g) => g,
+    };
+    if signal_group_allow_all() {
+        return true;
+    }
+    match signal_group_allowlist() {
+        None => false,
+        Some(set) => set.contains("*") || set.contains(gid),
+    }
+}
+
+/// Telegram allowlist: `TELEGRAM_ALLOWED_USERS` ∪ `GATEWAY_ALLOWED_USERS`.
+pub fn telegram_allowlist() -> Option<HashSet<String>> {
+    platform_allowlist("telegram")
+}
+
+/// Telegram allow-all switch: `TELEGRAM_ALLOW_ALL_USERS` ∪
+/// `GATEWAY_ALLOW_ALL_USERS`.
+pub fn telegram_allow_all() -> bool {
+    platform_allow_all("telegram")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +252,8 @@ mod tests {
         "MATRIX_ALLOW_ALL_USERS",
         "EMAIL_ALLOWED_USERS",
         "EMAIL_ALLOW_ALL_USERS",
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
         "GATEWAY_ALLOWED_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
     ];
@@ -219,7 +282,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::clear();
 
-        for platform in ["discord", "slack", "matrix", "email"] {
+        for platform in ["discord", "slack", "matrix", "email", "telegram"] {
             assert_eq!(
                 platform_allowlist(platform),
                 None,
@@ -313,6 +376,39 @@ mod tests {
         assert_eq!(platform_env_prefix("slack"), Some("SLACK"));
         assert_eq!(platform_env_prefix("matrix"), Some("MATRIX"));
         assert_eq!(platform_env_prefix("email"), Some("EMAIL"));
-        assert_eq!(platform_env_prefix("telegram"), None);
+        assert_eq!(platform_env_prefix("telegram"), Some("TELEGRAM"));
+    }
+
+    #[test]
+    fn telegram_allowlist_fail_closed_and_helpers() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        // Fail-closed when unset.
+        assert_eq!(telegram_allowlist(), None);
+        assert!(!is_platform_user_allowed("telegram", "565903951"));
+
+        // Platform-specific allowlist admits listed users only.
+        set_var("TELEGRAM_ALLOWED_USERS", Some("565903951"));
+        assert_eq!(telegram_allowlist(), platform_allowlist("telegram"));
+        assert!(is_platform_user_allowed("telegram", "565903951"));
+        assert!(!is_platform_user_allowed("telegram", "999"));
+
+        // GATEWAY_ALLOWED_USERS unions in.
+        set_var("GATEWAY_ALLOWED_USERS", Some("777"));
+        assert!(is_platform_user_allowed("telegram", "777"));
+        assert!(!is_platform_user_allowed("telegram", "999"));
+
+        // Wildcard admits everyone.
+        set_var("TELEGRAM_ALLOWED_USERS", Some("*"));
+        assert!(is_platform_user_allowed("telegram", "anyone"));
+
+        // Allow-all dev switch bypasses.
+        set_var("TELEGRAM_ALLOWED_USERS", None);
+        set_var("GATEWAY_ALLOWED_USERS", None);
+        set_var("TELEGRAM_ALLOW_ALL_USERS", Some("true"));
+        assert_eq!(telegram_allow_all(), platform_allow_all("telegram"));
+        assert!(telegram_allow_all());
+        assert!(is_platform_user_allowed("telegram", "anyone"));
     }
 }
