@@ -21,6 +21,8 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::markdown_split::split_markdown;
+use crate::platforms::helpers::send_with_rate_limit_retry;
 
 /// Slack Web API base URL.
 const SLACK_API_BASE: &str = "https://slack.com/api";
@@ -687,7 +689,7 @@ impl SlackAdapter {
         text: &str,
         thread_ts: Option<&str>,
     ) -> Result<String, GatewayError> {
-        let chunks = split_message(text, MAX_MESSAGE_LENGTH);
+        let chunks = split_markdown(text, MAX_MESSAGE_LENGTH);
         let mut last_ts = String::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
@@ -760,7 +762,7 @@ impl SlackAdapter {
         let body = serde_json::json!({
             "channel": channel,
             "ts": ts,
-            "text": &text[..text.len().min(MAX_MESSAGE_LENGTH)],
+            "text": &text[..text.floor_char_boundary(text.len().min(MAX_MESSAGE_LENGTH))],
         });
 
         self.slack_post("chat.update", &body).await?;
@@ -1062,13 +1064,17 @@ impl SlackAdapter {
     ) -> Result<SlackResponse, GatewayError> {
         let url = format!("{}/{}", SLACK_API_BASE, method);
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.token))
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(body)
-            .send()
+        let send_request = || {
+            self.client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.config.token))
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(body)
+                .send()
+        };
+        // Central send path: retries once after an HTTP 429 (Slack returns
+        // `ratelimited` with a `Retry-After` header in seconds).
+        let resp = send_with_rate_limit_retry(send_request)
             .await
             .map_err(|e| GatewayError::SendFailed(format!("Slack {} failed: {}", method, e)))?;
 
@@ -1148,35 +1154,6 @@ impl PlatformAdapter for SlackAdapter {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-/// Split a message into chunks that fit within the given max length.
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let end = (start + max_len).min(text.len());
-
-        if end >= text.len() {
-            chunks.push(text[start..].to_string());
-            break;
-        }
-
-        let break_at = text[start..end]
-            .rfind('\n')
-            .map(|pos| start + pos + 1)
-            .unwrap_or(end);
-
-        chunks.push(text[start..break_at].to_string());
-        start = break_at;
-    }
-
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,18 +1161,24 @@ mod tests {
     // --- Original tests (preserved) ---
 
     #[test]
-    fn split_message_short() {
-        let chunks = split_message("hello", 4000);
+    fn split_markdown_short() {
+        let chunks = split_markdown("hello", 4000);
         assert_eq!(chunks, vec!["hello"]);
     }
 
     #[test]
-    fn split_message_long() {
-        let text = "a".repeat(5000);
-        let chunks = split_message(&text, 4000);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 4000);
-        assert_eq!(chunks[1].len(), 1000);
+    fn split_markdown_slack_limit() {
+        let code: String = (0..300)
+            .map(|i| format!("line {i}: some_code();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro\n```rust\n{code}\n```\nOutro");
+        let chunks = split_markdown(&text, 4000);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert!(c.len() <= 4100, "chunk exceeds Slack limit: {}", c.len());
+            assert_eq!(c.matches("```").count() % 2, 0);
+        }
     }
 
     #[test]
@@ -1600,8 +1583,8 @@ mod tests {
     }
 
     #[test]
-    fn split_message_at_newline_boundary() {
+    fn split_markdown_at_newline_boundary() {
         let text = format!("{}\n{}", "a".repeat(3999), "b".repeat(100));
-        assert_eq!(split_message(&text, 4000).len(), 2);
+        assert_eq!(split_markdown(&text, 4000).len(), 2);
     }
 }

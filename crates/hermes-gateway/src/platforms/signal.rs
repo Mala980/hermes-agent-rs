@@ -6,12 +6,18 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::markdown_split::split_markdown;
+use crate::platforms::helpers::send_with_rate_limit_retry;
+
+/// Maximum message length for Signal sends (8000 chars); longer texts are
+/// split into sequential messages, never truncated.
+const MAX_MESSAGE_LENGTH: usize = 8000;
 
 // ---------------------------------------------------------------------------
 // Incoming message types
@@ -75,28 +81,32 @@ impl SignalAdapter {
     }
 
     /// Send a message via signal-cli REST API.
+    ///
+    /// Texts longer than [`MAX_MESSAGE_LENGTH`] are split fence-aware into
+    /// sequential messages.
     pub async fn send_text(&self, recipient: &str, text: &str) -> Result<(), GatewayError> {
         let url = format!("{}/v2/send", self.config.api_url);
-        let body = serde_json::json!({
-            "message": text,
-            "number": self.config.phone_number,
-            "recipients": [recipient]
-        });
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| GatewayError::SendFailed(format!("Signal send failed: {}", e)))?;
+        for chunk in split_markdown(text, MAX_MESSAGE_LENGTH) {
+            let body = serde_json::json!({
+                "message": chunk,
+                "number": self.config.phone_number,
+                "recipients": [recipient]
+            });
 
-        if !resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(GatewayError::SendFailed(format!(
-                "Signal API error: {}",
-                text
-            )));
+            let send_request = || self.client.post(&url).json(&body).send();
+            // Retries once after an HTTP 429.
+            let resp = send_with_rate_limit_retry(send_request)
+                .await
+                .map_err(|e| GatewayError::SendFailed(format!("Signal send failed: {}", e)))?;
+
+            if !resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(GatewayError::SendFailed(format!(
+                    "Signal API error: {}",
+                    text
+                )));
+            }
         }
         Ok(())
     }
@@ -142,6 +152,29 @@ impl SignalAdapter {
             group_id,
             attachments,
         })
+    }
+
+    /// Gate a parsed inbound message before dispatch to the agent loop.
+    ///
+    /// DMs (no `group_id`) always pass. Group messages pass only when their
+    /// `groupId` is listed in `SIGNAL_GROUP_ALLOWED_USERS` (fail-closed for
+    /// groups; see [`crate::allowlist::is_signal_group_allowed`]). Denied
+    /// group messages return `false` and are logged so a misconfigured
+    /// allowlist is visible.
+    ///
+    /// Call this on every value returned by [`Self::parse_received_message`]
+    /// before routing it into the gateway.
+    pub fn is_incoming_allowed(msg: &IncomingSignalMessage) -> bool {
+        if crate::allowlist::is_signal_group_allowed(msg.group_id.as_deref()) {
+            true
+        } else {
+            warn!(
+                group_id = msg.group_id.as_deref().unwrap_or("<unknown>"),
+                source = %msg.source,
+                "Skipping Signal group message: group not on SIGNAL_GROUP_ALLOWED_USERS (fail-closed)"
+            );
+            false
+        }
     }
 
     /// Receive messages via signal-cli REST API polling.
@@ -268,4 +301,134 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allowlist::ENV_LOCK;
+
+    #[test]
+    fn split_markdown_signal_limit() {
+        // Signal splits (never truncates) at 8000 chars, fence-aware.
+        let code: String = (0..600)
+            .map(|i| format!("let v_{i} = f({i});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro\n```rust\n{code}\n```\nOutro");
+        let chunks = split_markdown(&text, MAX_MESSAGE_LENGTH);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= 8100, "chunk exceeds Signal limit: {}", c.len());
+            assert_eq!(c.matches("```").count() % 2, 0);
+        }
+    }
+
+    fn signal_msg(group_id: Option<&str>) -> IncomingSignalMessage {
+        IncomingSignalMessage {
+            source: "+15551234567".to_string(),
+            timestamp: 1760000000,
+            text: "hi".to_string(),
+            group_id: group_id.map(str::to_string),
+            attachments: vec![],
+        }
+    }
+
+    const VARS: &[&str] = &[
+        "SIGNAL_GROUP_ALLOWED_USERS",
+        "SIGNAL_GROUP_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ];
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn clear() -> Self {
+            let saved = VARS
+                .iter()
+                .map(|&n| {
+                    let old = std::env::var(n).ok();
+                    std::env::remove_var(n);
+                    (n, old)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, old) in self.saved.drain(..) {
+                match old {
+                    Some(s) => std::env::set_var(name, s),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_message_denied_when_allowlist_unset_fail_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        assert!(crate::allowlist::signal_group_allowlist().is_none());
+        assert!(!crate::allowlist::is_signal_group_allowed(Some("group-1")));
+        assert!(!SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "group-1"
+        ))));
+    }
+
+    #[test]
+    fn group_message_allowed_when_group_id_listed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        std::env::set_var("SIGNAL_GROUP_ALLOWED_USERS", " group-1 ,group-2 ");
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "group-1"
+        ))));
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "group-2"
+        ))));
+        assert!(!SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "group-3"
+        ))));
+        // GATEWAY_ALLOWED_USERS unions in as well.
+        std::env::set_var("GATEWAY_ALLOWED_USERS", "group-9");
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "group-9"
+        ))));
+    }
+
+    #[test]
+    fn dm_passthrough_even_when_allowlist_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        // DMs are never gated: no groupId → always allowed, even fail-closed.
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(None)));
+        assert!(crate::allowlist::is_signal_group_allowed(None));
+    }
+
+    #[test]
+    fn wildcard_and_allow_all_switch_admit_every_group() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::clear();
+
+        std::env::set_var("SIGNAL_GROUP_ALLOWED_USERS", "*");
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "any-group"
+        ))));
+
+        std::env::set_var("SIGNAL_GROUP_ALLOWED_USERS", "");
+        std::env::set_var("SIGNAL_GROUP_ALLOW_ALL_USERS", "yes");
+        assert!(crate::allowlist::signal_group_allow_all());
+        assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
+            "any-group"
+        ))));
+    }
 }
