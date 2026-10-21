@@ -161,26 +161,47 @@ pub async fn register_platforms(
 
                     let telegram_config = TelegramConfig {
                         token,
-                        webhook_url: None,
-                        polling: true,
+                        webhook_url: hermes_config::extra_string(platform_cfg, "webhook_url"),
+                        polling: extra_bool(platform_cfg, "polling", true),
                         proxy: Default::default(),
                         parse_markdown: false,
                         parse_html: false,
                         poll_timeout: 30,
-                        bot_username: None,
+                        bot_username: hermes_config::extra_string(platform_cfg, "bot_username"),
                     };
                     match TelegramAdapter::new(telegram_config) {
                         Ok(adapter) => {
                             let adapter = Arc::new(adapter);
-                            gateway.register_adapter("telegram", adapter.clone()).await;
+                            let use_polling =
+                                adapter.config().polling && adapter.config().webhook_url.is_none();
+                            if use_polling {
+                                // Long-polling mode: spawn the real poll loop and
+                                // register the adapter with its inbound channel,
+                                // mirroring the weixin pattern above.
+                                let (inbound_tx, inbound_rx) =
+                                    tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(
+                                        256,
+                                    );
+                                let inbound_task = gateway
+                                    .register_adapter_with_inbound(
+                                        "telegram",
+                                        adapter.clone(),
+                                        inbound_rx,
+                                    )
+                                    .await;
+                                sidecar_tasks.push(inbound_task);
+                                let poll_adapter = adapter.clone();
+                                sidecar_tasks.push(tokio::spawn(async move {
+                                    poll_adapter.run_poll_loop(inbound_tx).await;
+                                }));
+                                tracing::info!("Telegram poll loop started");
+                            } else {
+                                // Webhook mode: no poll loop; updates arrive via
+                                // the webhook receiver instead.
+                                gateway.register_adapter("telegram", adapter.clone()).await;
+                                tracing::info!("Telegram webhook mode: poll loop disabled");
+                            }
                             registered.push("telegram".to_string());
-
-                            // Start Telegram poll loop
-                            sidecar_tasks.push(tokio::spawn(async move {
-                                // Simplified: actual implementation would run telegram poll loop
-                                // For now, just log that we would start it
-                                tracing::info!("Telegram poll loop would start here");
-                            }));
                         }
                         Err(e) => errors.push(("telegram".to_string(), e.to_string())),
                     }

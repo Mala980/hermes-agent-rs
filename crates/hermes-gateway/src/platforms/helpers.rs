@@ -2,6 +2,8 @@
 //!
 //! Common text manipulation utilities used across platform adapters.
 
+use std::time::Duration;
+
 use hmac::{Hmac, Mac};
 use regex::Regex;
 use sha2::Sha256;
@@ -376,5 +378,395 @@ mod hmac_tests {
             b"what do ya want for nothing?",
             &header
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit (HTTP 429) handling
+// ---------------------------------------------------------------------------
+
+/// Maximum time to wait for a single rate-limit backoff.
+pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
+/// Fallback wait when a 429 response carries no usable `retry_after` info.
+pub const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(5);
+
+/// Extract a rate-limit wait from a `Retry-After` header map.
+///
+/// Handles delta-seconds (integer or float) and the IMF-fixdate HTTP-date
+/// form (`Wed, 21 Oct 2015 07:28:00 GMT`), which is converted to a duration
+/// relative to now (saturating at zero). Returns `None` when the header is
+/// missing or unparseable.
+pub fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    parse_retry_after_value(value)
+}
+
+/// Extract a rate-limit wait from a JSON error body.
+///
+/// Handles the shapes used by the platforms in this crate:
+/// - `{"retry_after": <secs>}` — Discord (seconds, may be fractional or a numeric string)
+/// - `{"retry_after_ms": <ms>}` — Matrix `M_LIMIT_EXCEEDED`
+/// - `{"parameters": {"retry_after": <secs>}}` — Telegram
+///
+/// Returns `None` when the body is not JSON or carries no usable field.
+pub fn retry_after_from_body(body: &str) -> Option<Duration> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    // Telegram nests the field under `parameters`.
+    let nested = v.get("parameters").and_then(|p| p.get("retry_after"));
+    if let Some(d) = nested.and_then(|n| retry_after_number(n, false)) {
+        return Some(d);
+    }
+    if let Some(d) = v
+        .get("retry_after")
+        .and_then(|n| retry_after_number(n, false))
+    {
+        return Some(d);
+    }
+    if let Some(d) = v
+        .get("retry_after_ms")
+        .and_then(|n| retry_after_number(n, true))
+    {
+        return Some(d);
+    }
+    None
+}
+
+/// Determine how long to wait from a rate-limited (`429`) response.
+///
+/// Checks the `Retry-After` header first, then JSON body shapes; the result
+/// is capped at [`MAX_RETRY_WAIT`]. When the response is a 429 but carries no
+/// usable wait info, falls back to [`DEFAULT_RETRY_WAIT`].
+///
+/// Returns `None` when the response status is not 429.
+pub async fn retry_after_duration(resp: reqwest::Response) -> Option<Duration> {
+    if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    if let Some(wait) = retry_after_from_headers(resp.headers()) {
+        return Some(wait.min(MAX_RETRY_WAIT));
+    }
+    // `resp` is consumed here; the borrow of its headers above has ended.
+    let body = resp.text().await.unwrap_or_default();
+    let wait = retry_after_from_body(&body).unwrap_or(DEFAULT_RETRY_WAIT);
+    Some(wait.min(MAX_RETRY_WAIT))
+}
+
+/// Perform an HTTP request, retrying ONCE after a rate-limit (`429`) response.
+///
+/// The wait is extracted with [`retry_after_duration`] (capped at
+/// [`MAX_RETRY_WAIT`]). The retried response is returned as-is — a second
+/// 429 is surfaced to the caller, never retried again.
+///
+/// `send` is a closure (not a pre-built request) because a
+/// `reqwest::RequestBuilder` is consumed by `send()`.
+pub async fn send_with_rate_limit_retry<F, Fut>(
+    send: F,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let resp = send().await?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let wait = retry_after_duration(resp)
+            .await
+            .unwrap_or(DEFAULT_RETRY_WAIT);
+        tracing::warn!(
+            wait_secs = wait.as_secs(),
+            "Rate limited (HTTP 429); backing off and retrying once"
+        );
+        tokio::time::sleep(wait).await;
+        return send().await;
+    }
+    Ok(resp)
+}
+
+/// Parse a `Retry-After` header value: delta-seconds or an HTTP date.
+fn parse_retry_after_value(value: &str) -> Option<Duration> {
+    let v = value.trim();
+    if let Ok(secs) = v.parse::<f64>() {
+        if secs.is_finite() {
+            return Some(Duration::from_secs_f64(secs.max(0.0)));
+        }
+    }
+    // IMF-fixdate, e.g. "Wed, 21 Oct 2015 07:28:00 GMT".
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(v, "%a, %d %b %Y %H:%M:%S GMT") {
+        let target = dt.and_utc().timestamp();
+        let now = chrono::Utc::now().timestamp();
+        return Some(Duration::from_secs((target - now).max(0) as u64));
+    }
+    None
+}
+
+/// Convert a JSON `retry_after` value (number or numeric string) to a
+/// `Duration`; `millis` selects millisecond interpretation.
+fn retry_after_number(v: &serde_json::Value, millis: bool) -> Option<Duration> {
+    let f = match v {
+        serde_json::Value::Number(n) => n.as_f64()?,
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !f.is_finite() || f < 0.0 {
+        return None;
+    }
+    let secs = if millis { f / 1000.0 } else { f };
+    Some(Duration::from_secs_f64(secs))
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    fn headers_with_retry_after(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            value.parse().expect("valid header value"),
+        );
+        h
+    }
+
+    #[test]
+    fn retry_after_header_integer_seconds() {
+        let d = retry_after_from_headers(&headers_with_retry_after("5"));
+        assert_eq!(d, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_after_header_fractional_seconds() {
+        let d = retry_after_from_headers(&headers_with_retry_after("1.5"));
+        assert_eq!(d, Some(Duration::from_secs_f64(1.5)));
+    }
+
+    #[test]
+    fn retry_after_header_http_date() {
+        // 120 seconds in the future, formatted as an IMF-fixdate.
+        let future = chrono::Utc::now() + chrono::Duration::seconds(120);
+        let value = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let d = retry_after_from_headers(&headers_with_retry_after(&value))
+            .expect("HTTP-date Retry-After should parse");
+        assert!(
+            d >= Duration::from_secs(110) && d <= Duration::from_secs(125),
+            "unexpected wait: {d:?}"
+        );
+    }
+
+    #[test]
+    fn retry_after_header_missing_or_invalid() {
+        assert_eq!(retry_after_from_headers(&HeaderMap::new()), None);
+        assert_eq!(
+            retry_after_from_headers(&headers_with_retry_after("soon")),
+            None
+        );
+        assert_eq!(
+            retry_after_from_headers(&headers_with_retry_after("")),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_after_body_discord_shape() {
+        let d =
+            retry_after_from_body(r#"{"message":"slow down","retry_after":1.24,"global":false}"#);
+        assert_eq!(d, Some(Duration::from_secs_f64(1.24)));
+    }
+
+    #[test]
+    fn retry_after_body_telegram_shape() {
+        let d = retry_after_from_body(
+            r#"{"ok":false,"error_code":429,"parameters":{"retry_after":7}}"#,
+        );
+        assert_eq!(d, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn retry_after_body_matrix_millis_shape() {
+        let d = retry_after_from_body(
+            r#"{"errcode":"M_LIMIT_EXCEEDED","error":"too fast","retry_after_ms":2500}"#,
+        );
+        assert_eq!(d, Some(Duration::from_millis(2500)));
+    }
+
+    #[test]
+    fn retry_after_body_numeric_string() {
+        let d = retry_after_from_body(r#"{"retry_after":"3"}"#);
+        assert_eq!(d, Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn retry_after_body_garbage() {
+        assert_eq!(retry_after_from_body("not json"), None);
+        assert_eq!(retry_after_from_body(r#"{"ok":true}"#), None);
+        assert_eq!(retry_after_from_body(r#"{"retry_after":-2}"#), None);
+    }
+
+    // Async tests below exercise `retry_after_duration` and
+    // `send_with_rate_limit_retry` against a mock HTTP server.
+
+    async fn mock_server() -> wiremock::MockServer {
+        wiremock::MockServer::start().await
+    }
+
+    #[tokio::test]
+    async fn retry_after_duration_non_429_is_none() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/ok", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retry_after_duration(resp).await, None);
+    }
+
+    #[tokio::test]
+    async fn retry_after_duration_caps_at_60s() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/limited"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "3600")
+                    .set_body_string(r#"{"retry_after": 3600}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/limited", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        // Header wins over body here; both exceed the cap.
+        assert_eq!(retry_after_duration(resp).await, Some(MAX_RETRY_WAIT));
+    }
+
+    #[tokio::test]
+    async fn retry_after_duration_uses_body_when_no_header() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/limited"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string(r#"{"retry_after": 9, "global": false}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/limited", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retry_after_duration(resp).await,
+            Some(Duration::from_secs(9))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_rate_limit_retry_retries_once_then_succeeds() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        let url = format!("{}/send", server.uri());
+
+        // The one-shot 429 mock is mounted FIRST: wiremock gives precedence
+        // to the earliest-mounted matching mock, so the 429 wins for the
+        // first request only and the fallback serves the retry.
+        Mock::given(method("POST"))
+            .and(path("/send"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(r#"{"retry_after": 0}"#),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/send"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"ok":true}"#))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = send_with_rate_limit_retry(|| client.post(&url).body("{}").send())
+            .await
+            .expect("request should succeed after retry");
+        assert_eq!(resp.status(), 200);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "expected exactly one retry");
+    }
+
+    #[tokio::test]
+    async fn send_with_rate_limit_retry_gives_up_after_one_retry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        let url = format!("{}/send", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/send"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(r#"{"retry_after": 0}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = send_with_rate_limit_retry(|| client.post(&url).body("{}").send())
+            .await
+            .expect("transport should not fail");
+        // Second 429 is returned as-is, not retried again.
+        assert_eq!(resp.status(), 429);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "expected exactly one retry");
+    }
+
+    #[tokio::test]
+    async fn send_with_rate_limit_retry_passes_through_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = mock_server().await;
+        let url = format!("{}/send", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/send"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp = send_with_rate_limit_retry(|| client.post(&url).body("{}").send())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "no retry expected on success");
     }
 }

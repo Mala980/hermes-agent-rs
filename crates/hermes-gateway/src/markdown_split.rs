@@ -57,15 +57,21 @@ pub fn split_markdown(text: &str, max_len: usize) -> Vec<String> {
 }
 
 /// Find a safe byte offset to split at, within `max_len` bytes.
+///
+/// `max_len` is a byte budget; the returned offset is always floored to a
+/// UTF-8 char boundary so callers can slice safely with multibyte text.
 fn find_safe_split(text: &str, max_len: usize) -> usize {
-    let search_range = &text[..max_len.min(text.len())];
+    // Floor to a char boundary first: slicing at a raw byte `max_len` would
+    // panic on multibyte text (e.g. CJK/emoji).
+    let search_end = text.floor_char_boundary(max_len.min(text.len()));
+    let search_range = &text[..search_end];
 
     // Check if we're inside a code block at the split point
     let in_code_block = is_in_code_block(search_range);
 
     if in_code_block {
         // Find the end of the code block
-        if let Some(end) = find_code_block_end(text, max_len) {
+        if let Some(end) = find_code_block_end(text, search_end) {
             if end <= max_len + 100 {
                 // Allow slight overflow to close the code block
                 return end;
@@ -95,8 +101,8 @@ fn find_safe_split(text: &str, max_len: usize) -> usize {
         }
     }
 
-    // Hard split at max_len
-    max_len.min(text.len())
+    // Hard split at max_len (floored to a char boundary above)
+    search_end
 }
 
 /// Check if the text ends inside an unclosed code block.
@@ -141,8 +147,21 @@ fn find_code_block_end(text: &str, start_pos: usize) -> Option<usize> {
 fn close_and_reopen_formatting(text: &str) -> (String, String) {
     let mut open_marks: Vec<&str> = Vec::new();
 
-    // Track formatting marks: **, *, `, ~~
-    let marks = ["**", "~~", "*", "`"];
+    // Triple-backtick code fences are handled before single backticks so the
+    // three backticks of a fence aren't miscounted as inline code. An odd
+    // number of fences means the chunk ends inside a code block.
+    let fence_count = text.matches("```").count();
+    // Backticks already consumed by (non-overlapping) fence matches.
+    let inline_backticks = text.matches('`').count().saturating_sub(fence_count * 3);
+    if fence_count % 2 == 1 {
+        open_marks.push("```");
+    }
+    if inline_backticks % 2 == 1 {
+        open_marks.push("`");
+    }
+
+    // Track remaining formatting marks: **, *, ~~
+    let marks = ["**", "~~", "*"];
 
     for mark in &marks {
         let count = text.matches(mark).count();
@@ -396,5 +415,74 @@ mod tests {
         let result = strip_markdown("```python\nprint('hello')\n```");
         assert!(result.contains("print('hello')"));
         assert!(!result.contains("```"));
+    }
+
+    #[test]
+    fn test_split_markdown_multibyte_never_panics() {
+        // 3000 CJK chars = 9000 bytes; a raw byte slice at 1000 would land
+        // mid-character and panic.
+        let text = "あ".repeat(3000);
+        let chunks = split_markdown(&text, 1000);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            // Byte budget respected (floored to a char boundary).
+            assert!(c.len() <= 1000);
+            assert_eq!(c.chars().count() * 3, c.len());
+        }
+        // No content lost: no trimmable boundaries in this input.
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_split_markdown_multibyte_mixed() {
+        let text = format!("Hello 🌍 world! {}", "テスト ".repeat(500));
+        let chunks = split_markdown(&text, 200);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= 200, "chunk exceeds byte budget: {c:?}");
+        }
+        // Every chunk is valid UTF-8 (would have panicked otherwise).
+        let _ = chunks.join("\n");
+    }
+
+    #[test]
+    fn test_split_markdown_never_breaks_code_fence() {
+        let code: String = (0..200)
+            .map(|i| format!("let variable_number_{i} = {i} * 2;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Here is some code:\n```rust\n{code}\n```\nDone.");
+        let chunks = split_markdown(&text, 500);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            // Unclosed formatting is closed/reopened at split points, so
+            // every chunk must carry balanced fences.
+            let fences = c.matches("```").count();
+            assert_eq!(fences % 2, 0, "unbalanced code fence in chunk: {c:.120}...");
+        }
+    }
+
+    #[test]
+    fn test_split_markdown_per_platform_limits() {
+        // Platform limits from the send paths: Discord 2000, Telegram 4096,
+        // Slack 4000, Signal 8000, WhatsApp 4096.
+        let code: String = (0..400)
+            .map(|i| format!("line {i}: some code(); // comment"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro paragraph.\n\n```rust\n{code}\n```\n\nOutro.");
+        for &limit in &[2000usize, 4096, 4000, 8000] {
+            let chunks = split_markdown(&text, limit);
+            assert!(chunks.len() > 1, "expected splits at limit {limit}");
+            for c in &chunks {
+                // +100 is the documented fence-close overflow allowance.
+                assert!(
+                    c.len() <= limit + 100,
+                    "chunk exceeds limit {limit}: {} bytes",
+                    c.len()
+                );
+                assert_eq!(c.matches("```").count() % 2, 0);
+            }
+        }
     }
 }
