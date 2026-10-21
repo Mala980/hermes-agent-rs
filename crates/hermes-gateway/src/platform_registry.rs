@@ -395,6 +395,12 @@ pub async fn register_platforms(
                             "business_account_id",
                         ),
                         verify_token: hermes_config::extra_string(platform_cfg, "verify_token"),
+                        app_secret: hermes_config::extra_string(platform_cfg, "app_secret")
+                            .or_else(|| {
+                                std::env::var("WHATSAPP_APP_SECRET")
+                                    .ok()
+                                    .filter(|s| !s.is_empty())
+                            }),
                         proxy: Default::default(),
                     };
                     match WhatsAppAdapter::new(wa_cfg) {

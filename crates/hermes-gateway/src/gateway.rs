@@ -425,8 +425,25 @@ impl Gateway {
     // -----------------------------------------------------------------------
 
     /// Route an incoming message through the full pipeline:
-    /// DM check → session lookup → agent loop → response.
+    /// allowlist gate → DM check → session lookup → agent loop → response.
     pub async fn route_message(&self, incoming: &IncomingMessage) -> Result<(), GatewayError> {
+        // 0. Per-platform fail-closed allowlist. Applies to DMs AND
+        //    group/channel messages, and runs BEFORE the DmManager pairing
+        //    check: with the default Pair behavior, pairing requests only
+        //    flow for users admitted here (set
+        //    `<PLATFORM>_ALLOWED_USERS="*"` or the allow-all dev switch to
+        //    keep open pairing). See crate::allowlist.
+        if !crate::allowlist::is_platform_user_allowed(&incoming.platform, &incoming.user_id) {
+            warn!(
+                platform = %incoming.platform,
+                user_id = %incoming.user_id,
+                chat_id = %incoming.chat_id,
+                is_dm = incoming.is_dm,
+                "Skipping inbound message: user not on platform allowlist (fail-closed)"
+            );
+            return Ok(());
+        }
+
         // 1. Check DM authorization if this is a direct message
         if incoming.is_dm {
             let dm_manager = self.dm_manager.read().await;
@@ -2797,5 +2814,69 @@ mod tests {
         let names: Vec<String> = events.iter().map(|(name, _)| name.clone()).collect();
         assert!(names.contains(&"session:end".to_string()));
         assert!(names.contains(&"session:reset".to_string()));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn gateway_route_group_message_blocked_by_allowlist() {
+        // Env-based allowlist tests share one lock (see crate::allowlist).
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let save = |name: &str| {
+            let old = std::env::var(name).ok();
+            std::env::remove_var(name);
+            old
+        };
+        let old_d = save("DISCORD_ALLOWED_USERS");
+        let old_g = save("GATEWAY_ALLOWED_USERS");
+        let old_a = save("DISCORD_ALLOW_ALL_USERS");
+        let old_ga = save("GATEWAY_ALLOW_ALL_USERS");
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(TestAdapter {
+            messages: sent.clone(),
+        });
+        let session_mgr = Arc::new(SessionManager::new(SessionConfig::default()));
+        let gw = Gateway::new(
+            session_mgr,
+            DmManager::with_ignore_behavior(),
+            GatewayConfig::default(),
+        );
+        gw.register_adapter("discord", adapter).await;
+
+        let handler_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = handler_called.clone();
+        gw.set_message_handler(Arc::new(move |_messages| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok("reply".to_string()) })
+        }))
+        .await;
+
+        let group_msg = |user: &str| IncomingMessage {
+            platform: "discord".into(),
+            chat_id: "-group1".into(),
+            user_id: user.into(),
+            text: "hello group".into(),
+            message_id: None,
+            is_dm: false, // group message: previously bypassed the DM gate entirely
+        };
+
+        // Fail-closed: no env set → group message from anyone is skipped
+        // silently (Ok, handler never runs).
+        assert!(gw.route_message(&group_msg("stranger")).await.is_ok());
+        assert!(!handler_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Allowlisted user → group message flows through to the handler.
+        std::env::set_var("DISCORD_ALLOWED_USERS", "member1");
+        assert!(gw.route_message(&group_msg("member1")).await.is_ok());
+        assert!(handler_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        let restore = |name: &str, old: Option<String>| match old {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        };
+        restore("DISCORD_ALLOWED_USERS", old_d);
+        restore("GATEWAY_ALLOWED_USERS", old_g);
+        restore("DISCORD_ALLOW_ALL_USERS", old_a);
+        restore("GATEWAY_ALLOW_ALL_USERS", old_ga);
     }
 }

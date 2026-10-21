@@ -2,7 +2,9 @@
 //!
 //! Common text manipulation utilities used across platform adapters.
 
+use hmac::{Hmac, Mac};
 use regex::Regex;
+use sha2::Sha256;
 
 /// Split a long message into chunks that respect word and sentence boundaries.
 ///
@@ -235,5 +237,144 @@ mod tests {
         assert_eq!(media_category("mp4"), "video");
         assert_eq!(media_category("mp3"), "audio");
         assert_eq!(media_category("pdf"), "document");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook signature verification (HMAC-SHA256, fail-closed)
+// ---------------------------------------------------------------------------
+
+/// Verify a webhook signature header of the form `sha256=<hex>` (e.g. Meta's
+/// `X-Hub-Signature-256`) against the HMAC-SHA256 of the raw request body.
+///
+/// The comparison is constant-time via `hmac::Mac::verify` (never `==`).
+/// Returns `false` when the header lacks the `sha256=` prefix, is not valid
+/// 64-char hex, or the MAC does not match.
+pub fn verify_hmac_sha256_signature(secret: &str, body: &[u8], header: &str) -> bool {
+    let hex = match header.strip_prefix("sha256=") {
+        Some(h) => h,
+        None => return false,
+    };
+    let expected = match hex_decode_32(hex) {
+        Some(b) => b,
+        None => return false,
+    };
+    let mut mac = match Hmac::<Sha256>::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    mac.verify((&expected).into()).is_ok()
+}
+
+/// Decode a 64-char hex string into 32 bytes; `None` when malformed.
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_nibble(bytes[2 * i])?;
+        let lo = hex_nibble(bytes[2 * i + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod hmac_tests {
+    use super::*;
+
+    /// RFC 4231 test case 2 (HMAC-SHA-256): key "Jefe",
+    /// data "what do ya want for nothing?".
+    const RFC4231_SHA256_TC2: &str =
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+
+    fn signed_header(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let out = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(64);
+        for b in out {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        format!("sha256={hex}")
+    }
+
+    #[test]
+    fn hmac_sha256_rfc4231_known_answer() {
+        let header = format!("sha256={RFC4231_SHA256_TC2}");
+        assert!(verify_hmac_sha256_signature(
+            "Jefe",
+            b"what do ya want for nothing?",
+            &header
+        ));
+    }
+
+    #[test]
+    fn hmac_sha256_rejects_wrong_signature() {
+        let mut bad = String::from("sha256=");
+        bad.push_str(&"00".repeat(32));
+        assert!(!verify_hmac_sha256_signature(
+            "Jefe",
+            b"what do ya want for nothing?",
+            &bad
+        ));
+        // Tampered body against a genuine header.
+        let header = signed_header("secret", b"original body");
+        assert!(!verify_hmac_sha256_signature(
+            "secret",
+            b"tampered body",
+            &header
+        ));
+        // Tampered secret against a genuine header.
+        let header = signed_header("secret", b"body");
+        assert!(!verify_hmac_sha256_signature(
+            "other-secret",
+            b"body",
+            &header
+        ));
+    }
+
+    #[test]
+    fn hmac_sha256_rejects_malformed_headers() {
+        assert!(!verify_hmac_sha256_signature("s", b"b", ""));
+        assert!(!verify_hmac_sha256_signature("s", b"b", "not-a-signature"));
+        // Missing sha256= prefix.
+        assert!(!verify_hmac_sha256_signature("s", b"b", &"ab".repeat(32)));
+        // Too short / too long hex.
+        assert!(!verify_hmac_sha256_signature("s", b"b", "sha256=abcd"));
+        assert!(!verify_hmac_sha256_signature(
+            "s",
+            b"b",
+            &format!("sha256={}", "ab".repeat(33))
+        ));
+        // Non-hex chars.
+        assert!(!verify_hmac_sha256_signature(
+            "s",
+            b"b",
+            &format!("sha256={}", "zz".repeat(32))
+        ));
+    }
+
+    #[test]
+    fn hmac_sha256_accepts_uppercase_hex() {
+        let header = format!("sha256={}", RFC4231_SHA256_TC2.to_uppercase());
+        assert!(verify_hmac_sha256_signature(
+            "Jefe",
+            b"what do ya want for nothing?",
+            &header
+        ));
     }
 }

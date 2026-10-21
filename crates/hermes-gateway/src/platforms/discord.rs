@@ -52,14 +52,15 @@ pub struct DiscordConfig {
     #[serde(default)]
     pub require_mention: bool,
 
-    /// Gateway intents bitmask (default: GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
     #[serde(default = "default_intents")]
     pub intents: u64,
 }
 
 fn default_intents() -> u64 {
-    // GUILDS (1<<0) | GUILD_MESSAGES (1<<9) | MESSAGE_CONTENT (1<<15)
-    (1 << 0) | (1 << 9) | (1 << 15)
+    // GUILDS (1<<0) | GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15)
+    // DIRECT_MESSAGES is required to receive DM events; it is not privileged.
+    (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15)
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,5 +2143,22 @@ mod tests {
         let embed = DiscordEmbed::default();
         assert!(embed.title.is_none());
         assert!(embed.fields.is_empty());
+    }
+
+    #[test]
+    fn default_intents_include_direct_messages() {
+        let intents = default_intents();
+        // GUILDS (1<<0)
+        assert_ne!(intents & (1 << 0), 0);
+        // GUILD_MESSAGES (1<<9)
+        assert_ne!(intents & (1 << 9), 0);
+        // DIRECT_MESSAGES (1<<12) — required to receive DM events; not privileged.
+        assert_ne!(intents & (1 << 12), 0);
+        // MESSAGE_CONTENT (1<<15, privileged)
+        assert_ne!(intents & (1 << 15), 0);
+        // serde default on DiscordConfig picks the same mask.
+        let config: DiscordConfig =
+            serde_json::from_value(serde_json::json!({"token": "x"})).unwrap();
+        assert_eq!(config.intents, intents);
     }
 }

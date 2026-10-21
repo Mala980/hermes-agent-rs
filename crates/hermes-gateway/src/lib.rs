@@ -20,6 +20,7 @@
 //! - Platform-specific adapters behind feature flags
 
 pub mod adapter;
+pub mod allowlist;
 pub mod background;
 pub mod channel_directory;
 pub mod commands;
@@ -78,6 +79,11 @@ pub use media::MediaCache;
 pub use ssrf::{is_safe_url, validate_url};
 
 // Re-export DM management
+pub use allowlist::{
+    discord_allow_all, discord_allowlist, email_allow_all, email_allowlist,
+    is_platform_user_allowed, matrix_allow_all, matrix_allowlist, platform_allow_all,
+    platform_allowlist, platform_env_prefix, slack_allow_all, slack_allowlist,
+};
 pub use channel_directory::{ChannelDirectory, ChannelEntry};
 pub use delivery::{parse_target, DeliveryItem, DeliveryQueue, DeliveryRouter, DeliveryTarget};
 pub use dm::{DmDecision, DmManager};

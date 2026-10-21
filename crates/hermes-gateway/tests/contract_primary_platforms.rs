@@ -100,6 +100,16 @@ fn incoming(platform: &str, user_id: &str, text: &str) -> IncomingMessage {
 
 #[tokio::test]
 async fn contract_startup_and_routing_for_primary_platforms() {
+    // Wave-1 security: discord/slack inbound is fail-closed via per-platform
+    // allowlists (`<PLATFORM>_ALLOWED_USERS`, unset = deny all). Admit
+    // everyone for this routing contract, restoring the env afterwards.
+    let saved_env: Vec<(&str, Option<String>)> = ["DISCORD_ALLOWED_USERS", "SLACK_ALLOWED_USERS"]
+        .iter()
+        .map(|&k| (k, std::env::var(k).ok()))
+        .collect();
+    std::env::set_var("DISCORD_ALLOWED_USERS", "*");
+    std::env::set_var("SLACK_ALLOWED_USERS", "*");
+
     let session_manager = Arc::new(SessionManager::new(SessionConfig::default()));
     let mut dm = DmManager::with_pair_behavior();
     dm.authorize_user("u1");
@@ -148,6 +158,13 @@ async fn contract_startup_and_routing_for_primary_platforms() {
             sent.iter().any(|m| m.contains("ack:hello-")),
             "adapter index {idx} should receive assistant reply"
         );
+    }
+
+    for (k, v) in saved_env {
+        match v {
+            Some(val) => std::env::set_var(k, val),
+            None => std::env::remove_var(k),
+        }
     }
 }
 

@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::platforms::helpers::verify_hmac_sha256_signature;
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
 
@@ -53,6 +54,14 @@ pub struct WhatsAppConfig {
     /// Webhook verify token for incoming events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_token: Option<String>,
+
+    /// Meta app secret used to verify `X-Hub-Signature-256` on inbound
+    /// webhook POST bodies (HMAC-SHA256, fail-closed).
+    ///
+    /// Falls back to the `WHATSAPP_APP_SECRET` environment variable when
+    /// unset. Webhook POSTs are rejected (503) when neither is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_secret: Option<String>,
 
     /// Proxy configuration for outbound requests.
     #[serde(default)]
@@ -139,6 +148,65 @@ impl WhatsAppAdapter {
             Some(challenge.to_string())
         } else {
             None
+        }
+    }
+
+    /// Verify a WhatsApp webhook POST before any body processing.
+    ///
+    /// Checks Meta's `X-Hub-Signature-256` header (`sha256=<hex>`) against the
+    /// HMAC-SHA256 of the raw request body, using a constant-time comparison
+    /// (see [`verify_hmac_sha256_signature`]).
+    ///
+    /// The app secret comes from [`WhatsAppConfig::app_secret`], falling back
+    /// to the `WHATSAPP_APP_SECRET` environment variable. Verification is
+    /// fail-closed:
+    /// - secret missing/empty -> `Err((503, _))` + warn log,
+    /// - header missing/invalid -> `Err((403, _))` + warn log,
+    /// - match -> `Ok(())`.
+    ///
+    /// NOTE: this only authenticates the subscription *challenge*
+    /// ([`verify_webhook`]); [`parse_webhook_event`] itself does not
+    /// authenticate the caller, so always run this check first on the raw
+    /// body for every inbound POST.
+    pub fn verify_webhook_post(
+        &self,
+        body: &[u8],
+        signature_header: Option<&str>,
+    ) -> Result<(), (u16, &'static str)> {
+        let secret = self
+            .config
+            .app_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::var("WHATSAPP_APP_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+        Self::verify_webhook_post_with_secret(secret.as_deref(), body, signature_header)
+    }
+
+    /// Core of [`verify_webhook_post`] with the secret resolved explicitly,
+    /// so the fail-closed behavior is unit-testable without env mutation.
+    fn verify_webhook_post_with_secret(
+        secret: Option<&str>,
+        body: &[u8],
+        signature_header: Option<&str>,
+    ) -> Result<(), (u16, &'static str)> {
+        let secret = match secret {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                warn!("WHATSAPP_APP_SECRET not set; rejecting WhatsApp webhook (fail-closed, 503)");
+                return Err((503, "whatsapp webhook not configured"));
+            }
+        };
+        let header = signature_header.unwrap_or("");
+        if verify_hmac_sha256_signature(secret, body, header) {
+            Ok(())
+        } else {
+            warn!("invalid WhatsApp webhook signature; rejecting (403)");
+            Err((403, "invalid webhook signature"))
         }
     }
 
@@ -475,5 +543,132 @@ impl PlatformAdapter for WhatsAppAdapter {
     }
     fn platform_name(&self) -> &str {
         "whatsapp"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let out = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(64);
+        for b in out {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        format!("sha256={hex}")
+    }
+
+    /// RFC 4231 test case 2 (HMAC-SHA-256): key "Jefe",
+    /// data "what do ya want for nothing?".
+    #[test]
+    fn whatsapp_signature_rfc4231_known_answer() {
+        let body = b"what do ya want for nothing?";
+        let header = "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        assert!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(Some("Jefe"), body, Some(header))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn whatsapp_signature_wrong_secret_or_body_rejected_403() {
+        let body = b"hello";
+        let header = sign("correct-secret", body);
+        // Wrong secret.
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(
+                Some("wrong-secret"),
+                body,
+                Some(&header)
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+        // Tampered body.
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(
+                Some("correct-secret"),
+                b"tampered",
+                Some(&header)
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+        // Missing header.
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(Some("correct-secret"), body, None),
+            Err((403, "invalid webhook signature"))
+        );
+        // Header without sha256= prefix.
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(
+                Some("correct-secret"),
+                body,
+                Some(header.trim_start_matches("sha256="))
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+    }
+
+    #[test]
+    fn whatsapp_signature_missing_secret_rejected_503_fail_closed() {
+        let body = b"hello";
+        let header = sign("any", body);
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(None, body, Some(&header)),
+            Err((503, "whatsapp webhook not configured"))
+        );
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook_post_with_secret(Some(""), body, Some(&header)),
+            Err((503, "whatsapp webhook not configured"))
+        );
+    }
+
+    #[test]
+    fn whatsapp_verify_webhook_post_uses_config_secret() {
+        let cfg = WhatsAppConfig {
+            token: "tok".into(),
+            phone_number_id: None,
+            business_account_id: None,
+            verify_token: None,
+            app_secret: Some("cfg-secret".into()),
+            proxy: Default::default(),
+        };
+        let adapter = WhatsAppAdapter::new(cfg).expect("adapter");
+        let body = b"ping";
+        let header = sign("cfg-secret", body);
+        assert!(adapter.verify_webhook_post(body, Some(&header)).is_ok());
+        // Config secret beats the env fallback; env is not consulted here.
+        assert_eq!(
+            adapter.verify_webhook_post(body, None),
+            Err((403, "invalid webhook signature"))
+        );
+    }
+
+    #[test]
+    fn whatsapp_verify_webhook_post_env_fallback_fail_closed() {
+        // Config has no secret; env fallback is consulted.
+        let cfg = WhatsAppConfig {
+            token: "tok".into(),
+            phone_number_id: None,
+            business_account_id: None,
+            verify_token: None,
+            app_secret: None,
+            proxy: Default::default(),
+        };
+        let adapter = WhatsAppAdapter::new(cfg).expect("adapter");
+        let body = b"ping";
+        std::env::set_var("WHATSAPP_APP_SECRET", "env-secret-xyz");
+        let header = sign("env-secret-xyz", body);
+        assert!(adapter.verify_webhook_post(body, Some(&header)).is_ok());
+        std::env::remove_var("WHATSAPP_APP_SECRET");
+        assert_eq!(
+            adapter.verify_webhook_post(body, Some(&header)),
+            Err((503, "whatsapp webhook not configured"))
+        );
     }
 }

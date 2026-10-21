@@ -17,6 +17,14 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::BasePlatformAdapter;
+use crate::platforms::helpers::verify_hmac_sha256_signature;
+
+// ---------------------------------------------------------------------------
+// Incoming webhook authentication
+// ---------------------------------------------------------------------------
+
+/// Replay window for incoming webhooks: |now - timestamp| must be <= 300s.
+const REPLAY_WINDOW_SECS: u64 = 300;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -102,27 +110,81 @@ impl WebhookAdapter {
         queue.drain(..).collect()
     }
 
-    /// Verify HMAC-SHA256 signature.
-    fn verify_signature(secret: &str, body: &[u8], signature: &str) -> bool {
-        use std::fmt::Write;
-        let key = secret.as_bytes();
-        // Simple HMAC-SHA256 using md5 crate is not suitable; we compute a
-        // basic keyed hash. For production, use `hmac` + `sha2` crates.
-        // Here we do a constant-length comparison of a simplified hash.
-        let mut hasher_input = Vec::with_capacity(key.len() + body.len());
-        hasher_input.extend_from_slice(key);
-        hasher_input.extend_from_slice(body);
-        let digest = md5::compute(&hasher_input);
-        let mut hex = String::with_capacity(32);
-        for byte in digest.iter() {
-            let _ = write!(hex, "{:02x}", byte);
+    /// Decide whether an incoming webhook POST is authentic, before any body
+    /// processing. Fail-closed.
+    ///
+    /// BREAKING CHANGE (was silently fail-open): the old `verify_signature`
+    /// computed a keyed md5 digest that it NEVER compared and returned
+    /// `!sig_clean.is_empty()` -- i.e. ANY non-empty `X-Signature` header was
+    /// accepted. That function has been REPLACED, not extended, with real
+    /// HMAC-SHA256 verification plus a 5-minute replay window:
+    ///
+    /// 1. HMAC-SHA256 of the raw body with the configured secret, compared in
+    ///    constant time ([`verify_hmac_sha256_signature`], not `==`) against
+    ///    the `X-Hub-Signature-256` header (`sha256=<hex>` form). The legacy
+    ///    `X-Signature` header name is still accepted as an alias. Header names
+    ///    are matched case-insensitively.
+    /// 2. Replay window: timestamp from the `X-Webhook-Timestamp` header (unix
+    ///    seconds), falling back to a numeric/`"numeric"` `timestamp` field in
+    ///    the JSON body. Accepted only when `|now - ts| <= 300`s -- rejects
+    ///    stale replays and extreme future clock skew alike.
+    ///
+    /// The legacy plaintext-token behavior (comparing a `token` field in the
+    /// body against the secret, or accepting any non-empty signature header)
+    /// is REMOVED, not kept as a fallback: a body token does not sign the
+    /// payload and cannot be compared in constant time, so keeping it would
+    /// defeat this fix. Clients must migrate to HMAC signatures + timestamps.
+    ///
+    /// - missing/empty secret -> `Err((503, _))` + warn (fail-closed),
+    /// - bad signature or missing/stale timestamp -> `Err((403, _))` + warn,
+    /// - both valid -> `Ok(())`.
+    pub fn verify_incoming_webhook(
+        secret: Option<&str>,
+        body: &[u8],
+        signature: Option<&str>,
+        timestamp_header: Option<&str>,
+        json_body: &serde_json::Value,
+    ) -> Result<(), (u16, &'static str)> {
+        let secret = match secret {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                warn!("incoming webhook secret not configured; rejecting POST (fail-closed, 503)");
+                return Err((503, "webhook not configured"));
+            }
+        };
+        if !verify_hmac_sha256_signature(secret, body, signature.unwrap_or("")) {
+            warn!("invalid incoming webhook signature; rejecting (403)");
+            return Err((403, "invalid webhook signature"));
         }
-        // Compare with the provided signature (prefix-agnostic)
-        let sig_clean = signature.strip_prefix("sha256=").unwrap_or(signature);
-        // In a real implementation, use a proper HMAC-SHA256. For now,
-        // accept if the signature field is present and non-empty.
-        !sig_clean.is_empty()
+        let ts: Option<u64> = timestamp_header
+            .and_then(|h| h.trim().parse().ok())
+            .or_else(|| body_timestamp(json_body));
+        match ts {
+            Some(t) if timestamp_fresh(t) => Ok(()),
+            _ => {
+                warn!("incoming webhook timestamp missing or stale; rejecting (403)");
+                Err((403, "invalid or stale webhook timestamp"))
+            }
+        }
     }
+}
+
+/// Extract the `timestamp` field from a JSON body (number or numeric string).
+fn body_timestamp(v: &serde_json::Value) -> Option<u64> {
+    match v.get("timestamp") {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// `true` when the unix-seconds timestamp is within the replay window.
+fn timestamp_fresh(ts: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.abs_diff(ts) <= REPLAY_WINDOW_SECS
 }
 
 #[async_trait]
@@ -272,31 +334,57 @@ async fn handle_webhook_request(
     let method = parts.first().copied().unwrap_or("GET");
     let path = parts.get(1).copied().unwrap_or("/");
 
-    let signature = request
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("x-signature:"))
-        .map(|l| {
-            l.split_once(':')
-                .map(|x| x.1)
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        })
+    let signature = header_value(&request, "x-hub-signature-256")
+        .or_else(|| header_value(&request, "x-signature"))
         .unwrap_or_default();
+    let timestamp_header = header_value(&request, "x-webhook-timestamp");
 
     if method == "POST" && path == expected_path {
         let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(n);
         let body_bytes = &buf[body_start..n];
 
-        if !WebhookAdapter::verify_signature(secret, body_bytes, &signature) {
-            let resp =
-                "HTTP/1.1 403 Forbidden\r\nContent-Length: 22\r\n\r\n{\"error\":\"bad signature\"}";
+        let body_str = String::from_utf8_lossy(body_bytes);
+        let json_body: serde_json::Value = match serde_json::from_str(&body_str) {
+            Ok(v) => v,
+            Err(e) => {
+                let body = format!("{{\"error\":\"invalid json: {e}\"}}");
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(), body
+                );
+                writer.write_all(resp.as_bytes()).await?;
+                return Ok(());
+            }
+        };
+
+        // Authenticate before any payload processing (fail-closed).
+        let secret_opt = if secret.is_empty() {
+            None
+        } else {
+            Some(secret)
+        };
+        if let Err((status, msg)) = WebhookAdapter::verify_incoming_webhook(
+            secret_opt,
+            body_bytes,
+            (!signature.is_empty()).then_some(signature.as_str()),
+            timestamp_header.as_deref(),
+            &json_body,
+        ) {
+            let reason = match status {
+                503 => "503 Service Unavailable",
+                _ => "403 Forbidden",
+            };
+            let body = format!("{{\"error\":\"{msg}\"}}");
+            let resp = format!(
+                "HTTP/1.1 {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
             writer.write_all(resp.as_bytes()).await?;
             return Ok(());
         }
 
-        let body_str = String::from_utf8_lossy(body_bytes);
-        match serde_json::from_str::<WebhookPayload>(&body_str) {
+        match serde_json::from_value::<WebhookPayload>(json_body) {
             Ok(payload) => {
                 if let Some(tx) = inbound_tx.read().await.as_ref() {
                     let _ = tx.send(payload).await;
@@ -328,4 +416,203 @@ async fn handle_webhook_request(
     }
 
     Ok(())
+}
+
+/// Case-insensitive HTTP header lookup on the raw request head.
+fn header_value(request: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}:");
+    request.lines().find_map(|l| {
+        if l.len() >= prefix.len() && l[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            Some(l[prefix.len()..].trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let out = mac.finalize().into_bytes();
+        let mut hex = String::with_capacity(64);
+        for b in out {
+            use std::fmt::Write;
+            let _ = write!(hex, "{b:02x}");
+        }
+        format!("sha256={hex}")
+    }
+
+    fn now_ts() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn body_with_ts(ts: u64) -> (Vec<u8>, serde_json::Value) {
+        let body = format!(r#"{{"chat_id":"c1","text":"hi","timestamp":{ts}}}"#).into_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        (body, json)
+    }
+
+    /// RFC 4231 test case 2 (HMAC-SHA-256): key "Jefe",
+    /// data "what do ya want for nothing?".
+    #[test]
+    fn webhook_signature_rfc4231_known_answer() {
+        let body = b"what do ya want for nothing?";
+        let header = "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843";
+        let json_v: serde_json::Value = serde_json::from_slice(&body_with_ts(now_ts()).0).unwrap();
+        assert!(WebhookAdapter::verify_incoming_webhook(
+            Some("Jefe"),
+            body,
+            Some(header),
+            Some(&now_ts().to_string()),
+            &json_v,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn webhook_valid_signature_and_fresh_timestamp_ok() {
+        let (body, json) = body_with_ts(now_ts());
+        let sig = sign("topsecret", &body);
+        assert!(WebhookAdapter::verify_incoming_webhook(
+            Some("topsecret"),
+            &body,
+            Some(&sig),
+            None, // timestamp falls back to body field
+            &json,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn webhook_wrong_signature_rejected_403() {
+        let (body, json) = body_with_ts(now_ts());
+        // Any non-empty garbage used to be accepted (fail-open); now 403.
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(
+                Some("topsecret"),
+                &body,
+                Some("sha256=0000000000000000000000000000000000000000000000000000000000000000"),
+                Some(&now_ts().to_string()),
+                &json,
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+        // Legacy plaintext token in body does NOT authenticate.
+        let legacy = br#"{"chat_id":"c1","text":"hi","token":"topsecret"}"#.to_vec();
+        let legacy_json: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(
+                Some("topsecret"),
+                &legacy,
+                Some("sha256=0000000000000000000000000000000000000000000000000000000000000000"),
+                Some(&now_ts().to_string()),
+                &legacy_json,
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+        // Missing signature header entirely.
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(
+                Some("topsecret"),
+                &body,
+                None,
+                Some(&now_ts().to_string()),
+                &json,
+            ),
+            Err((403, "invalid webhook signature"))
+        );
+    }
+
+    #[test]
+    fn webhook_missing_secret_rejected_503_fail_closed() {
+        let (body, json) = body_with_ts(now_ts());
+        let sig = sign("whatever", &body);
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(
+                None,
+                &body,
+                Some(&sig),
+                Some(&now_ts().to_string()),
+                &json,
+            ),
+            Err((503, "webhook not configured"))
+        );
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(
+                Some(""),
+                &body,
+                Some(&sig),
+                Some(&now_ts().to_string()),
+                &json,
+            ),
+            Err((503, "webhook not configured"))
+        );
+    }
+
+    #[test]
+    fn webhook_stale_and_missing_timestamp_rejected_403() {
+        let secret = "topsecret";
+        // Stale: 10 minutes old.
+        let (body, json) = body_with_ts(now_ts() - 600);
+        let sig = sign(secret, &body);
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(Some(secret), &body, Some(&sig), None, &json,),
+            Err((403, "invalid or stale webhook timestamp"))
+        );
+        // Extreme future skew: 10 minutes ahead.
+        let (body, json) = body_with_ts(now_ts() + 600);
+        let sig = sign(secret, &body);
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(Some(secret), &body, Some(&sig), None, &json,),
+            Err((403, "invalid or stale webhook timestamp"))
+        );
+        // No timestamp anywhere.
+        let body = br#"{"chat_id":"c1","text":"hi"}"#.to_vec();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sig = sign(secret, &body);
+        assert_eq!(
+            WebhookAdapter::verify_incoming_webhook(Some(secret), &body, Some(&sig), None, &json,),
+            Err((403, "invalid or stale webhook timestamp"))
+        );
+    }
+
+    #[test]
+    fn webhook_timestamp_header_preferred_over_body() {
+        let secret = "topsecret";
+        // Body timestamp is stale, but a fresh header timestamp saves it.
+        let (body, _json) = body_with_ts(now_ts() - 600);
+        let sig = sign(secret, &body);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(WebhookAdapter::verify_incoming_webhook(
+            Some(secret),
+            &body,
+            Some(&sig),
+            Some(&now_ts().to_string()),
+            &json,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn header_value_is_case_insensitive() {
+        let req = "POST /webhook HTTP/1.1\r\nX-Hub-Signature-256: sha256=abc\r\nx-webhook-timestamp: 123\r\n\r\n";
+        assert_eq!(
+            header_value(req, "x-hub-signature-256").as_deref(),
+            Some("sha256=abc")
+        );
+        assert_eq!(
+            header_value(req, "X-Webhook-Timestamp").as_deref(),
+            Some("123")
+        );
+        assert!(header_value(req, "x-missing").is_none());
+    }
 }
