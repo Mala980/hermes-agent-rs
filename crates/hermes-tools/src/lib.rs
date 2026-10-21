@@ -22,6 +22,7 @@
 pub mod approval;
 pub mod backends;
 pub mod dispatch;
+pub mod memory_match;
 pub mod register_builtins;
 pub mod registry;
 pub mod threat_scan;
@@ -77,7 +78,7 @@ pub use tools::messaging::{MessagingBackend, SendMessageHandler};
 pub use tools::mixture_of_agents::MixtureOfAgentsHandler;
 pub use tools::osv_check::OsvCheckHandler;
 pub use tools::process_registry::ProcessRegistryHandler;
-pub use tools::session_search::{SessionSearchBackend, SessionSearchHandler};
+pub use tools::session_search::{SessionMessage, SessionSearchBackend, SessionSearchHandler};
 pub use tools::skill_commands;
 pub use tools::skill_utils;
 pub use tools::skills::{SkillManageHandler, SkillViewHandler, SkillsListHandler};

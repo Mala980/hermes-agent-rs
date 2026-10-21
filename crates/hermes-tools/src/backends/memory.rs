@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
 
+use crate::memory_match::{locate_entry_index, splice_patch_span};
 use crate::tools::memory::MemoryBackend;
 use hermes_core::ToolError;
 
@@ -246,6 +247,46 @@ impl MemoryBackend for FileMemoryBackend {
         Ok(Self::success_response(target, &entries, "Entry replaced."))
     }
 
+    /// Patch one span inside a single entry (parity with the original's
+    /// `memory_patch`): typography-tolerant entry lookup via
+    /// [`locate_entry_index`], then a single-span replacement via
+    /// [`splice_patch_span`]; the rest of the entry is preserved. The patched
+    /// store must still fit the target's char limit.
+    async fn patch(
+        &self,
+        target: &str,
+        old_text: &str,
+        new_content: &str,
+    ) -> Result<String, ToolError> {
+        let path = self.path_for(target)?;
+        let new_content = new_content.trim();
+        if new_content.is_empty() {
+            return Err(ToolError::InvalidParams(
+                "content cannot be empty for action='patch'.".to_string(),
+            ));
+        }
+
+        let content = self.read_file(&path).await?;
+        let mut entries = Self::parse_entries(&content);
+
+        let idx = locate_entry_index(&entries, old_text.trim())?;
+        let patched = splice_patch_span(&entries[idx], old_text.trim(), new_content)?;
+
+        let mut candidate = entries.clone();
+        candidate[idx] = patched;
+        let new_total = candidate.join(ENTRY_DELIMITER).chars().count();
+        let limit = Self::char_limit_for(target);
+        if new_total > limit {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Patch would put memory at {new_total}/{limit} chars."
+            )));
+        }
+        entries = candidate;
+        self.write_file(&path, &Self::format_entries(&entries))
+            .await?;
+        Ok(Self::success_response(target, &entries, "Entry patched."))
+    }
+
     async fn remove(&self, target: &str, old_text: &str) -> Result<String, ToolError> {
         let path = self.path_for(target)?;
         let old_text = old_text.trim();
@@ -297,5 +338,91 @@ impl MemoryBackend for FileMemoryBackend {
             .await?;
 
         Ok(Self::success_response(target, &entries, "Entry removed."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_backend() -> (FileMemoryBackend, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let backend = FileMemoryBackend::with_dir(dir.path().to_path_buf());
+        (backend, dir)
+    }
+
+    #[tokio::test]
+    async fn patch_replaces_single_span_and_keeps_rest() {
+        let (b, _dir) = temp_backend();
+        b.add("memory", "the sky is blue today").await.unwrap();
+        let out = b
+            .patch("memory", "blue", "green")
+            .await
+            .expect("patch should succeed");
+        assert!(out.contains("Entry patched."));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].as_str().unwrap(), "the sky is green today");
+    }
+
+    #[tokio::test]
+    async fn patch_locates_entry_with_folded_typography() {
+        // Entry lookup tolerates typography, but the replaced span must be
+        // byte-exact in the entry (reference semantics): here the span is.
+        let (b, _dir) = temp_backend();
+        b.add("memory", "the “quick” brown fox").await.unwrap();
+        let out = b
+            .patch("memory", "brown fox", "red fox")
+            .await
+            .expect("byte-exact span patch should succeed");
+        assert!(out.contains("the “quick” red fox"));
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_non_byte_exact_span_as_noop() {
+        // Folded lookup finds the entry, but the typographically different
+        // span is not byte-exact in it → no-op rejection, like the reference.
+        let (b, _dir) = temp_backend();
+        b.add("memory", "the “quick” brown fox").await.unwrap();
+        let err = b
+            .patch("memory", "the \"quick\" brown fox", "x")
+            .await
+            .expect_err("non-byte-exact span must be rejected");
+        assert!(err.to_string().contains("no-op"));
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_ambiguous_span() {
+        let (b, _dir) = temp_backend();
+        b.add("memory", "a b a").await.unwrap();
+        let err = b
+            .patch("memory", "a", "z")
+            .await
+            .expect_err("ambiguous span must be rejected");
+        assert!(err.to_string().contains("occurs 2 times"));
+    }
+
+    #[tokio::test]
+    async fn patch_rejects_noop() {
+        let (b, _dir) = temp_backend();
+        b.add("memory", "hello world").await.unwrap();
+        let err = b
+            .patch("memory", "missing", "zzz")
+            .await
+            .expect_err("patch with no match must fail");
+        assert!(err.to_string().contains("No memory entry matched"));
+    }
+
+    #[tokio::test]
+    async fn patch_honors_target_store() {
+        let (b, _dir) = temp_backend();
+        b.add("memory", "agent note").await.unwrap();
+        b.add("user", "user pref").await.unwrap();
+        let out = b.patch("user", "pref", "habit").await.unwrap();
+        assert!(out.contains("\"target\":\"user\""));
+        // The memory store is untouched.
+        let out2 = b.remove("memory", "agent note").await.unwrap();
+        assert!(out2.contains("Entry removed."));
     }
 }

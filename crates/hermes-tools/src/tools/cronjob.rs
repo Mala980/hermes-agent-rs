@@ -160,7 +160,7 @@ impl ToolHandler for CronjobHandler {
             "schedule".into(),
             json!({
                 "type": "string",
-                "description": "Cron schedule expression (e.g. '0 9 * * *' for 9am daily)"
+                "description": "Schedule: 5/6-field cron (e.g. '0 9 * * *' for 9am daily), interval ('every 15m', 'every 1h'), one-shot ('at 2030-01-01T09:00:00+08:00'), or keyword ('hourly', 'daily', 'weekly', 'midnight', 'noon'). Cron wall-clock uses the job's timezone when set."
             }),
         );
         props.insert(

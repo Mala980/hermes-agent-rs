@@ -21,7 +21,7 @@
 //! `~/.hermes/processes.json` for recovery after restart.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -135,6 +135,20 @@ struct ManagedProcess {
     child: Option<tokio::process::Child>,
     stdout_buf: Arc<Mutex<RingBuffer>>,
     stderr_buf: Arc<Mutex<RingBuffer>>,
+}
+
+/// Process-wide shared [`ProcessManager`].
+///
+/// The TUI's background-process panel (F4) and the `process_registry` tool
+/// both operate on this instance, so the panel shows the same processes
+/// the agent spawned — real registry data, not a mock.
+static GLOBAL_MANAGER: OnceLock<Arc<ProcessManager>> = OnceLock::new();
+
+/// Return the process-wide shared [`ProcessManager`], creating it on first use.
+pub fn global_process_manager() -> Arc<ProcessManager> {
+    GLOBAL_MANAGER
+        .get_or_init(|| Arc::new(ProcessManager::new()))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +448,17 @@ pub struct ProcessRegistryHandler {
 impl ProcessRegistryHandler {
     pub fn new(manager: Arc<ProcessManager>) -> Self {
         Self { manager }
+    }
+
+    /// Handler bound to the process-wide shared [`ProcessManager`]
+    /// (see [`global_process_manager`]).
+    ///
+    /// This is what production registration uses, so background processes
+    /// spawned through the `process_registry` tool are visible to the TUI's
+    /// F4 panel. Prefer [`ProcessRegistryHandler::default`] (private
+    /// manager) in tests to keep them isolated.
+    pub fn shared() -> Self {
+        Self::new(global_process_manager())
     }
 }
 
