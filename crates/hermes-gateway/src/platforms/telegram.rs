@@ -19,6 +19,7 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::markdown_split::split_markdown;
 
 /// Maximum message length for Telegram (4096 characters).
 const MAX_MESSAGE_LENGTH: usize = 4096;
@@ -412,7 +413,7 @@ impl TelegramAdapter {
         keyboard: Option<InlineKeyboardMarkup>,
         message_thread_id: Option<i64>,
     ) -> Result<Vec<i64>, GatewayError> {
-        let chunks = split_message(text, MAX_MESSAGE_LENGTH);
+        let chunks = split_markdown(text, MAX_MESSAGE_LENGTH);
         let mut message_ids = Vec::new();
 
         for (i, chunk) in chunks.iter().enumerate() {
@@ -466,7 +467,7 @@ impl TelegramAdapter {
         let mut body = serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id.parse::<i64>().unwrap_or(0),
-            "text": &text[..text.len().min(MAX_MESSAGE_LENGTH)],
+            "text": &text[..text.floor_char_boundary(text.len().min(MAX_MESSAGE_LENGTH))],
         });
 
         if let Some(pm) = parse_mode {
@@ -736,6 +737,115 @@ impl TelegramAdapter {
         self.consecutive_errors.load(Ordering::SeqCst)
     }
 
+    /// Whether the adapter is currently marked running.
+    pub fn is_running(&self) -> bool {
+        self.base.is_running()
+    }
+
+    /// Clone of the stop `Notify`, signaled by [`TelegramAdapter::stop`].
+    ///
+    /// The poll loop ([`TelegramAdapter::run_poll_loop`]) selects on this so
+    /// it terminates promptly when the adapter is stopped — the same
+    /// mechanism `stop()` uses.
+    pub fn stop_notifier(&self) -> Arc<Notify> {
+        self.stop_signal.clone()
+    }
+
+    /// Run the long-polling receive loop, forwarding inbound messages as
+    /// platform-agnostic [`crate::gateway::IncomingMessage`]s on `tx`.
+    ///
+    /// Each polled update is handled by [`TelegramAdapter::process_update`]:
+    /// fail-closed allowlist gate ([`crate::allowlist`]), `answerCallbackQuery`
+    /// for button presses, then conversion via
+    /// [`TelegramAdapter::update_to_incoming`].
+    ///
+    /// The loop terminates when [`TelegramAdapter::stop`] signals the stop
+    /// `Notify` (also interrupting backoff sleeps), or when the `tx` receiver
+    /// is dropped (the gateway pump task going away).
+    pub async fn run_poll_loop(
+        self: &Arc<Self>,
+        tx: tokio::sync::mpsc::Sender<crate::gateway::IncomingMessage>,
+    ) {
+        info!("Telegram poll loop started");
+        loop {
+            tokio::select! {
+                _ = self.stop_signal.notified() => {
+                    info!("Telegram poll loop stopping (stop signaled)");
+                    break;
+                }
+                result = self.poll_with_backoff() => {
+                    match result {
+                        PollResult::Updates(updates) => {
+                            for update in &updates {
+                                if !self.process_update(update, &tx).await {
+                                    info!(
+                                        "Telegram poll loop stopping (inbound receiver dropped)"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        PollResult::Backoff { delay_ms, .. } => {
+                            tokio::select! {
+                                _ = self.stop_signal.notified() => {
+                                    info!("Telegram poll loop stopping during backoff");
+                                    return;
+                                }
+                                _ = tokio::time::sleep(
+                                    tokio::time::Duration::from_millis(delay_ms),
+                                ) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        info!("Telegram poll loop stopped");
+    }
+
+    /// Handle a single polled update.
+    ///
+    /// Order: parse → fail-closed allowlist gate (dropped updates are logged
+    /// and skipped) → answer callback queries so the user's client stops
+    /// showing the loading spinner → forward as a gateway-level
+    /// [`crate::gateway::IncomingMessage`].
+    ///
+    /// Returns `false` when the inbound receiver is gone and the poll loop
+    /// should exit.
+    async fn process_update(
+        &self,
+        update: &Update,
+        tx: &tokio::sync::mpsc::Sender<crate::gateway::IncomingMessage>,
+    ) -> bool {
+        let Some(parsed) = Self::parse_update(update) else {
+            return true;
+        };
+
+        let user_id = parsed.user_id.map(|u| u.to_string()).unwrap_or_default();
+        if !crate::allowlist::is_platform_user_allowed("telegram", &user_id) {
+            warn!(
+                user_id = %user_id,
+                update_id = update.update_id,
+                "Telegram: dropping update from non-allowlisted user (fail-closed)"
+            );
+            return true;
+        }
+
+        if let Some(ref callback_query_id) = parsed.callback_query_id {
+            if let Err(e) = self
+                .answer_callback_query(callback_query_id, None, false)
+                .await
+            {
+                warn!(
+                    callback_query_id = %callback_query_id,
+                    "Telegram: answerCallbackQuery failed: {}", e
+                );
+            }
+        }
+
+        tx.send(Self::parsed_to_incoming(&parsed)).await.is_ok()
+    }
+
     // -----------------------------------------------------------------------
     // Update parsing
     // -----------------------------------------------------------------------
@@ -834,6 +944,33 @@ impl TelegramAdapter {
             callback_query_id: Some(cq.id.clone()),
             callback_data: cq.data.clone(),
         })
+    }
+
+    /// Convert a Telegram `Update` into the platform-agnostic gateway
+    /// [`crate::gateway::IncomingMessage`].
+    ///
+    /// Returns `None` when the update carries no parseable message or
+    /// callback query (same condition as [`TelegramAdapter::parse_update`]).
+    pub fn update_to_incoming(update: &Update) -> Option<crate::gateway::IncomingMessage> {
+        let parsed = Self::parse_update(update)?;
+        Some(Self::parsed_to_incoming(&parsed))
+    }
+
+    /// Convert a parsed telegram-local [`IncomingMessage`] into the
+    /// platform-agnostic gateway [`crate::gateway::IncomingMessage`].
+    ///
+    /// Field mapping: `platform` is always `"telegram"`; numeric Telegram IDs
+    /// become strings; `is_dm` is true only for private chats; callback
+    /// queries carry the button `data` as `text`.
+    pub fn parsed_to_incoming(parsed: &IncomingMessage) -> crate::gateway::IncomingMessage {
+        crate::gateway::IncomingMessage {
+            platform: "telegram".to_string(),
+            chat_id: parsed.chat_id.to_string(),
+            user_id: parsed.user_id.map(|u| u.to_string()).unwrap_or_default(),
+            text: parsed.text.clone().unwrap_or_default(),
+            message_id: Some(parsed.message_id.to_string()),
+            is_dm: parsed.chat_type == ChatKind::Private,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1090,75 +1227,59 @@ impl PlatformAdapter for TelegramAdapter {
 // Utility functions
 // ---------------------------------------------------------------------------
 
-/// Split a message into chunks that fit within the given max length,
-/// preferring to break at newline boundaries.
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let end = (start + max_len).min(text.len());
-
-        if end >= text.len() {
-            chunks.push(text[start..].to_string());
-            break;
-        }
-
-        // Try to break at a newline near the boundary.
-        let break_at = text[start..end]
-            .rfind('\n')
-            .map(|pos| start + pos + 1)
-            .unwrap_or(end);
-
-        chunks.push(text[start..break_at].to_string());
-        start = break_at;
-    }
-
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
-    // split_message tests (original)
+    // split_markdown tests (fence-aware splitting at Telegram's 4096 limit)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn split_message_short() {
-        let chunks = split_message("hello", 4096);
+    fn split_markdown_short() {
+        let chunks = split_markdown("hello", 4096);
         assert_eq!(chunks, vec!["hello"]);
     }
 
     #[test]
-    fn split_message_exact_boundary() {
+    fn split_markdown_exact_boundary() {
         let text = "a".repeat(4096);
-        let chunks = split_message(&text, 4096);
+        let chunks = split_markdown(&text, 4096);
         assert_eq!(chunks.len(), 1);
     }
 
     #[test]
-    fn split_message_long() {
+    fn split_markdown_long() {
         let text = "a".repeat(5000);
-        let chunks = split_message(&text, 4096);
+        let chunks = split_markdown(&text, 4096);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 4096);
         assert_eq!(chunks[1].len(), 904);
     }
 
     #[test]
-    fn split_message_prefers_newline() {
+    fn split_markdown_prefers_newline() {
         let mut text = "a".repeat(4000);
         text.push('\n');
         text.push_str(&"b".repeat(200));
-        let chunks = split_message(&text, 4096);
+        let chunks = split_markdown(&text, 4096);
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].ends_with('\n'));
+    }
+
+    #[test]
+    fn split_markdown_telegram_fence_aware() {
+        let code: String = (0..250)
+            .map(|i| format!("line {i}: some_code();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro\n```rust\n{code}\n```\nOutro");
+        let chunks = split_markdown(&text, 4096);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= 4196, "chunk exceeds Telegram limit: {}", c.len());
+            assert_eq!(c.matches("```").count() % 2, 0);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1396,6 +1517,252 @@ mod tests {
         assert_eq!(incoming.callback_query_id, Some("cq_456".into()));
         assert_eq!(incoming.chat_id, 0);
         assert_eq!(incoming.message_id, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // update_to_incoming: Update -> gateway-level IncomingMessage conversion
+    // -----------------------------------------------------------------------
+
+    fn test_adapter() -> TelegramAdapter {
+        TelegramAdapter::new(TelegramConfig {
+            token: "test-token".into(),
+            webhook_url: None,
+            polling: true,
+            proxy: Default::default(),
+            parse_markdown: false,
+            parse_html: false,
+            poll_timeout: 30,
+            bot_username: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn update_to_incoming_text_message() {
+        let update = Update {
+            update_id: 40,
+            message: Some(make_text_message(
+                11,
+                make_chat(700, "private"),
+                make_user(500, Some("cbuser")),
+                "hello",
+            )),
+            callback_query: None,
+        };
+
+        let gw = TelegramAdapter::update_to_incoming(&update).unwrap();
+        assert_eq!(gw.platform, "telegram");
+        assert_eq!(gw.chat_id, "700");
+        assert_eq!(gw.user_id, "500");
+        assert_eq!(gw.text, "hello");
+        assert_eq!(gw.message_id, Some("11".into()));
+        assert!(gw.is_dm);
+    }
+
+    #[test]
+    fn update_to_incoming_callback_query() {
+        let update = Update {
+            update_id: 41,
+            message: None,
+            callback_query: Some(CallbackQuery {
+                id: "cq_789".into(),
+                from: make_user(501, Some("btnuser")),
+                message: Some(TelegramMessage {
+                    message_id: 201,
+                    chat: make_chat(601, "private"),
+                    from: None,
+                    text: Some("Pick one".into()),
+                    voice: None,
+                    photo: None,
+                    caption: None,
+                    sticker: None,
+                    reply_to_message: None,
+                    message_thread_id: None,
+                }),
+                data: Some("btn_action_2".into()),
+                chat_instance: None,
+            }),
+        };
+
+        // The callback query must be answerable: parse_update keeps its id.
+        let parsed = TelegramAdapter::parse_update(&update).unwrap();
+        assert_eq!(parsed.callback_query_id, Some("cq_789".into()));
+
+        let gw = TelegramAdapter::update_to_incoming(&update).unwrap();
+        assert_eq!(gw.platform, "telegram");
+        assert_eq!(gw.chat_id, "601");
+        assert_eq!(gw.user_id, "501");
+        // Button data becomes the message text for the agent loop.
+        assert_eq!(gw.text, "btn_action_2");
+        assert_eq!(gw.message_id, Some("201".into()));
+        assert!(gw.is_dm);
+    }
+
+    #[test]
+    fn update_to_incoming_group_is_not_dm() {
+        let update = Update {
+            update_id: 42,
+            message: Some(make_text_message(
+                12,
+                make_chat(800, "supergroup"),
+                make_user(502, None),
+                "hi all",
+            )),
+            callback_query: None,
+        };
+
+        let gw = TelegramAdapter::update_to_incoming(&update).unwrap();
+        assert_eq!(gw.chat_id, "800");
+        assert_eq!(gw.text, "hi all");
+        assert!(!gw.is_dm);
+    }
+
+    #[test]
+    fn update_to_incoming_media_without_text_defaults_empty() {
+        let mut msg = make_text_message(13, make_chat(700, "private"), make_user(503, None), "x");
+        msg.text = None;
+        msg.voice = Some(Voice {
+            file_id: "voice123".into(),
+            file_unique_id: "vu123".into(),
+            duration: 5,
+        });
+        let update = Update {
+            update_id: 43,
+            message: Some(msg),
+            callback_query: None,
+        };
+
+        let gw = TelegramAdapter::update_to_incoming(&update).unwrap();
+        assert_eq!(gw.text, "");
+        assert_eq!(gw.message_id, Some("13".into()));
+    }
+
+    #[test]
+    fn update_to_incoming_empty_update_is_none() {
+        let update = Update {
+            update_id: 44,
+            message: None,
+            callback_query: None,
+        };
+        assert!(TelegramAdapter::update_to_incoming(&update).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // process_update: allowlist gate (no live HTTP needed for text messages)
+    // -----------------------------------------------------------------------
+
+    fn set_test_var(name: &str, v: Option<&str>) -> Option<String> {
+        let old = std::env::var(name).ok();
+        match v {
+            Some(s) => std::env::set_var(name, s),
+            None => std::env::remove_var(name),
+        }
+        old
+    }
+
+    fn make_dm_text_update(update_id: i64, user_id: i64, text: &str) -> Update {
+        Update {
+            update_id,
+            message: Some(make_text_message(
+                100,
+                make_chat(900, "private"),
+                make_user(user_id, None),
+                text,
+            )),
+            callback_query: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_drops_disallowed_user() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old_allowed = set_test_var("TELEGRAM_ALLOWED_USERS", Some("111"));
+        let old_fallback = set_test_var("GATEWAY_ALLOWED_USERS", None);
+        let old_all = set_test_var("TELEGRAM_ALLOW_ALL_USERS", None);
+
+        let adapter = test_adapter();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(50, 999, "should be dropped");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        // Nothing forwarded for a non-allowlisted sender (fail-closed).
+        assert!(rx.try_recv().is_err());
+
+        set_test_var("TELEGRAM_ALLOWED_USERS", old_allowed.as_deref());
+        set_test_var("GATEWAY_ALLOWED_USERS", old_fallback.as_deref());
+        set_test_var("TELEGRAM_ALLOW_ALL_USERS", old_all.as_deref());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_forwards_allowed_message() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old_allowed = set_test_var("TELEGRAM_ALLOWED_USERS", None);
+        let old_fallback = set_test_var("GATEWAY_ALLOWED_USERS", None);
+        let old_all = set_test_var("TELEGRAM_ALLOW_ALL_USERS", Some("1"));
+
+        let adapter = test_adapter();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(51, 999, "hello agent");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        let gw = rx.try_recv().expect("allowed message must be forwarded");
+        assert_eq!(gw.platform, "telegram");
+        assert_eq!(gw.chat_id, "900");
+        assert_eq!(gw.user_id, "999");
+        assert_eq!(gw.text, "hello agent");
+        assert!(gw.is_dm);
+
+        set_test_var("TELEGRAM_ALLOWED_USERS", old_allowed.as_deref());
+        set_test_var("GATEWAY_ALLOWED_USERS", old_fallback.as_deref());
+        set_test_var("TELEGRAM_ALLOW_ALL_USERS", old_all.as_deref());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_receiver_dropped_stops_loop() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old_allowed = set_test_var("TELEGRAM_ALLOWED_USERS", None);
+        let old_fallback = set_test_var("GATEWAY_ALLOWED_USERS", None);
+        let old_all = set_test_var("TELEGRAM_ALLOW_ALL_USERS", Some("1"));
+
+        let adapter = test_adapter();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        drop(rx);
+        let update = make_dm_text_update(52, 999, "nobody listening");
+
+        // Receiver gone -> process_update returns false -> loop exits.
+        assert!(!adapter.process_update(&update, &tx).await);
+
+        set_test_var("TELEGRAM_ALLOWED_USERS", old_allowed.as_deref());
+        set_test_var("GATEWAY_ALLOWED_USERS", old_fallback.as_deref());
+        set_test_var("TELEGRAM_ALLOW_ALL_USERS", old_all.as_deref());
+    }
+
+    #[test]
+    fn adapter_stop_signals_poll_loop_notifier() {
+        // run_poll_loop selects on stop_notifier(); stop() must fire it.
+        use futures::FutureExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let adapter = Arc::new(test_adapter());
+            adapter.start().await.unwrap();
+            assert!(adapter.is_running());
+            let notifier = adapter.stop_notifier();
+            let notified = notifier.notified();
+            // Fuse the future so we can poll it without awaiting.
+            tokio::pin!(notified);
+            assert!(notified.as_mut().now_or_never().is_none());
+            adapter.stop().await.unwrap();
+            assert!(!adapter.is_running());
+            notified.as_mut().await;
+        });
     }
 
     // -----------------------------------------------------------------------
