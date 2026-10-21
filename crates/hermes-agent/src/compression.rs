@@ -49,7 +49,14 @@ const MIN_SUMMARY_TOKENS: u64 = 2_000;
 const SUMMARY_RATIO: f64 = 0.20;
 const SUMMARY_TOKENS_CEILING: u64 = 12_000;
 const CHARS_PER_TOKEN: usize = 4;
-const SUMMARY_FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
+/// Cooldown after repeated summary failures: 10 minutes (hermes-rs parity,
+/// `SUMMARY_FAILURE_COOLDOWN_SECS` in hermes-rs `context.rs`).
+pub const SUMMARY_FAILURE_COOLDOWN_SECS: u64 = 600;
+
+/// Max LLM summary attempts per session (hermes-rs parity:
+/// `MAX_COMPRESSION_ATTEMPTS = 3` in hermes-rs `context.rs`, mirroring
+/// `max_compression_attempts=3` in the original `context_compressor.py`).
+pub const MAX_COMPRESSION_ATTEMPTS: u32 = 3;
 
 // Truncation limits for the summariser input (per Python class constants).
 const CONTENT_MAX: usize = 6_000;
@@ -70,6 +77,11 @@ pub enum CompressionError {
     #[error("summarisation cooldown active for another {0:?}")]
     CooldownActive(Duration),
 
+    /// The per-session summary attempt budget is exhausted. The caller should
+    /// fall through to the static fallback marker.
+    #[error("summary attempt budget exhausted ({0} attempts this session)")]
+    AttemptBudgetExhausted(u32),
+
     /// The underlying auxiliary client failed in a non-retryable way.
     #[error("auxiliary client error: {0}")]
     Auxiliary(#[from] AuxiliaryError),
@@ -77,6 +89,63 @@ pub enum CompressionError {
     /// The LLM provider returned an error during the summarisation call.
     #[error("LLM provider error: {0}")]
     Llm(#[from] AgentError),
+}
+
+// ---------------------------------------------------------------------------
+// Per-session compaction guard (hermes-rs parity)
+// ---------------------------------------------------------------------------
+
+/// Per-session summary-attempt guard: attempt cap + failure-cooldown ladder.
+///
+/// Port of hermes-rs `context::CompactionState` (W1-B8): at most
+/// [`MAX_COMPRESSION_ATTEMPTS`] summary attempts per session, and a
+/// [`SUMMARY_FAILURE_COOLDOWN_SECS`]-second cooldown that arms only after
+/// *repeated* consecutive failures (ladder) — a single failure may still be
+/// retried on the next turn. Deterministic tool-result pruning never counts
+/// as an attempt and is never cooled down.
+#[derive(Debug, Default)]
+pub struct CompactionState {
+    /// LLM summary attempts made this session.
+    pub attempts: u32,
+    /// Consecutive summary failures (reset by one success).
+    pub consecutive_failures: u32,
+    /// Summary attempts are held until this instant after repeated failures.
+    pub cooldown_until: Option<Instant>,
+}
+
+impl CompactionState {
+    /// May an LLM summary be attempted right now? False once the attempt cap
+    /// is reached or while the failure cooldown is active.
+    pub fn summarize_allowed(&self, now: Instant) -> bool {
+        if self.attempts >= MAX_COMPRESSION_ATTEMPTS {
+            return false;
+        }
+        match self.cooldown_until {
+            Some(until) => now >= until,
+            None => true,
+        }
+    }
+
+    /// Record one LLM summary attempt (call immediately before the request).
+    pub fn record_attempt(&mut self) {
+        self.attempts += 1;
+    }
+
+    /// A summary succeeded: clear consecutive failures and any cooldown.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.cooldown_until = None;
+    }
+
+    /// A summary failed: bump the consecutive-failure count; arm the
+    /// cooldown only after repeated failures (ladder) — the first failure
+    /// alone does not block the next turn's attempt.
+    pub fn record_failure(&mut self, now: Instant) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= 2 {
+            self.cooldown_until = Some(now + Duration::from_secs(SUMMARY_FAILURE_COOLDOWN_SECS));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +241,9 @@ pub struct ContextCompressor {
     compression_count: u64,
     last_prompt_tokens: u64,
     previous_summary: Option<String>,
-    failure_cooldown_until: Option<Instant>,
+    /// Per-session summary guard: attempt cap + failure-cooldown ladder
+    /// (hermes-rs `CompactionState` parity).
+    compaction: CompactionState,
 }
 
 impl ContextCompressor {
@@ -182,37 +253,64 @@ impl ContextCompressor {
     /// compressor is used. To re-target a different model, build a new
     /// instance.
     pub fn new(config: CompressorConfig, auxiliary: Arc<AuxiliaryClient>) -> Self {
-        let summary_ratio = config.summary_target_ratio.clamp(0.10, 0.80);
-        let threshold_tokens = (config.context_length as f64 * config.threshold_percent) as u64;
-        let target_tokens = (threshold_tokens as f64 * summary_ratio) as u64;
-        let max_summary_tokens =
-            ((config.context_length as f64 * 0.05) as u64).min(SUMMARY_TOKENS_CEILING);
+        let clamped = CompressorConfig {
+            summary_target_ratio: config.summary_target_ratio.clamp(0.10, 0.80),
+            ..config.clone()
+        };
+        let (threshold_tokens, tail_token_budget, max_summary_tokens) =
+            Self::derive_budgets(&clamped, clamped.context_length);
 
-        if !config.quiet_mode {
+        if !clamped.quiet_mode {
             tracing::info!(
                 "Context compressor initialised: context_length={} threshold={} ({:.0}%) target_ratio={:.0}% tail_budget={}",
-                config.context_length,
+                clamped.context_length,
                 threshold_tokens,
-                config.threshold_percent * 100.0,
-                summary_ratio * 100.0,
-                target_tokens,
+                clamped.threshold_percent * 100.0,
+                clamped.summary_target_ratio * 100.0,
+                tail_token_budget,
             );
         }
 
         Self {
-            config: CompressorConfig {
-                summary_target_ratio: summary_ratio,
-                ..config
-            },
+            config: clamped,
             auxiliary,
             threshold_tokens,
-            tail_token_budget: target_tokens,
+            tail_token_budget,
             max_summary_tokens,
             compression_count: 0,
             last_prompt_tokens: 0,
             previous_summary: None,
-            failure_cooldown_until: None,
+            compaction: CompactionState::default(),
         }
+    }
+
+    /// Derive `(threshold_tokens, tail_token_budget, max_summary_tokens)` for
+    /// a context window. Shared by [`Self::new`] and [`Self::retarget`].
+    fn derive_budgets(config: &CompressorConfig, context_length: u64) -> (u64, u64, u64) {
+        let summary_ratio = config.summary_target_ratio.clamp(0.10, 0.80);
+        let threshold_tokens = (context_length as f64 * config.threshold_percent) as u64;
+        let tail_token_budget = (threshold_tokens as f64 * summary_ratio) as u64;
+        let max_summary_tokens =
+            ((context_length as f64 * 0.05) as u64).min(SUMMARY_TOKENS_CEILING);
+        (threshold_tokens, tail_token_budget, max_summary_tokens)
+    }
+
+    /// Retarget the compressor at a different model context window (tokens),
+    /// recomputing the derived token budgets. Attempt/cooldown state and the
+    /// previous summary are preserved across retargets, so one long-lived
+    /// instance can serve turns routed to different models.
+    pub fn retarget(&mut self, context_length: u64) {
+        let (threshold_tokens, tail_token_budget, max_summary_tokens) =
+            Self::derive_budgets(&self.config, context_length);
+        self.config.context_length = context_length;
+        self.threshold_tokens = threshold_tokens;
+        self.tail_token_budget = tail_token_budget;
+        self.max_summary_tokens = max_summary_tokens;
+    }
+
+    /// The per-session summary guard (attempt cap + cooldown ladder).
+    pub fn compaction_state(&self) -> &CompactionState {
+        &self.compaction
     }
 
     /// Total in-window threshold (tokens). Compression triggers above this.
@@ -384,19 +482,28 @@ Write only the summary body. Do not include any preamble or prefix."
     /// Generate a structured summary of the supplied turns using the
     /// auxiliary client.
     ///
-    /// Returns `Ok(Some(summary))` on success, `Ok(None)` when the cooldown
-    /// is active, and `Err(...)` for hard auxiliary failures (which also
-    /// arm the cooldown for `SUMMARY_FAILURE_COOLDOWN`).
+    /// Returns `Ok(Some(summary))` on success, `Ok(None)` when the summary
+    /// came back empty, `Err(CooldownActive)` while the failure cooldown
+    /// holds, `Err(AttemptBudgetExhausted)` once the per-session attempt cap
+    /// is reached, and `Err(...)` for hard auxiliary failures.
+    ///
+    /// Attempt accounting follows the [`CompactionState`] ladder: every call
+    /// records an attempt, consecutive failures arm a 10-minute cooldown
+    /// only after the second one, and one success clears the ladder.
     pub async fn generate_summary(
         &mut self,
         turns: &[Message],
     ) -> Result<Option<String>, CompressionError> {
-        if let Some(deadline) = self.failure_cooldown_until {
-            let now = Instant::now();
+        let now = Instant::now();
+        if self.compaction.attempts >= MAX_COMPRESSION_ATTEMPTS {
+            return Err(CompressionError::AttemptBudgetExhausted(
+                self.compaction.attempts,
+            ));
+        }
+        if let Some(deadline) = self.compaction.cooldown_until {
             if now < deadline {
                 return Err(CompressionError::CooldownActive(deadline - now));
             }
-            self.failure_cooldown_until = None;
         }
 
         let budget = self.compute_summary_budget(turns);
@@ -410,6 +517,7 @@ Write only the summary body. Do not include any preamble or prefix."
             request = request.with_model(model.clone());
         }
 
+        self.compaction.record_attempt();
         match self.auxiliary.call(request).await {
             Ok(resp) => {
                 let body = resp
@@ -417,29 +525,30 @@ Write only the summary body. Do not include any preamble or prefix."
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 if body.is_empty() {
-                    self.arm_cooldown();
+                    self.compaction.record_failure(now);
                     Ok(None)
                 } else {
+                    self.compaction.record_success();
                     self.previous_summary = Some(body.clone());
                     Ok(Some(with_summary_prefix(&body)))
                 }
             }
             Err(err) => {
-                self.arm_cooldown();
+                self.compaction.record_failure(now);
                 if !self.config.quiet_mode {
-                    tracing::warn!(
-                        "Failed to generate context summary: {err}. \
-                         Further summary attempts paused for {:?}.",
-                        SUMMARY_FAILURE_COOLDOWN
-                    );
+                    // Only the repeated failure arms the cooldown (ladder);
+                    // say so explicitly so the log doesn't over-claim.
+                    let paused_note = match self.compaction.cooldown_until {
+                        Some(until) if now < until => {
+                            format!(" Further summary attempts paused for {:?}.", until - now)
+                        }
+                        _ => String::new(),
+                    };
+                    tracing::warn!("Failed to generate context summary: {err}.{paused_note}");
                 }
                 Err(CompressionError::Auxiliary(err))
             }
         }
-    }
-
-    fn arm_cooldown(&mut self) {
-        self.failure_cooldown_until = Some(Instant::now() + SUMMARY_FAILURE_COOLDOWN);
     }
 
     // ------------------------------------------------------------------
@@ -888,6 +997,14 @@ fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     chars_to_tokens(total)
 }
 
+/// Estimate prompt tokens for a message slice (chars/4 heuristic plus
+/// per-message and tool-call overhead) — the same estimate
+/// [`ContextCompressor`] uses for its trigger check. Exposed so the agent
+/// loop can evaluate the compaction trigger without duplicating the math.
+pub fn estimate_tokens(messages: &[Message]) -> u64 {
+    estimate_messages_tokens(messages)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1202,15 +1319,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generate_summary_arms_cooldown_on_failure() {
+    async fn generate_summary_cooldown_ladder() {
+        // Ladder (hermes-rs CompactionState parity): the first failure does
+        // NOT arm the cooldown — a retry is allowed on the next turn. The
+        // second consecutive failure arms the 10-minute cooldown.
         let aux = aux_with_provider(Arc::new(FailingProvider));
         let mut compressor = ContextCompressor::new(quiet_config(), aux);
         let turns = vec![msg(MessageRole::User, "x")];
+
         let err = compressor.generate_summary(&turns).await.unwrap_err();
         assert!(matches!(err, CompressionError::Auxiliary(_)));
-        // Second call within cooldown window short-circuits.
+        assert!(
+            compressor
+                .compaction_state()
+                .summarize_allowed(Instant::now()),
+            "first failure must not arm the cooldown"
+        );
+
         let err2 = compressor.generate_summary(&turns).await.unwrap_err();
-        assert!(matches!(err2, CompressionError::CooldownActive(_)));
+        assert!(matches!(err2, CompressionError::Auxiliary(_)));
+
+        // Third call within the cooldown window short-circuits.
+        let err3 = compressor.generate_summary(&turns).await.unwrap_err();
+        assert!(matches!(err3, CompressionError::CooldownActive(_)));
+    }
+
+    #[tokio::test]
+    async fn generate_summary_attempt_cap_blocks_fourth_attempt() {
+        // Simulate three prior summary attempts this session, then prove the
+        // fourth is refused without touching the provider.
+        let provider = CannedSummaryProvider::new("unused");
+        let aux = aux_with_provider(provider.clone());
+        let mut compressor = ContextCompressor::new(quiet_config(), aux);
+        for _ in 0..MAX_COMPRESSION_ATTEMPTS {
+            compressor.compaction.record_attempt();
+        }
+        compressor.compaction.cooldown_until = None;
+
+        let turns = vec![msg(MessageRole::User, "x")];
+        let err = compressor.generate_summary(&turns).await.unwrap_err();
+        assert!(
+            matches!(err, CompressionError::AttemptBudgetExhausted(3)),
+            "expected attempt-budget error, got {err:?}"
+        );
+        assert_eq!(provider.call_count(), 0, "no LLM call may be issued");
+    }
+
+    #[test]
+    fn compaction_state_caps_attempts_at_three() {
+        let t0 = Instant::now();
+        let mut s = CompactionState::default();
+        assert!(s.summarize_allowed(t0));
+        for _ in 0..MAX_COMPRESSION_ATTEMPTS {
+            s.record_attempt();
+            s.record_success();
+        }
+        assert!(
+            !s.summarize_allowed(t0),
+            "the 4th summary attempt must be blocked"
+        );
+    }
+
+    #[test]
+    fn compaction_state_cooldown_only_after_repeated_failures() {
+        let t0 = Instant::now();
+        let mut s = CompactionState::default();
+        s.record_attempt();
+        s.record_failure(t0);
+        assert!(
+            s.summarize_allowed(t0),
+            "a single failure must not arm the cooldown"
+        );
+        s.record_attempt();
+        s.record_failure(t0);
+        assert!(
+            !s.summarize_allowed(t0),
+            "repeated failures must arm the cooldown"
+        );
+        s.record_success();
+        assert!(s.summarize_allowed(t0), "one success must clear the ladder");
     }
 
     // ---------- sanitiser ----------
@@ -1369,6 +1556,71 @@ mod tests {
         // Tail preserved verbatim.
         let last = out.last().unwrap();
         assert_eq!(last.content.as_deref(), Some("tail 4"));
+    }
+
+    #[tokio::test]
+    async fn compress_prunes_old_tool_results_before_failed_summary() {
+        // Wired-path check (W1-B7/B8): oldest-first tool-result pruning runs
+        // BEFORE summarisation, and a failed summary never aborts the turn —
+        // the pruned context is kept with a static fallback marker.
+        //
+        // The oversized tool outputs sit in the protected head region, so the
+        // prune placeholders survive into the final output even though the
+        // summarised middle is replaced by the fallback marker.
+        let aux = aux_with_provider(Arc::new(FailingProvider));
+        let cfg = CompressorConfig {
+            context_length: 10_000,
+            threshold_percent: 0.5,
+            protect_first_n: 5,
+            protect_last_n: 3,
+            ..quiet_config()
+        };
+        let mut compressor = ContextCompressor::new(cfg, aux);
+
+        let mut messages = vec![msg(MessageRole::System, "sys")];
+        // Head pairs with old, oversized tool outputs — prune candidates.
+        for i in 0..2 {
+            let cid = format!("cold{i}");
+            messages.push(assistant_with_tool_call(&cid, "shell", "ls"));
+            messages.push(tool_msg(&cid, &format!("old{i} {}", "z".repeat(500))));
+        }
+        // Middle: many small pairs (summarised away on failure).
+        for i in 0..20 {
+            let cid = format!("mid{i}");
+            messages.push(assistant_with_tool_call(&cid, "shell", "pwd"));
+            messages.push(tool_msg(&cid, "ok"));
+        }
+        // Recent tail the compressor must protect.
+        for i in 0..4 {
+            messages.push(msg(MessageRole::User, &format!("tail {i}")));
+        }
+
+        let out = compressor.compress(messages, Some(60_000)).await;
+        // The turn is not aborted: messages come back, pruned, with the
+        // static fallback banner where the summary would have gone.
+        assert!(!out.is_empty(), "compress must not drop the turn");
+        let pruned = out
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(PRUNED_TOOL_PLACEHOLDER))
+            .count();
+        assert_eq!(
+            pruned, 2,
+            "oldest-first tool results must be pruned before summarising"
+        );
+        assert!(
+            out.iter().any(|m| m
+                .content
+                .as_deref()
+                .unwrap_or("")
+                .contains("Summary generation was unavailable")),
+            "static fallback banner must be present"
+        );
+        let last = out.last().unwrap();
+        assert_eq!(
+            last.content.as_deref(),
+            Some("tail 3"),
+            "tail kept verbatim"
+        );
     }
 
     #[tokio::test]

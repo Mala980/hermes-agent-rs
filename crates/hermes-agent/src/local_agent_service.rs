@@ -110,6 +110,9 @@ impl LocalAgentService {
         if let Some(pm) = &self.plugin_manager {
             agent = agent.with_plugins(pm.clone());
         }
+        // W1-B5 parity: persist the turn record before tools execute
+        // (fail-open on DB errors).
+        agent = agent.with_session_persistence(self.session_persistence.clone());
         agent
     }
 }

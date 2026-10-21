@@ -20,6 +20,7 @@ pub mod agent_builder;
 pub mod agent_loop;
 pub mod api_bridge;
 pub mod auxiliary_builder;
+pub mod batch_segments;
 pub mod budget;
 pub mod compression;
 pub mod context;
