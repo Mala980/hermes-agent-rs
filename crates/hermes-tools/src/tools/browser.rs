@@ -820,6 +820,122 @@ pub trait VaultBackend: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encrypted file vault: crypto primitives
+// ---------------------------------------------------------------------------
+
+/// Encrypt-then-MAC construction for the file vault.
+///
+/// - Confidentiality: HMAC-SHA256-CTR stream cipher —
+///   `keystream block_i = HMAC(k_enc, nonce || le64(i))`, XORed with plaintext.
+/// - Integrity: `tag = HMAC-SHA256(k_mac, nonce || ciphertext)`, verified with
+///   a constant-time comparison before decryption.
+///
+/// Only `hmac 0.12` + `sha2 0.10` are used (already workspace deps); no AES
+/// crate is needed. This mirrors the reference port's construction for the
+/// local-file threat model. It is NOT hardware-backed and there is no
+/// passphrase: whoever can read `vault.key` (0600) can decrypt the vault.
+mod vault_crypto {
+    /// HMAC-SHA256.
+    pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+        mac.update(msg);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// OS entropy for keys, nonces and temp-file names.
+    pub fn random_bytes(n: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")?;
+        let mut buf = vec![0u8; n];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Constant-time equality for MAC tags.
+    pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut acc = 0u8;
+        for (x, y) in a.iter().zip(b.iter()) {
+            acc |= x ^ y;
+        }
+        acc == 0
+    }
+
+    /// Keystream blocks: `block_i = HMAC(k_enc, nonce || le64(i))`.
+    pub fn keystream(enc_key: &[u8], nonce: &[u8; 16], len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut ctr: u64 = 0;
+        while out.len() < len {
+            let mut msg = Vec::with_capacity(24);
+            msg.extend_from_slice(nonce);
+            msg.extend_from_slice(&ctr.to_le_bytes());
+            out.extend_from_slice(&hmac_sha256(enc_key, &msg));
+            ctr += 1;
+        }
+        out.truncate(len);
+        out
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, ToolError> {
+    let bad = || ToolError::ExecutionFailed("vault: invalid hex encoding".into());
+    if !s.len().is_multiple_of(2) {
+        return Err(bad());
+    }
+    let raw = s.as_bytes();
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = hex_val(raw[i]).ok_or_else(bad)?;
+        let lo = hex_val(raw[i + 1]).ok_or_else(bad)?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// On-disk envelope for `vault.json.enc`:
+/// `{"format":"hermes-vault/1","nonce":"<32 hex>","payload":"<hex>"}`,
+/// where `payload = ciphertext || tag` (tag = 32 raw bytes),
+/// `ciphertext = plaintext XOR keystream(k_enc, nonce)`,
+/// `tag = HMAC-SHA256(k_mac, nonce || ciphertext)`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct VaultEnvelope {
+    format: String,
+    nonce: String,
+    payload: String,
+}
+
+/// Serializes read-modify-write cycles so concurrent in-process saves cannot
+/// interleave. Writes are atomic (temp file + rename); cross-process is
+/// last-writer-wins (documented).
+static FILE_VAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StoredVaultItem {
     handle: String,
@@ -835,8 +951,45 @@ struct StoredVaultItem {
     has_otp: bool,
 }
 
-/// Local JSON-file vault (mode 0600). Mirrors the Python local vault store.
+/// Non-secret metadata projection for a stored item.
+fn vault_meta_of(item: &StoredVaultItem) -> VaultItemMeta {
+    VaultItemMeta {
+        handle: item.handle.clone(),
+        backend: "local".into(),
+        label: item.label.clone(),
+        kind: item.kind,
+        origin: item.origin.clone(),
+        allowed_origins: item.allowed_origins.clone(),
+        identifier: item.identifier.clone(),
+        has_otp: item.has_otp,
+    }
+}
+
+/// Local file-backed vault with at-rest encryption.
+///
+/// Layout — everything lives in the directory containing `path`:
+/// - `vault.key` — 0600, 64 random bytes (32-byte encryption key +
+///   32-byte MAC key), created on first use with `create_new` (race-safe).
+/// - `vault.json.enc` — 0600, the encrypted item list (see [`VaultEnvelope`]).
+/// - legacy `browser_vault.json` — plaintext from older builds. On the first
+///   load where it exists it is migrated into the encrypted store and renamed
+///   to `browser_vault.json.migrated`. The old file is never deleted
+///   silently; re-migration is idempotent (dedup by handle).
+///
+/// The directory gets best-effort 0700 (a warning is logged on failure).
+///
+/// Item records keep the legacy shape
+/// (handle/label/kind/origin/allowed_origins/identifier/has_otp); the `secret`
+/// field rides inside the encrypted payload and never appears in `list`
+/// output.
+///
+/// This backend is **key-file based, not passphrase locked**: `needs_unlock`
+/// stays `false` and there is no unlock prompt — possession of `vault.key`
+/// (0600) is the unlock. Saving a new secret interactively goes through
+/// [`read_masked_password`], which fails closed when stdin is not a TTY.
 pub struct FileVaultBackend {
+    /// Legacy plaintext path; doubles as the migration source. The key and
+    /// the encrypted store live in its parent directory.
     path: std::path::PathBuf,
 }
 
@@ -845,47 +998,258 @@ impl FileVaultBackend {
         Self { path }
     }
 
+    /// Legacy default location (`<hermes_home>/browser_vault.json`).
+    ///
+    /// Kept stable for migration: an existing plaintext file here is moved
+    /// into the encrypted store on first use. The encrypted files live
+    /// beside it as `<hermes_home>/vault.key` and `<hermes_home>/vault.json.enc`.
     pub fn default_path() -> std::path::PathBuf {
         hermes_config::hermes_home().join("browser_vault.json")
     }
 
-    fn load(&self) -> Result<Vec<StoredVaultItem>, ToolError> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let data = std::fs::read(&self.path)
-            .map_err(|e| ToolError::ExecutionFailed(format!("vault read failed: {e}")))?;
-        serde_json::from_slice(&data)
-            .map_err(|e| ToolError::ExecutionFailed(format!("vault parse failed: {e}")))
+    fn vault_dir(&self) -> Result<std::path::PathBuf, ToolError> {
+        self.path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| ToolError::ExecutionFailed("vault path has no parent directory".into()))
     }
 
-    fn save(&self, items: &[StoredVaultItem]) -> Result<(), ToolError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ToolError::ExecutionFailed(format!("vault dir failed: {e}")))?;
-        }
-        let data = serde_json::to_vec_pretty(items)
-            .map_err(|e| ToolError::ExecutionFailed(format!("vault encode failed: {e}")))?;
+    fn key_path(&self) -> Result<std::path::PathBuf, ToolError> {
+        Ok(self.vault_dir()?.join("vault.key"))
+    }
+
+    fn enc_path(&self) -> Result<std::path::PathBuf, ToolError> {
+        Ok(self.vault_dir()?.join("vault.json.enc"))
+    }
+
+    fn migrated_path(&self) -> std::path::PathBuf {
+        self.path.with_extension("json.migrated")
+    }
+
+    fn ensure_dir(&self) -> Result<std::path::PathBuf, ToolError> {
+        let dir = self.vault_dir()?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault dir failed: {e}")))?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                tracing::warn!(
+                    "browser_vault: could not set 0700 on vault dir {}: {e}",
+                    dir.display()
+                );
+            }
+        }
+        Ok(dir)
+    }
+
+    /// Load (or create) the 64-byte key: 32-byte encryption key ||
+    /// 32-byte MAC key.
+    fn load_key(&self) -> Result<([u8; 32], [u8; 32]), ToolError> {
+        self.ensure_dir()?;
+        let path = self.key_path()?;
+        let raw: Vec<u8> = if path.exists() {
+            std::fs::read(&path)
+                .map_err(|e| ToolError::ExecutionFailed(format!("vault key read failed: {e}")))?
+        } else {
+            let fresh = vault_crypto::random_bytes(64)
+                .map_err(|e| ToolError::ExecutionFailed(format!("vault key gen failed: {e}")))?;
+            use std::io::Write;
+            match std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.path)
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(&data)
-                })
-                .map_err(|e| ToolError::ExecutionFailed(format!("vault write failed: {e}")))?;
-        }
-        #[cfg(not(unix))]
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    f.write_all(&fresh).map_err(|e| {
+                        ToolError::ExecutionFailed(format!("vault key write failed: {e}"))
+                    })?;
+                    fresh
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Lost a creation race; use the winner's key.
+                    std::fs::read(&path).map_err(|e| {
+                        ToolError::ExecutionFailed(format!("vault key read failed: {e}"))
+                    })?
+                }
+                Err(e) => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "vault key write failed: {e}"
+                    )))
+                }
+            }
+        };
+        #[cfg(unix)]
         {
-            std::fs::write(&self.path, data)
-                .map_err(|e| ToolError::ExecutionFailed(format!("vault write failed: {e}")))?;
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(
+                    "browser_vault: could not set 0600 on {}: {e}",
+                    path.display()
+                );
+            }
         }
+        if raw.len() != 64 {
+            return Err(ToolError::ExecutionFailed(
+                "vault key file is corrupt (expected 64 bytes)".into(),
+            ));
+        }
+        let mut k_enc = [0u8; 32];
+        let mut k_mac = [0u8; 32];
+        k_enc.copy_from_slice(&raw[..32]);
+        k_mac.copy_from_slice(&raw[32..]);
+        Ok((k_enc, k_mac))
+    }
+
+    fn encrypt(&self, plaintext: &[u8]) -> Result<VaultEnvelope, ToolError> {
+        let (k_enc, k_mac) = self.load_key()?;
+        let nonce_raw = vault_crypto::random_bytes(16)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault nonce failed: {e}")))?;
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&nonce_raw);
+        let ks = vault_crypto::keystream(&k_enc, &nonce, plaintext.len());
+        let ciphertext: Vec<u8> = plaintext
+            .iter()
+            .zip(ks.iter())
+            .map(|(p, k)| p ^ k)
+            .collect();
+        let mut mac_msg = Vec::with_capacity(16 + ciphertext.len());
+        mac_msg.extend_from_slice(&nonce);
+        mac_msg.extend_from_slice(&ciphertext);
+        let tag = vault_crypto::hmac_sha256(&k_mac, &mac_msg);
+        let mut payload = ciphertext;
+        payload.extend_from_slice(&tag);
+        Ok(VaultEnvelope {
+            format: "hermes-vault/1".to_string(),
+            nonce: hex_encode(&nonce),
+            payload: hex_encode(&payload),
+        })
+    }
+
+    fn decrypt(&self, env: &VaultEnvelope) -> Result<Vec<u8>, ToolError> {
+        let bad = || {
+            ToolError::ExecutionFailed(
+                "vault decryption failed (wrong key or corrupted file)".into(),
+            )
+        };
+        if env.format != "hermes-vault/1" {
+            return Err(ToolError::ExecutionFailed(format!(
+                "unknown vault format: {}",
+                env.format
+            )));
+        }
+        let (k_enc, k_mac) = self.load_key()?;
+        let nonce_raw = hex_decode(&env.nonce).map_err(|_| bad())?;
+        let payload = hex_decode(&env.payload).map_err(|_| bad())?;
+        if nonce_raw.len() != 16 || payload.len() < 32 {
+            return Err(bad());
+        }
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&nonce_raw);
+        let (ciphertext, tag) = payload.split_at(payload.len() - 32);
+        let mut mac_msg = Vec::with_capacity(16 + ciphertext.len());
+        mac_msg.extend_from_slice(&nonce);
+        mac_msg.extend_from_slice(ciphertext);
+        let expect = vault_crypto::hmac_sha256(&k_mac, &mac_msg);
+        if !vault_crypto::ct_eq(&expect, tag) {
+            return Err(bad());
+        }
+        let ks = vault_crypto::keystream(&k_enc, &nonce, ciphertext.len());
+        Ok(ciphertext
+            .iter()
+            .zip(ks.iter())
+            .map(|(c, k)| c ^ k)
+            .collect())
+    }
+
+    /// Load items. The caller must hold [`FILE_VAULT_LOCK`].
+    fn load_locked(&self) -> Result<Vec<StoredVaultItem>, ToolError> {
+        let enc = self.enc_path()?;
+        let mut items: Vec<StoredVaultItem> = if enc.exists() {
+            let raw = std::fs::read(&enc)
+                .map_err(|e| ToolError::ExecutionFailed(format!("vault read failed: {e}")))?;
+            if raw.is_empty() {
+                Vec::new()
+            } else {
+                let env: VaultEnvelope = serde_json::from_slice(&raw).map_err(|_| {
+                    ToolError::ExecutionFailed("vault file is corrupt (bad envelope)".into())
+                })?;
+                let plain = self.decrypt(&env)?;
+                serde_json::from_slice(&plain).map_err(|_| {
+                    ToolError::ExecutionFailed("vault file is corrupt (bad payload)".into())
+                })?
+            }
+        } else {
+            Vec::new()
+        };
+        self.migrate_legacy_locked(&mut items)?;
+        Ok(items)
+    }
+
+    /// Migrate a legacy plaintext `browser_vault.json` into the encrypted
+    /// store (dedup by handle), then rename it to `.migrated`. Idempotent:
+    /// if the rename failed on a previous run, merging again changes nothing.
+    /// The caller must hold [`FILE_VAULT_LOCK`].
+    fn migrate_legacy_locked(&self, items: &mut Vec<StoredVaultItem>) -> Result<(), ToolError> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let data = std::fs::read(&self.path)
+            .map_err(|e| ToolError::ExecutionFailed(format!("legacy vault read failed: {e}")))?;
+        let legacy: Vec<StoredVaultItem> = serde_json::from_slice(&data)
+            .map_err(|e| ToolError::ExecutionFailed(format!("legacy vault parse failed: {e}")))?;
+        for item in legacy {
+            if !items.iter().any(|i| i.handle == item.handle) {
+                items.push(item);
+            }
+        }
+        // Persist before renaming so a crash cannot lose items.
+        self.save_locked(items)?;
+        let target = self.migrated_path();
+        match std::fs::rename(&self.path, &target) {
+            Ok(()) => tracing::info!(
+                "browser_vault: migrated legacy plaintext vault into the encrypted store; \
+                 old file renamed to {}",
+                target.display()
+            ),
+            Err(e) => tracing::warn!(
+                "browser_vault: migrated legacy vault but could not rename {}: {e} \
+                 (will re-migrate idempotently on next load)",
+                self.path.display()
+            ),
+        }
+        Ok(())
+    }
+
+    /// Write items atomically (temp file + rename). The caller must hold
+    /// [`FILE_VAULT_LOCK`].
+    fn save_locked(&self, items: &[StoredVaultItem]) -> Result<(), ToolError> {
+        let dir = self.ensure_dir()?;
+        let data = serde_json::to_vec(items)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault encode failed: {e}")))?;
+        let env = self.encrypt(&data)?;
+        let out = serde_json::to_vec(&env)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault encode failed: {e}")))?;
+        let tmp_name = format!(
+            ".vault.{}.tmp",
+            hex_encode(
+                &vault_crypto::random_bytes(8)
+                    .map_err(|e| ToolError::ExecutionFailed(format!("vault nonce failed: {e}")))?
+            )
+        );
+        let tmp = dir.join(tmp_name);
+        std::fs::write(&tmp, &out)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault write failed: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("browser_vault: could not set 0600 on temp vault file: {e}");
+            }
+        }
+        std::fs::rename(&tmp, self.enc_path()?)
+            .map_err(|e| ToolError::ExecutionFailed(format!("vault write failed: {e}")))?;
         Ok(())
     }
 }
@@ -897,37 +1261,17 @@ impl VaultBackend for FileVaultBackend {
     }
 
     async fn list_items(&self) -> Result<Vec<VaultItemMeta>, ToolError> {
-        Ok(self
-            .load()?
-            .into_iter()
-            .map(|i| VaultItemMeta {
-                handle: i.handle,
-                backend: "local".into(),
-                label: i.label,
-                kind: i.kind,
-                origin: i.origin,
-                allowed_origins: i.allowed_origins,
-                identifier: i.identifier,
-                has_otp: i.has_otp,
-            })
-            .collect())
+        let _guard = FILE_VAULT_LOCK.lock().unwrap();
+        Ok(self.load_locked()?.iter().map(vault_meta_of).collect())
     }
 
     async fn get_item(&self, handle: &str) -> Result<VaultItem, ToolError> {
-        self.load()?
+        let _guard = FILE_VAULT_LOCK.lock().unwrap();
+        self.load_locked()?
             .into_iter()
             .find(|i| i.handle == handle)
             .map(|i| VaultItem {
-                meta: VaultItemMeta {
-                    handle: i.handle,
-                    backend: "local".into(),
-                    label: i.label,
-                    kind: i.kind,
-                    origin: i.origin,
-                    allowed_origins: i.allowed_origins,
-                    identifier: i.identifier,
-                    has_otp: i.has_otp,
-                },
+                meta: vault_meta_of(&i),
                 secret: i.secret,
             })
             .ok_or_else(|| ToolError::NotFound(format!("vault item {handle:?} not found")))
@@ -945,7 +1289,8 @@ impl VaultBackend for FileVaultBackend {
                 "Cannot save an empty secret".into(),
             ));
         }
-        let mut items = self.load()?;
+        let _guard = FILE_VAULT_LOCK.lock().unwrap();
+        let mut items = self.load_locked()?;
         let handle = uuid::Uuid::new_v4().to_string();
         // Replace an existing login for the same origin+identifier instead of
         // duplicating it.
@@ -960,7 +1305,7 @@ impl VaultBackend for FileVaultBackend {
             secret: secret.to_string(),
             has_otp: false,
         });
-        self.save(&items)?;
+        self.save_locked(&items)?;
         Ok(handle)
     }
 }
@@ -1742,8 +2087,10 @@ mod tests {
     #[test]
     fn test_file_vault_roundtrip_no_secret_in_list() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("vault.json");
-        let backend = FileVaultBackend::new(path.clone());
+        // `path` is the legacy plaintext location; the encrypted files live
+        // in its parent directory.
+        let legacy_path = dir.path().join("vault.json");
+        let backend = FileVaultBackend::new(legacy_path.clone());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let handle = rt
             .block_on(backend.save_login(
@@ -1757,9 +2104,12 @@ mod tests {
         let items = rt.block_on(backend.list_items()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].identifier.as_deref(), Some("user@example.com"));
-        // The file holds the secret, but list output never includes it.
+        // The list output never includes the secret.
         let list_json = serde_json::to_string(&items).unwrap();
         assert!(!list_json.contains("s3cr3t"));
+        // But the secret round-trips for fill.
+        let item = rt.block_on(backend.get_item(&handle)).unwrap();
+        assert_eq!(item.secret, "s3cr3t");
         // Saving again for the same origin+identifier replaces instead of duplicating.
         rt.block_on(backend.save_login(
             "Example",
@@ -1770,13 +2120,241 @@ mod tests {
         .unwrap();
         let items = rt.block_on(backend.list_items()).unwrap();
         assert_eq!(items.len(), 1);
-        // File is created with owner-only permissions on Unix.
+        // The encrypted store holds no plaintext secret, and no legacy
+        // plaintext file was ever created.
+        let enc_path = dir.path().join("vault.json.enc");
+        assert!(enc_path.exists());
+        let enc_bytes = std::fs::read(&enc_path).unwrap();
+        assert!(!enc_bytes.windows(6).any(|w| w == b"s3cr3t"));
+        assert!(!legacy_path.exists());
+        // Key + encrypted file are owner-only on Unix.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&enc_path), 0o600);
+            assert_eq!(mode(&dir.path().join("vault.key")), 0o600);
         }
+    }
+
+    #[test]
+    fn test_vault_crypto_keystream_deterministic() {
+        let a = vault_crypto::keystream(&[9u8; 32], &[7u8; 16], 100);
+        let b = vault_crypto::keystream(&[9u8; 32], &[7u8; 16], 100);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 100);
+        // Different nonce -> different keystream.
+        assert_ne!(a, vault_crypto::keystream(&[9u8; 32], &[8u8; 16], 100));
+        // Different key -> different keystream.
+        assert_ne!(a, vault_crypto::keystream(&[10u8; 32], &[7u8; 16], 100));
+    }
+
+    #[test]
+    fn test_vault_crypto_ct_eq() {
+        assert!(vault_crypto::ct_eq(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!vault_crypto::ct_eq(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!vault_crypto::ct_eq(&[1, 2], &[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_vault_envelope_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FileVaultBackend::new(dir.path().join("vault.json"));
+        let env = backend.encrypt(b"hello vault").unwrap();
+        assert_eq!(env.format, "hermes-vault/1");
+        assert_eq!(env.nonce.len(), 32);
+        assert_eq!(backend.decrypt(&env).unwrap(), b"hello vault");
+        // No plaintext in the stored payload.
+        let payload = hex_decode(&env.payload).unwrap();
+        assert!(!payload.windows(5).any(|w| w == b"hello"));
+        // Unknown envelope format is rejected.
+        let mut bad_env = backend.encrypt(b"x").unwrap();
+        bad_env.format = "hermes-vault/99".into();
+        assert!(backend.decrypt(&bad_env).is_err());
+    }
+
+    #[test]
+    fn test_vault_tamper_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FileVaultBackend::new(dir.path().join("vault.json"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(backend.save_login("Example", "u", "https://example.com", "s3cr3t"))
+            .unwrap();
+        let enc_path = dir.path().join("vault.json.enc");
+
+        // Tamper with the ciphertext region and, separately, with the tag.
+        let pristine = std::fs::read(&enc_path).unwrap();
+        for (tamper, idx_fn) in [
+            ("ciphertext", 0usize),
+            ("tag", usize::MAX), // resolved below to the last hex char
+        ] {
+            let mut env: VaultEnvelope = serde_json::from_slice(&pristine).unwrap();
+            let mut chars: Vec<char> = env.payload.chars().collect();
+            let idx = if idx_fn == usize::MAX {
+                chars.len() - 1
+            } else {
+                idx_fn
+            };
+            chars[idx] = if chars[idx] == 'a' { 'b' } else { 'a' };
+            env.payload = chars.into_iter().collect();
+            std::fs::write(&enc_path, serde_json::to_vec(&env).unwrap()).unwrap();
+            let err = rt.block_on(backend.list_items()).unwrap_err();
+            assert!(
+                err.to_string().contains("decryption failed"),
+                "tamper {tamper} was not detected: {err}"
+            );
+            // Restore the pristine store for the next iteration.
+            std::fs::write(&enc_path, &pristine).unwrap();
+        }
+        // Store is usable again after re-saving.
+        assert_eq!(rt.block_on(backend.list_items()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_vault_permissions_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let backend = FileVaultBackend::new(dir.path().join("vault.json"));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(backend.save_login("Example", "u", "https://example.com", "pw"))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(dir.path()), 0o700, "vault dir");
+            assert_eq!(mode(&dir.path().join("vault.key")), 0o600, "vault.key");
+            assert_eq!(
+                mode(&dir.path().join("vault.json.enc")),
+                0o600,
+                "vault.json.enc"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vault_key_file_reused_across_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let backend = FileVaultBackend::new(dir.path().join("vault.json"));
+        rt.block_on(backend.save_login("Example", "u", "https://example.com", "pw"))
+            .unwrap();
+        let key_before = std::fs::read(dir.path().join("vault.key")).unwrap();
+        assert_eq!(key_before.len(), 64);
+        // A fresh backend instance reuses the on-disk key: items still decrypt.
+        let backend2 = FileVaultBackend::new(dir.path().join("vault.json"));
+        let items = rt.block_on(backend2.list_items()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("vault.key")).unwrap(),
+            key_before
+        );
+    }
+
+    #[test]
+    fn test_vault_migration_from_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("vault.json");
+        let backend = FileVaultBackend::new(legacy_path.clone());
+        // Simulate an old plaintext vault (cleartext `secret`, legacy shape).
+        let legacy = vec![StoredVaultItem {
+            handle: "legacy1".into(),
+            label: "Old".into(),
+            kind: VaultItemKind::Login,
+            origin: "https://old.example".into(),
+            allowed_origins: vec![],
+            identifier: Some("olduser".into()),
+            secret: "oldsecret".into(),
+            has_otp: false,
+        }];
+        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let items = rt.block_on(backend.list_items()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].handle, "legacy1");
+        // The secret survived migration and is now stored encrypted.
+        let item = rt.block_on(backend.get_item("legacy1")).unwrap();
+        assert_eq!(item.secret, "oldsecret");
+        // The legacy file was renamed (never deleted silently).
+        assert!(!legacy_path.exists());
+        assert!(dir.path().join("vault.json.migrated").exists());
+        let enc = std::fs::read(dir.path().join("vault.json.enc")).unwrap();
+        assert!(!enc.windows(9).any(|w| w == b"oldsecret"));
+        // Second load is idempotent: no duplicates, no errors.
+        let items = rt.block_on(backend.list_items()).unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn test_vault_migration_merges_with_encrypted_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("vault.json");
+        let backend = FileVaultBackend::new(legacy_path.clone());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // An item already in the encrypted store...
+        let new_handle = rt
+            .block_on(backend.save_login("New", "n", "https://new.example", "newsecret"))
+            .unwrap();
+        // ...plus a legacy plaintext file with the same handle (dedup) and a
+        // genuinely old one.
+        let legacy = vec![
+            StoredVaultItem {
+                handle: new_handle.clone(),
+                label: "New".into(),
+                kind: VaultItemKind::Login,
+                origin: "https://new.example".into(),
+                allowed_origins: vec![],
+                identifier: Some("n".into()),
+                secret: "stale".into(),
+                has_otp: false,
+            },
+            StoredVaultItem {
+                handle: "legacy2".into(),
+                label: "Old".into(),
+                kind: VaultItemKind::Login,
+                origin: "https://old.example".into(),
+                allowed_origins: vec![],
+                identifier: Some("o".into()),
+                secret: "oldsecret".into(),
+                has_otp: false,
+            },
+        ];
+        std::fs::write(&legacy_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let items = rt.block_on(backend.list_items()).unwrap();
+        assert_eq!(items.len(), 2);
+        // The encrypted copy wins for the duplicated handle.
+        assert_eq!(
+            rt.block_on(backend.get_item(&new_handle)).unwrap().secret,
+            "newsecret"
+        );
+    }
+
+    #[test]
+    fn test_vault_masked_prompt_fail_closed_without_tty() {
+        // The test harness stdin is not a TTY: reading a masked password
+        // must fail closed instead of echoing or blocking.
+        let err = read_masked_password("Password: ").unwrap_err();
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(_)),
+            "expected fail-closed ExecutionFailed, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vault_file_backend_keyfile_based_no_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FileVaultBackend::new(dir.path().join("vault.json"));
+        // Key-file based: no unlock gate (unlike external manager backends).
+        assert!(!backend.needs_unlock());
+        assert!(backend.is_unlocked());
+        assert!(backend.unlock().await.is_err());
     }
 
     #[test]
