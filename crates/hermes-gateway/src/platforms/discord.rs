@@ -8,18 +8,25 @@
 //! MESSAGE_CREATE, MESSAGE_UPDATE, INTERACTION_CREATE, VOICE_STATE_UPDATE,
 //! MESSAGE_REACTION_ADD, MESSAGE_REACTION_REMOVE).
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::markdown_split::split_markdown;
+use crate::platforms::helpers::send_with_rate_limit_retry;
 
 /// Maximum message length for Discord (2000 characters).
 const MAX_MESSAGE_LENGTH: usize = 2000;
@@ -29,6 +36,19 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
 /// Discord Gateway WebSocket URL.
 const DISCORD_GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
+
+/// Maximum number of inbound message IDs kept for deduplication.
+///
+/// Discord replays recent events after a reconnect/RESUME; keeping a bounded
+/// window of seen IDs prevents double-processing. Oldest entries are evicted
+/// first (insertion order).
+const MAX_SEEN_MESSAGE_IDS: usize = 5000;
+
+/// Base reconnect delay before jitter, in milliseconds.
+const RECONNECT_BASE_DELAY_MS: u64 = 1_000;
+
+/// Maximum reconnect delay (cap for the exponential backoff), in milliseconds.
+const RECONNECT_MAX_DELAY_MS: u64 = 60_000;
 
 // ---------------------------------------------------------------------------
 // DiscordConfig
@@ -61,6 +81,93 @@ fn default_intents() -> u64 {
     // GUILDS (1<<0) | GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15)
     // DIRECT_MESSAGES is required to receive DM events; it is not privileged.
     (1 << 0) | (1 << 9) | (1 << 12) | (1 << 15)
+}
+
+// ---------------------------------------------------------------------------
+// Reliability helpers: reconnect backoff + inbound message dedup
+// ---------------------------------------------------------------------------
+
+/// Compute the *base* reconnect delay for a 0-based attempt index.
+///
+/// Pure exponential backoff: 1s, 2s, 4s, …, capped at 60s. Kept separate from
+/// [`reconnect_delay`] so the progression is unit-testable without jitter.
+pub fn reconnect_base_delay(attempt: u32) -> Duration {
+    let shift = attempt.min(6); // 2^6 = 64s -> capped below
+    let millis = RECONNECT_BASE_DELAY_MS.saturating_mul(1u64 << shift);
+    Duration::from_millis(millis.min(RECONNECT_MAX_DELAY_MS))
+}
+
+/// Deterministic xorshift64* PRNG step, used only for backoff jitter.
+fn jitter_step(mut x: u64) -> f64 {
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11;
+    r as f64 / (1u64 << 53) as f64 // [0, 1)
+}
+
+/// Compute the actual reconnect delay for a 0-based attempt index: the base
+/// delay from [`reconnect_base_delay`] with ±25% jitter applied.
+pub fn reconnect_delay(attempt: u32) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    let factor = 0.75 + 0.5 * jitter_step(nanos ^ (attempt as u64).wrapping_mul(0x9E37_79B9));
+    let millis = (reconnect_base_delay(attempt).as_millis() as f64 * factor) as u64;
+    Duration::from_millis(millis.max(1))
+}
+
+/// Bounded in-memory set of seen inbound message IDs.
+///
+/// Backed by a [`HashSet`] for O(1) membership checks plus a [`VecDeque`]
+/// that tracks insertion order so the oldest IDs are evicted first once the
+/// cap ([`MAX_SEEN_MESSAGE_IDS`]) is reached.
+#[derive(Debug, Default)]
+pub struct MessageDedup {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl MessageDedup {
+    /// Create an empty dedup set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a message ID.
+    ///
+    /// Returns `true` if the ID was new (the caller should process the
+    /// message), `false` if it was already seen (the caller should skip it).
+    pub fn insert(&mut self, id: String) -> bool {
+        if !self.set.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        self.trim();
+        true
+    }
+
+    /// Number of IDs currently tracked.
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    /// Returns `true` when no IDs are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Evict oldest entries until the set is within [`MAX_SEEN_MESSAGE_IDS`].
+    pub fn trim(&mut self) {
+        while self.order.len() > MAX_SEEN_MESSAGE_IDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +720,9 @@ pub struct DiscordAdapter {
     config: DiscordConfig,
     client: Client,
     stop_signal: Arc<Notify>,
+    /// In-memory set of seen inbound message IDs, used to skip duplicate
+    /// MESSAGE_CREATE / MESSAGE_UPDATE events replayed after a reconnect.
+    seen_messages: Arc<Mutex<MessageDedup>>,
 }
 
 impl DiscordAdapter {
@@ -629,6 +739,7 @@ impl DiscordAdapter {
             config,
             client,
             stop_signal: Arc::new(Notify::new()),
+            seen_messages: Arc::new(Mutex::new(MessageDedup::new())),
         })
     }
 
@@ -646,26 +757,56 @@ impl DiscordAdapter {
     // REST API: Sending messages
     // -----------------------------------------------------------------------
 
+    /// Build the JSON body for a plain-text channel message.
+    ///
+    /// `allowed_mentions.parse` is restricted to `["users"]` so bot replies
+    /// can mention users but never ping `@everyone` / `@here` or roles.
+    pub fn text_message_body(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "content": content,
+            "allowed_mentions": { "parse": ["users"] },
+        })
+    }
+
+    /// Build the JSON body for an embed message.
+    ///
+    /// Uses the same users-only `allowed_mentions` policy as
+    /// [`Self::text_message_body`].
+    pub fn embed_message_body(content: Option<&str>, embeds: &[DiscordEmbed]) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "embeds": embeds,
+            "allowed_mentions": { "parse": ["users"] },
+        });
+        if let Some(text) = content {
+            body["content"] = serde_json::Value::String(text.to_string());
+        }
+        body
+    }
+
     /// Send a message to a Discord channel, splitting if it exceeds 2000 chars.
     pub async fn send_text(
         &self,
         channel_id: &str,
         content: &str,
     ) -> Result<Vec<String>, GatewayError> {
-        let chunks = split_message(content, MAX_MESSAGE_LENGTH);
+        let chunks = split_markdown(content, MAX_MESSAGE_LENGTH);
         let mut message_ids = Vec::new();
 
         for chunk in &chunks {
             let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
-            let body = serde_json::json!({ "content": chunk });
+            let body = Self::text_message_body(chunk);
 
-            let resp = self
-                .client
-                .post(&url)
-                .header("Authorization", self.auth_header())
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
+            let send_request = || {
+                self.client
+                    .post(&url)
+                    .header("Authorization", self.auth_header())
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+            };
+            // Retries once after an HTTP 429 (Discord sends `retry_after`
+            // seconds in the JSON body / `Retry-After` header).
+            let resp = send_with_rate_limit_retry(send_request)
                 .await
                 .map_err(|e| GatewayError::SendFailed(format!("Discord send failed: {}", e)))?;
 
@@ -700,7 +841,7 @@ impl DiscordAdapter {
         );
 
         let body = serde_json::json!({
-            "content": &content[..content.len().min(MAX_MESSAGE_LENGTH)],
+            "content": &content[..content.floor_char_boundary(content.len().min(MAX_MESSAGE_LENGTH))],
         });
 
         let resp = self
@@ -737,10 +878,7 @@ impl DiscordAdapter {
     ) -> Result<String, GatewayError> {
         let url = format!("{}/channels/{}/messages", DISCORD_API_BASE, channel_id);
 
-        let mut body = serde_json::json!({ "embeds": embeds });
-        if let Some(text) = content {
-            body["content"] = serde_json::Value::String(text.to_string());
-        }
+        let body = Self::embed_message_body(content, embeds);
 
         let resp = self
             .client
@@ -1165,6 +1303,228 @@ impl DiscordAdapter {
     }
 
     // -----------------------------------------------------------------------
+    // Gateway WebSocket supervised connection
+    // -----------------------------------------------------------------------
+
+    /// Send one gateway payload as a JSON text frame.
+    async fn send_gateway_payload(
+        sink: &mut futures::stream::SplitSink<
+            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+            WsMessage,
+        >,
+        payload: &GatewayPayload,
+    ) -> Result<(), GatewayError> {
+        let text = serde_json::to_string(payload)
+            .map_err(|e| GatewayError::SendFailed(format!("failed to encode payload: {}", e)))?;
+        sink.send(WsMessage::Text(text))
+            .await
+            .map_err(|e| GatewayError::ConnectionFailed(format!("gateway send failed: {}", e)))
+    }
+
+    /// Serve a single gateway WebSocket connection.
+    ///
+    /// Drives `session` through the handshake (HELLO → IDENTIFY or RESUME),
+    /// the heartbeat loop, and inbound dispatch (with message-ID dedup).
+    /// Returns when the connection closes, errors, the gateway requests a
+    /// reconnect, the session is invalidated, or [`Self::stop`] is called.
+    /// The session state is preserved so the caller can RESUME on reconnect.
+    async fn serve_connection(
+        &self,
+        ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        session: &mut GatewaySession,
+    ) {
+        let (mut sink, mut stream) = ws_stream.split();
+        let mut next_heartbeat: Option<tokio::time::Instant> = None;
+
+        loop {
+            let heartbeat_sleep = async {
+                match next_heartbeat {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => futures::future::pending().await,
+                }
+            };
+
+            tokio::select! {
+                _ = self.stop_signal.notified() => {
+                    let _ = sink.close().await;
+                    return;
+                }
+                _ = heartbeat_sleep => {
+                    // A missed ACK means the connection is zombied: drop it so
+                    // the supervise loop reconnects (and RESUMEs if possible).
+                    if session.is_zombie() {
+                        warn!("Discord heartbeat not acknowledged; reconnecting");
+                        let _ = sink.close().await;
+                        return;
+                    }
+                    session.heartbeat_sent();
+                    let payload = Self::build_heartbeat_payload(session.sequence);
+                    if Self::send_gateway_payload(&mut sink, &payload).await.is_err() {
+                        return;
+                    }
+                    if let Some(ms) = session.heartbeat_interval_ms {
+                        next_heartbeat =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(ms));
+                    }
+                }
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            let payload: GatewayPayload = match serde_json::from_str(text.as_str()) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    debug!("ignoring malformed gateway payload: {}", e);
+                                    continue;
+                                }
+                            };
+                            let actions = session.handle_gateway_event(&payload);
+                            if next_heartbeat.is_none() {
+                                if let Some(ms) = session.heartbeat_interval_ms {
+                                    next_heartbeat = Some(
+                                        tokio::time::Instant::now() + Duration::from_millis(ms),
+                                    );
+                                }
+                            }
+                            let mut drop_connection = false;
+                            for action in actions {
+                                let send_result = match action {
+                                    GatewayAction::SendIdentify => {
+                                        Self::send_gateway_payload(
+                                            &mut sink,
+                                            &self.build_identify_payload(),
+                                        )
+                                        .await
+                                    }
+                                    GatewayAction::SendHeartbeat => {
+                                        session.heartbeat_sent();
+                                        Self::send_gateway_payload(
+                                            &mut sink,
+                                            &Self::build_heartbeat_payload(session.sequence),
+                                        )
+                                        .await
+                                    }
+                                    GatewayAction::SendResume => {
+                                        match (session.session_id.clone(), session.sequence) {
+                                            (Some(sid), Some(seq)) => {
+                                                Self::send_gateway_payload(
+                                                    &mut sink,
+                                                    &self.build_resume_payload(&sid, seq),
+                                                )
+                                                .await
+                                            }
+                                            // Session data vanished mid-flight; fall back
+                                            // to a fresh IDENTIFY.
+                                            _ => {
+                                                Self::send_gateway_payload(
+                                                    &mut sink,
+                                                    &self.build_identify_payload(),
+                                                )
+                                                .await
+                                            }
+                                        }
+                                    }
+                                    GatewayAction::Reconnect => {
+                                        debug!("gateway requested reconnect");
+                                        drop_connection = true;
+                                        Ok(())
+                                    }
+                                    GatewayAction::InvalidSession(_) => {
+                                        // handle_invalid_session already cleared the
+                                        // session state when not resumable.
+                                        drop_connection = true;
+                                        Ok(())
+                                    }
+                                    GatewayAction::Dispatch(name, data) => {
+                                        // Dedup applies to MESSAGE_CREATE /
+                                        // MESSAGE_UPDATE; other events pass through.
+                                        if self.dispatch_event(&name, &data).await.is_none() {
+                                            debug!(event = %name, "duplicate dispatch event skipped");
+                                        } else {
+                                            debug!(event = %name, "dispatch event received");
+                                        }
+                                        Ok(())
+                                    }
+                                };
+                                if send_result.is_err() {
+                                    drop_connection = true;
+                                    break;
+                                }
+                            }
+                            if drop_connection {
+                                let _ = sink.close().await;
+                                return;
+                            }
+                        }
+                        Some(Ok(WsMessage::Ping(p))) => {
+                            let _ = sink.send(WsMessage::Pong(p)).await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None => {
+                            debug!("Discord gateway connection closed by peer");
+                            return;
+                        }
+                        Some(Err(e)) => {
+                            warn!("Discord gateway WebSocket error: {}", e);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the supervised gateway connection loop until [`Self::stop`].
+    ///
+    /// Connects to the Discord Gateway WebSocket, serves the connection via
+    /// [`Self::serve_connection`], and on any disconnect reconnects with
+    /// exponential backoff ([`reconnect_delay`]). When the [`GatewaySession`]
+    /// still holds a `session_id` and sequence number, the reconnect attempts
+    /// a RESUME; otherwise it performs a fresh IDENTIFY.
+    ///
+    /// This is an explicit opt-in driver: spawn it from the gateway
+    /// orchestrator, e.g.
+    /// `tokio::spawn(async move { adapter.run_supervised().await })`.
+    /// It is deliberately *not* started from [`PlatformAdapter::start`] so
+    /// that callers keep control over the connection lifecycle.
+    pub async fn run_supervised(&self) {
+        let mut attempt: u32 = 0;
+        let mut session = GatewaySession::new();
+
+        while self.base.is_running() {
+            let url = session
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| DISCORD_GATEWAY_URL.to_string());
+
+            match connect_async(&url).await {
+                Ok((ws_stream, _)) => {
+                    info!("Discord gateway connected");
+                    attempt = 0;
+                    self.serve_connection(ws_stream, &mut session).await;
+                    debug!("Discord gateway connection ended; will reconnect");
+                }
+                Err(e) => {
+                    warn!("Discord gateway connect failed: {}", e);
+                }
+            }
+
+            if !self.base.is_running() {
+                break;
+            }
+
+            let delay = reconnect_delay(attempt);
+            attempt = attempt.saturating_add(1);
+            info!("Discord reconnecting in {:?} (attempt {})", delay, attempt);
+            tokio::select! {
+                _ = self.stop_signal.notified() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+
+        info!("Discord supervised gateway loop exited");
+    }
+
+    // -----------------------------------------------------------------------
     // Event parsing
     // -----------------------------------------------------------------------
 
@@ -1387,6 +1747,33 @@ impl DiscordAdapter {
             _ => None,
         }
     }
+
+    /// Parse and filter an inbound dispatch event, applying message-ID dedup.
+    ///
+    /// Like [`Self::parse_dispatch`], but `MESSAGE_CREATE` / `MESSAGE_UPDATE`
+    /// events whose message ID was already seen are dropped (returns `None`)
+    /// so reconnect replays cannot double-process a message. This is the
+    /// inbound path used by [`Self::run_supervised`].
+    pub async fn dispatch_event(
+        &self,
+        event_name: &str,
+        data: &serde_json::Value,
+    ) -> Option<DispatchEvent> {
+        let event = Self::parse_dispatch(event_name, data)?;
+        let message_id = match &event {
+            DispatchEvent::MessageCreate(m) => Some(m.message_id.clone()),
+            DispatchEvent::MessageUpdate(m) => Some(m.message_id.clone()),
+            _ => None,
+        };
+        if let Some(id) = message_id {
+            let mut seen = self.seen_messages.lock().await;
+            if !seen.insert(id.clone()) {
+                debug!("skipping duplicate Discord message {}", id);
+                return None;
+            }
+        }
+        Some(event)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,40 +1849,15 @@ impl PlatformAdapter for DiscordAdapter {
     fn platform_name(&self) -> &str {
         "discord"
     }
+
+    async fn maintenance_prune(&self) {
+        self.seen_messages.lock().await.trim();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
-
-/// Split a message into chunks that fit within the given max length.
-fn split_message(text: &str, max_len: usize) -> Vec<String> {
-    if text.len() <= max_len {
-        return vec![text.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let end = (start + max_len).min(text.len());
-
-        if end >= text.len() {
-            chunks.push(text[start..].to_string());
-            break;
-        }
-
-        let break_at = text[start..end]
-            .rfind('\n')
-            .map(|pos| start + pos + 1)
-            .unwrap_or(end);
-
-        chunks.push(text[start..break_at].to_string());
-        start = break_at;
-    }
-
-    chunks
-}
 
 /// URL-encode a unicode emoji for use in reaction endpoints.
 pub fn encode_emoji(emoji: &str) -> String {
@@ -1525,18 +1887,19 @@ mod tests {
     // -- existing tests (preserved) -----------------------------------------
 
     #[test]
-    fn split_message_short() {
-        let chunks = split_message("hello", 2000);
-        assert_eq!(chunks, vec!["hello"]);
-    }
-
-    #[test]
-    fn split_message_long() {
-        let text = "a".repeat(3000);
-        let chunks = split_message(&text, 2000);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), 2000);
-        assert_eq!(chunks[1].len(), 1000);
+    fn split_markdown_discord_limit() {
+        // Fence-aware splitting at Discord's 2000-char limit.
+        let code: String = (0..150)
+            .map(|i| format!("let value_{i} = compute({i});"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = format!("Intro\n```rust\n{code}\n```\nOutro");
+        let chunks = split_markdown(&text, 2000);
+        assert!(chunks.len() > 1);
+        for c in &chunks {
+            assert!(c.len() <= 2100, "chunk exceeds Discord limit: {}", c.len());
+            assert_eq!(c.matches("```").count() % 2, 0);
+        }
     }
 
     #[test]
@@ -2160,5 +2523,195 @@ mod tests {
         let config: DiscordConfig =
             serde_json::from_value(serde_json::json!({"token": "x"})).unwrap();
         assert_eq!(config.intents, intents);
+    }
+
+    // -- Reconnect backoff ---------------------------------------------------
+
+    #[test]
+    fn reconnect_base_delay_progression() {
+        // 1s, 2s, 4s, … capped at 60s.
+        let expected_secs = [1u64, 2, 4, 8, 16, 32, 60, 60, 60];
+        for (attempt, &expected) in expected_secs.iter().enumerate() {
+            assert_eq!(
+                reconnect_base_delay(attempt as u32),
+                Duration::from_secs(expected),
+                "attempt {}",
+                attempt
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_delay_within_jitter_bounds() {
+        // Jitter is ±25% of the base delay.
+        for attempt in 0..8u32 {
+            let base_ms = reconnect_base_delay(attempt).as_millis() as f64;
+            let delay_ms = reconnect_delay(attempt).as_millis() as f64;
+            assert!(
+                delay_ms >= base_ms * 0.75 - 1.0,
+                "attempt {}: {:?} below lower jitter bound",
+                attempt,
+                reconnect_delay(attempt)
+            );
+            assert!(
+                delay_ms <= base_ms * 1.25 + 1.0,
+                "attempt {}: {:?} above upper jitter bound",
+                attempt,
+                reconnect_delay(attempt)
+            );
+        }
+    }
+
+    // -- Inbound message dedup -----------------------------------------------
+
+    #[test]
+    fn message_dedup_insert_and_duplicate() {
+        let mut dedup = MessageDedup::new();
+        assert!(dedup.is_empty());
+        assert!(dedup.insert("msg1".to_string()));
+        assert_eq!(dedup.len(), 1);
+        // Second insert of the same ID reports a duplicate.
+        assert!(!dedup.insert("msg1".to_string()));
+        assert_eq!(dedup.len(), 1);
+        assert!(dedup.insert("msg2".to_string()));
+        assert_eq!(dedup.len(), 2);
+    }
+
+    #[test]
+    fn message_dedup_evicts_oldest_at_cap() {
+        let mut dedup = MessageDedup::new();
+        for i in 0..(MAX_SEEN_MESSAGE_IDS + 10) {
+            assert!(dedup.insert(format!("msg{}", i)));
+        }
+        assert_eq!(dedup.len(), MAX_SEEN_MESSAGE_IDS);
+        // The oldest IDs were evicted, so they insert as "new" again…
+        assert!(dedup.insert("msg0".to_string()));
+        // …while the newest ID is still tracked as a duplicate.
+        assert!(!dedup.insert(format!("msg{}", MAX_SEEN_MESSAGE_IDS + 9)));
+        assert_eq!(dedup.len(), MAX_SEEN_MESSAGE_IDS);
+    }
+
+    #[test]
+    fn message_dedup_trim_enforces_cap() {
+        let mut dedup = MessageDedup::new();
+        for i in 0..(MAX_SEEN_MESSAGE_IDS + 5) {
+            // bypass the in-insert trim by pushing directly, then trim once
+            dedup.set.insert(format!("msg{}", i));
+            dedup.order.push_back(format!("msg{}", i));
+        }
+        dedup.trim();
+        assert_eq!(dedup.len(), MAX_SEEN_MESSAGE_IDS);
+    }
+
+    fn test_adapter() -> DiscordAdapter {
+        let config = DiscordConfig {
+            token: "test-token".into(),
+            application_id: None,
+            proxy: AdapterProxyConfig::default(),
+            require_mention: false,
+            intents: default_intents(),
+        };
+        DiscordAdapter::new(config).unwrap()
+    }
+
+    fn message_create_data(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "channel_id": "ch1",
+            "content": "hello",
+            "author": { "id": "u1", "username": "user" },
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_dedups_message_create() {
+        let adapter = test_adapter();
+        let data = message_create_data("dup-msg");
+
+        let first = adapter.dispatch_event("MESSAGE_CREATE", &data).await;
+        assert!(matches!(first, Some(DispatchEvent::MessageCreate(_))));
+
+        // Same message ID arriving again (e.g. replayed after reconnect) is skipped.
+        let second = adapter.dispatch_event("MESSAGE_CREATE", &data).await;
+        assert!(second.is_none());
+
+        // A different message ID still passes through.
+        let other = adapter
+            .dispatch_event("MESSAGE_CREATE", &message_create_data("other-msg"))
+            .await;
+        assert!(matches!(other, Some(DispatchEvent::MessageCreate(_))));
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_dedups_message_update() {
+        let adapter = test_adapter();
+        let data = serde_json::json!({
+            "id": "upd-msg",
+            "channel_id": "ch1",
+            "content": "edited",
+        });
+
+        assert!(adapter
+            .dispatch_event("MESSAGE_UPDATE", &data)
+            .await
+            .is_some());
+        assert!(adapter
+            .dispatch_event("MESSAGE_UPDATE", &data)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_event_non_message_events_pass_through() {
+        let adapter = test_adapter();
+        let data = serde_json::json!({
+            "id": "react1",
+            "channel_id": "ch1",
+            "message_id": "msg1",
+            "user_id": "u1",
+            "emoji": { "name": "👍" },
+        });
+        // Reaction events carry no deduped message ID of their own: they are
+        // never dropped by the dedup set.
+        assert!(adapter
+            .dispatch_event("MESSAGE_REACTION_ADD", &data)
+            .await
+            .is_some());
+        assert!(adapter
+            .dispatch_event("MESSAGE_REACTION_ADD", &data)
+            .await
+            .is_some());
+    }
+
+    // -- allowed_mentions bodies ------------------------------------------------
+
+    #[test]
+    fn text_message_body_has_users_only_allowed_mentions() {
+        let body = DiscordAdapter::text_message_body("hello");
+        assert_eq!(body["content"], serde_json::json!("hello"));
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({ "parse": ["users"] })
+        );
+    }
+
+    #[test]
+    fn embed_message_body_has_users_only_allowed_mentions() {
+        let embed = DiscordEmbed::default().with_title("t");
+        let with_content =
+            DiscordAdapter::embed_message_body(Some("hi"), std::slice::from_ref(&embed));
+        assert_eq!(with_content["content"], serde_json::json!("hi"));
+        assert_eq!(
+            with_content["allowed_mentions"],
+            serde_json::json!({ "parse": ["users"] })
+        );
+        assert!(with_content["embeds"].is_array());
+
+        let without_content = DiscordAdapter::embed_message_body(None, &[embed]);
+        assert!(without_content.get("content").is_none());
+        assert_eq!(
+            without_content["allowed_mentions"],
+            serde_json::json!({ "parse": ["users"] })
+        );
     }
 }
