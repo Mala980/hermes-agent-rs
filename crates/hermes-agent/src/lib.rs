@@ -32,6 +32,7 @@ pub mod fallback;
 pub mod honcho_provider;
 pub mod interrupt;
 pub mod local_agent_service;
+pub mod memory_budget;
 pub mod memory_manager;
 pub mod memory_plugins;
 pub mod oauth;
@@ -58,8 +59,14 @@ pub use agent_loop::{
 // Re-export context management
 pub use compression::summarize_messages_with_llm;
 pub use context::{
-    load_context_files, load_soul_md, load_soul_md_from, switch_personality, ContextManager,
-    SystemPromptBuilder,
+    load_builtin_memory_snapshot, load_builtin_memory_snapshot_with_budget, load_context_files,
+    load_soul_md, load_soul_md_from, switch_personality, ContextManager, SystemPromptBuilder,
+};
+
+// Re-export memory injection budgets
+pub use memory_budget::{
+    apply_memory_char_budget, truncated_dropped_note, MemoryBudget, MemoryBudgetReport,
+    TRUNCATED_MARKER,
 };
 
 // Re-export budget enforcement

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use hermes_core::{BudgetConfig, Message, MessageRole};
 
+use crate::memory_budget::{apply_memory_char_budget, truncated_dropped_note, MemoryBudget};
+
 /// Number of recent messages to preserve during compression.
 const DEFAULT_RECENT_MESSAGES: usize = 4;
 const MEMORY_ENTRY_DELIMITER: &str = "\n§\n";
@@ -486,7 +488,9 @@ fn dedup_entries(entries: Vec<String>) -> Vec<String> {
     out
 }
 
-fn render_memory_block(target: &str, entries: &[String]) -> Option<String> {
+fn render_memory_block(target: &str, entries: &[String], budget: &MemoryBudget) -> Option<String> {
+    let report = apply_memory_char_budget(entries, budget);
+    let entries = &report.entries;
     if entries.is_empty() {
         return None;
     }
@@ -502,17 +506,33 @@ fn render_memory_block(target: &str, entries: &[String]) -> Option<String> {
         .and_then(|v| v.checked_div(limit))
         .unwrap_or(0)
         .min(100);
-    Some(format!(
-        "{label} [{pct}% - {current}/{limit} chars]\n{content}"
-    ))
+    let mut block = format!("{label} [{pct}% - {current}/{limit} chars]\n{content}");
+    if report.dropped_entries > 0 {
+        block.push('\n');
+        block.push_str(&truncated_dropped_note(
+            report.dropped_entries,
+            budget.max_total_chars,
+        ));
+    }
+    Some(block)
 }
 
 /// Load the built-in memory snapshot used in the system prompt.
 ///
 /// This mirrors Python's MemoryStore snapshot semantics at session start:
 /// the returned blocks are read once and treated as a frozen prompt view.
+/// Uses the default [`MemoryBudget`] for prompt injection.
 pub fn load_builtin_memory_snapshot(
     hermes_home_override: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    load_builtin_memory_snapshot_with_budget(hermes_home_override, &MemoryBudget::default())
+}
+
+/// Same as [`load_builtin_memory_snapshot`] with an explicit injection
+/// budget (per-entry truncation + oldest-first drop with a note).
+pub fn load_builtin_memory_snapshot_with_budget(
+    hermes_home_override: Option<&str>,
+    budget: &MemoryBudget,
 ) -> (Option<String>, Option<String>) {
     let base = hermes_home_override
         .map(PathBuf::from)
@@ -533,8 +553,8 @@ pub fn load_builtin_memory_snapshot(
         .unwrap_or_default();
 
     (
-        render_memory_block("memory", &memory_entries),
-        render_memory_block("user", &user_entries),
+        render_memory_block("memory", &memory_entries, budget),
+        render_memory_block("user", &user_entries, budget),
     )
 }
 
