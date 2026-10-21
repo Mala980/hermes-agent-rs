@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
-use crate::tools::session_search::SessionSearchBackend;
+use crate::tools::session_search::{SessionMessage, SessionSearchBackend};
 use hermes_core::ToolError;
 
 const MAX_SESSION_CHARS: usize = 100_000;
@@ -354,6 +354,10 @@ impl SqliteSessionSearchBackend {
     }
 
     /// Index a message into the FTS5 table.
+    ///
+    /// Ensures a stub row in `sessions` first: a message may be indexed
+    /// before its session row exists (or after it was pruned), and the
+    /// `messages.session_id` foreign key would otherwise reject the insert.
     pub fn index_message(
         &self,
         session_id: &str,
@@ -366,6 +370,11 @@ impl SqliteSessionSearchBackend {
             .lock()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
         conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+            rusqlite::params![session_id, timestamp],
+        )
+        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to ensure session row: {}", e)))?;
+        conn.execute(
             "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![session_id, role, content, timestamp],
         )
@@ -376,6 +385,51 @@ impl SqliteSessionSearchBackend {
 
 #[async_trait]
 impl SessionSearchBackend for SqliteSessionSearchBackend {
+    /// Read/scroll shape: load one session's messages in archive order.
+    ///
+    /// Returns `Ok(None)` when the session id is unknown (no row in
+    /// `sessions` and no indexed messages).
+    async fn session_messages(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Vec<SessionMessage>>, ToolError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let session_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                rusqlite::params![session_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, COALESCE(content, '') FROM messages \
+                 WHERE session_id = ?1 ORDER BY id ASC",
+            )
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to prepare messages query: {}", e))
+            })?;
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |r| {
+                Ok(SessionMessage {
+                    role: r.get::<_, String>(0)?,
+                    content: r.get::<_, String>(1)?,
+                })
+            })
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to load session messages: {}", e))
+            })?;
+        let messages: Vec<SessionMessage> = rows.flatten().collect();
+        if messages.is_empty() && !session_exists {
+            Ok(None)
+        } else {
+            Ok(Some(messages))
+        }
+    }
+
     async fn search(
         &self,
         query: Option<&str>,
@@ -692,5 +746,44 @@ impl SessionSearchBackend for SqliteSessionSearchBackend {
             "sessions_searched": sessions_searched,
         })
         .to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_messages_returns_archived_messages_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend =
+            SqliteSessionSearchBackend::new(dir.path().join("sessions.db").to_str().unwrap())
+                .unwrap();
+        backend
+            .index_message("s1", "user", "hello", "2026-10-22T00:00:00Z")
+            .unwrap();
+        backend
+            .index_message("s1", "assistant", "hi there", "2026-10-22T00:00:01Z")
+            .unwrap();
+
+        let msgs = backend
+            .session_messages("s1")
+            .await
+            .unwrap()
+            .expect("session must be found");
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content, "hello");
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content, "hi there");
+    }
+
+    #[tokio::test]
+    async fn session_messages_unknown_session_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend =
+            SqliteSessionSearchBackend::new(dir.path().join("sessions.db").to_str().unwrap())
+                .unwrap();
+        assert!(backend.session_messages("missing").await.unwrap().is_none());
     }
 }

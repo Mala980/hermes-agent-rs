@@ -592,10 +592,13 @@ pub fn register_builtin_tools_with_approval_mode(
     );
 
     // -- Process registry ----------------------------------------------------
+    // NOTE (Wave 6 / TUI): `shared()` binds the tool to the process-wide
+    // ProcessManager so the TUI F4 panel lists the same background processes
+    // the agent spawns. `default()` keeps a private manager (used in tests).
     reg(
         registry,
         "terminal",
-        Arc::new(crate::tools::process_registry::ProcessRegistryHandler::default()),
+        Arc::new(crate::tools::process_registry::ProcessRegistryHandler::shared()),
         "📊",
         vec![],
     );
