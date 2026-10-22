@@ -831,7 +831,6 @@ mod tests {
     #[test]
     fn telegram_menu_commands_is_dynamic_and_sanitized() {
         let menu = telegram_menu_commands();
-        // Should include all builtins (no leading slash, no aliases as separate entries).
         assert!(
             menu.len() >= 20,
             "expected 20+ commands, got {}",
@@ -840,14 +839,11 @@ mod tests {
         assert!(menu.iter().any(|(n, _)| n == "status"));
         assert!(menu.iter().any(|(n, _)| n == "new"));
         assert!(menu.iter().any(|(n, _)| n == "help"));
-        // No leading slashes.
         assert!(menu.iter().all(|(n, _)| !n.starts_with('/')));
-        // No duplicates.
         let mut names: Vec<&str> = menu.iter().map(|(n, _)| n.as_str()).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), menu.len(), "duplicate command names in menu");
-        // Within Telegram limits.
         assert!(menu.len() <= 100);
         assert!(menu.iter().all(|(n, d)| n.len() <= 32 && !d.is_empty()));
     }
