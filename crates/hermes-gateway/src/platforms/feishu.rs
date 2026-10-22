@@ -15,7 +15,7 @@ use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
@@ -40,6 +40,15 @@ pub struct FeishuConfig {
     pub verification_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypt_key: Option<String>,
+    /// Bind host for the inbound event webhook server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_host: Option<String>,
+    /// Port for the inbound event webhook server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_port: Option<u16>,
+    /// Path for the inbound event webhook server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_path: Option<String>,
     #[serde(default)]
     pub proxy: AdapterProxyConfig,
 }
@@ -225,7 +234,24 @@ pub struct FeishuAdapter {
     client: Client,
     tenant_token: RwLock<Option<CachedToken>>,
     stop_signal: Arc<Notify>,
+    /// Inbound channel to the gateway, set by the registry via
+    /// [`FeishuAdapter::set_inbound_sender`].
+    inbound_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<crate::gateway::IncomingMessage>>>>,
+    /// Shutdown signal for the webhook server task spawned by `start()`.
+    shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
 }
+
+/// Default bind host for the inbound event webhook server.
+const DEFAULT_WEBHOOK_HOST: &str = "0.0.0.0";
+
+/// Default port for the inbound event webhook server (mirrors the original).
+const DEFAULT_WEBHOOK_PORT: u16 = 8090;
+
+/// Default path for the inbound event webhook server (mirrors the original).
+const DEFAULT_WEBHOOK_PATH: &str = "/feishu/webhook";
+
+/// Maximum webhook POST body accepted.
+const WEBHOOK_MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 impl FeishuAdapter {
     pub fn new(config: FeishuConfig) -> Result<Self, GatewayError> {
@@ -238,11 +264,35 @@ impl FeishuAdapter {
             client,
             tenant_token: RwLock::new(None),
             stop_signal: Arc::new(Notify::new()),
+            inbound_tx: Arc::new(RwLock::new(None)),
+            shutdown_tx: RwLock::new(None),
         })
     }
 
     pub fn config(&self) -> &FeishuConfig {
         &self.config
+    }
+
+    /// Attach the gateway's inbound channel. Parsed message events are
+    /// forwarded on it by the webhook server spawned in [`Self::start`].
+    pub async fn set_inbound_sender(
+        &self,
+        tx: tokio::sync::mpsc::Sender<crate::gateway::IncomingMessage>,
+    ) {
+        *self.inbound_tx.write().await = Some(tx);
+    }
+
+    /// Convert a parsed [`IncomingFeishuMessage`] into a gateway-level
+    /// [`crate::gateway::IncomingMessage`]. `p2p` chats are DMs.
+    pub fn to_incoming(msg: &IncomingFeishuMessage) -> crate::gateway::IncomingMessage {
+        crate::gateway::IncomingMessage {
+            platform: "feishu".into(),
+            chat_id: msg.chat_id.clone(),
+            user_id: msg.sender_id.clone().unwrap_or_default(),
+            text: msg.text.clone(),
+            message_id: Some(msg.message_id.clone()),
+            is_dm: msg.chat_type == "p2p",
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1202,6 +1252,108 @@ impl PostElement {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound event webhook server
+// ---------------------------------------------------------------------------
+
+/// Handle one inbound Feishu event-webhook connection.
+///
+/// - `POST <path>` with `{"type": "url_verification", "challenge": ...}`:
+///   URL ownership handshake; echoes the challenge (token still checked,
+///   fail-closed).
+/// - `POST <path>` with a v2 event: the `header.token` (or top-level
+///   `token`) must match the configured `verification_token` (fail-closed
+///   503/403); `im.message.receive_v1` events are parsed via
+///   [`FeishuAdapter::parse_message_event`] and forwarded to the gateway
+///   inbound channel. Always 200 once verified.
+async fn handle_feishu_webhook_request(
+    mut stream: tokio::net::TcpStream,
+    expected_path: &str,
+    verification_token: Option<&str>,
+    inbound_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<crate::gateway::IncomingMessage>>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::platforms::helpers::{read_http_request, write_http_response};
+
+    let (request_line, _headers, body) =
+        read_http_request(&mut stream, WEBHOOK_MAX_BODY_BYTES).await?;
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let method = parts.first().copied().unwrap_or("GET");
+    let target = parts.get(1).copied().unwrap_or("/");
+    let path = target.split('?').next().unwrap_or("/");
+    if method != "POST" || path != expected_path {
+        write_http_response(&mut stream, 404, "text/plain", "not found").await?;
+        return Ok(());
+    }
+
+    let event: FeishuEvent = match serde_json::from_slice(&body) {
+        Ok(e) => e,
+        Err(_) => {
+            write_http_response(&mut stream, 400, "text/plain", "invalid JSON").await?;
+            return Ok(());
+        }
+    };
+
+    // URL verification handshake: still check the token, fail-closed.
+    if event.event_type.as_deref() == Some("url_verification") {
+        let Some(token) = verification_token.filter(|t| !t.is_empty()) else {
+            write_http_response(
+                &mut stream,
+                503,
+                "text/plain",
+                "verification_token not configured",
+            )
+            .await?;
+            return Ok(());
+        };
+        if !FeishuAdapter::verify_event(&event, token) {
+            warn!("Feishu webhook: url_verification token mismatch");
+            write_http_response(&mut stream, 403, "text/plain", "token mismatch").await?;
+            return Ok(());
+        }
+        let Some(challenge) = event.challenge.as_deref() else {
+            write_http_response(&mut stream, 400, "text/plain", "missing challenge").await?;
+            return Ok(());
+        };
+        let body = serde_json::json!({ "challenge": challenge }).to_string();
+        write_http_response(&mut stream, 200, "application/json", &body).await?;
+        return Ok(());
+    }
+
+    // Event callbacks: fail-closed token check.
+    let Some(token) = verification_token.filter(|t| !t.is_empty()) else {
+        warn!("Feishu webhook event refused: verification_token unset");
+        write_http_response(
+            &mut stream,
+            503,
+            "text/plain",
+            "verification_token not configured",
+        )
+        .await?;
+        return Ok(());
+    };
+    if !FeishuAdapter::verify_event(&event, token) {
+        warn!("Feishu webhook: event token mismatch");
+        write_http_response(&mut stream, 403, "text/plain", "token mismatch").await?;
+        return Ok(());
+    }
+
+    if event.header.as_ref().map(|h| h.event_type.as_str()) == Some("im.message.receive_v1") {
+        if let Some(payload) = event.event.as_ref() {
+            if let Some(msg) = FeishuAdapter::parse_message_event(payload) {
+                let tx = inbound_tx.read().await.clone();
+                if let Some(tx) = tx {
+                    let incoming = FeishuAdapter::to_incoming(&msg);
+                    if tx.send(incoming).await.is_err() {
+                        debug!("Feishu inbound receiver dropped");
+                    }
+                }
+            }
+        }
+    }
+    write_http_response(&mut stream, 200, "text/plain", "ok").await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // PlatformAdapter trait implementation
 // ---------------------------------------------------------------------------
 
@@ -1210,12 +1362,87 @@ impl PlatformAdapter for FeishuAdapter {
     async fn start(&self) -> Result<(), GatewayError> {
         info!("Feishu adapter starting (app_id: {})", self.config.app_id);
         self.get_tenant_token().await?;
+
+        let host = self
+            .config
+            .webhook_host
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_HOST.to_string());
+        let port = self.config.webhook_port.unwrap_or(DEFAULT_WEBHOOK_PORT);
+        let path = self
+            .config
+            .webhook_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_PATH.to_string());
+        let verification_token = self.config.verification_token.clone();
+        if verification_token
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+        {
+            warn!(
+                "Feishu verification_token is not set — inbound webhook events will be refused with 503. \
+                 Set it to enable inbound message delivery."
+            );
+        }
+        let addr: std::net::SocketAddr = format!("{host}:{port}").parse().map_err(|e| {
+            GatewayError::ConnectionFailed(format!("Feishu webhook invalid address: {e}"))
+        })?;
+        let inbound_tx = self.inbound_tx.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        *self.shutdown_tx.write().await = Some(shutdown_tx);
+
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Feishu webhook server failed to bind {addr}: {e}");
+                    return;
+                }
+            };
+            info!("Feishu webhook listening on {addr}{path}");
+            let mut shutdown_rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        match accept {
+                            Ok((stream, peer)) => {
+                                let verification_token = verification_token.clone();
+                                let path = path.clone();
+                                let inbound_tx = inbound_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_feishu_webhook_request(
+                                        stream,
+                                        &path,
+                                        verification_token.as_deref(),
+                                        inbound_tx,
+                                    )
+                                    .await
+                                    {
+                                        debug!("Feishu webhook request error from {peer}: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => warn!("Feishu webhook accept error: {e}"),
+                        }
+                    }
+                    _ = &mut shutdown_rx => {
+                        info!("Feishu webhook server shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
         self.base.mark_running();
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), GatewayError> {
         info!("Feishu adapter stopping");
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
         self.base.mark_stopped();
         self.stop_signal.notify_one();
         Ok(())
@@ -1548,5 +1775,78 @@ mod tests {
         assert!(result.contains("My Title"));
         assert!(result.contains("Hello link"));
         assert!(result.contains("Second line"));
+    }
+
+    #[test]
+    fn to_incoming_p2p_is_dm() {
+        let msg = IncomingFeishuMessage {
+            message_id: "om_1".to_string(),
+            chat_id: "oc_1".to_string(),
+            chat_type: "p2p".to_string(),
+            sender_id: Some("ou_1".to_string()),
+            text: "hi feishu".to_string(),
+            message_type: "text".to_string(),
+            is_mention: false,
+        };
+        let incoming = FeishuAdapter::to_incoming(&msg);
+        assert_eq!(incoming.platform, "feishu");
+        assert_eq!(incoming.chat_id, "oc_1");
+        assert_eq!(incoming.user_id, "ou_1");
+        assert!(incoming.is_dm);
+
+        let group = IncomingFeishuMessage {
+            chat_type: "group".to_string(),
+            ..msg
+        };
+        assert!(!FeishuAdapter::to_incoming(&group).is_dm);
+    }
+
+    #[test]
+    fn webhook_url_verification_event_shape() {
+        // The handler deserializes the raw body into FeishuEvent; the
+        // url_verification shape must survive without a header.
+        let body = serde_json::json!({
+            "challenge": "abc123",
+            "token": "tok",
+            "type": "url_verification"
+        });
+        let event: FeishuEvent = serde_json::from_value(body).unwrap();
+        assert_eq!(event.event_type.as_deref(), Some("url_verification"));
+        assert_eq!(event.challenge.as_deref(), Some("abc123"));
+        assert!(FeishuAdapter::verify_event(&event, "tok"));
+        assert!(!FeishuAdapter::verify_event(&event, "wrong"));
+    }
+
+    #[test]
+    fn webhook_message_event_parses() {
+        let body = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "e1",
+                "event_type": "im.message.receive_v1",
+                "token": "tok"
+            },
+            "event": {
+                "message": {
+                    "message_id": "om_2",
+                    "chat_id": "oc_2",
+                    "chat_type": "group",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}"
+                },
+                "sender": { "sender_id": { "open_id": "ou_2" } }
+            }
+        });
+        let event: FeishuEvent = serde_json::from_value(body).unwrap();
+        assert!(FeishuAdapter::verify_event(&event, "tok"));
+        assert_eq!(
+            event.header.as_ref().unwrap().event_type,
+            "im.message.receive_v1"
+        );
+        let msg = FeishuAdapter::parse_message_event(event.event.as_ref().unwrap()).unwrap();
+        assert_eq!(msg.text, "hello");
+        assert_eq!(msg.chat_id, "oc_2");
+        let incoming = FeishuAdapter::to_incoming(&msg);
+        assert!(!incoming.is_dm);
     }
 }
