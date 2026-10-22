@@ -387,23 +387,38 @@ impl TelegramAdapter {
     pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
         // Keep in sync with `crate::commands::dispatch_builtin_command`.
         // (command, description) pairs shown in Telegram's / menu.
+        // Canonical names only (no aliases like /bg, /cancel, /clear).
         const COMMANDS: &[(&str, &str)] = &[
+            ("help", "Show available commands"),
             ("new", "Start a new conversation"),
             ("reset", "Reset the current session"),
             ("retry", "Retry the last message"),
-            ("model", "Show or switch model"),
-            ("personality", "Show or switch personality"),
-            ("approve", "Approve a user (admin)"),
-            ("deny", "Deny a user (admin)"),
-            ("compress", "Compress context"),
-            ("usage", "Show token usage"),
+            ("undo", "Undo the last turn"),
             ("stop", "Stop the agent"),
             ("status", "Show session status"),
+            ("model", "Show or switch model"),
             ("provider", "Show or switch provider"),
+            ("personality", "Show or switch personality"),
             ("profile", "Show or switch profile"),
+            ("sessions", "List sessions"),
+            ("branch", "Branch the conversation"),
+            ("rollback", "Rollback to a checkpoint"),
+            ("compress", "Compress context"),
+            ("reasoning", "Toggle reasoning display"),
             ("verbose", "Toggle verbose mode"),
+            ("usage", "Show token usage"),
+            ("budget", "Show budget status"),
+            ("tools", "List available tools"),
+            ("commands", "List slash commands"),
+            ("background", "Run in background"),
+            ("btw", "Side message to agent"),
+            ("fast", "Switch to fast model"),
             ("yolo", "Toggle auto-approve mode"),
-            ("help", "Show available commands"),
+            ("approve", "Approve a user (admin)"),
+            ("deny", "Deny a user (admin)"),
+            ("sethome", "Set home directory"),
+            ("insights", "Show session insights"),
+            ("update", "Check for updates"),
         ];
 
         let commands: Vec<serde_json::Value> = COMMANDS
