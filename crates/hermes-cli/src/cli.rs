@@ -428,6 +428,97 @@ pub enum CliCommand {
         #[arg(long)]
         yes: bool,
     },
+
+    // ── Ported from hermes-rs ───────────────────────────────────────
+    /// Text-to-speech and speech-to-text utilities.
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
+    },
+
+    /// Run prompts from a JSONL file non-interactively.
+    ///
+    /// Each input line: {"prompt": "...", "session": "optional-id"}.
+    /// Output: JSONL records with response/usage/duration.
+    Batch {
+        /// Input JSONL file path.
+        input: String,
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+
+    /// Run evaluation suites.
+    Eval {
+        #[command(subcommand)]
+        cmd: EvalCmd,
+    },
+
+    /// Standalone incoming webhook server (POST /hook → agent → JSON).
+    Webhook {
+        /// Port to listen on.
+        #[arg(long, default_value = "8080")]
+        port: u16,
+    },
+
+    /// One-shot non-interactive run (like `chat --query`).
+    Run {
+        /// The prompt to run.
+        prompt: String,
+    },
+
+    /// Launch the TUI directly.
+    Tui,
+}
+
+// ---------------------------------------------------------------------------
+// Voice subcommands (ported from hermes-rs)
+// ---------------------------------------------------------------------------
+
+/// Voice utilities: text-to-speech and speech-to-text.
+#[derive(Debug, Clone, Subcommand)]
+pub enum VoiceCmd {
+    /// Synthesize speech from text (writes an audio file).
+    Say {
+        /// Text to synthesize.
+        text: String,
+        /// Output path (default: speech-<unix_ts>.mp3).
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Voice name (provider-specific).
+        #[arg(long)]
+        voice: Option<String>,
+    },
+    /// Transcribe an audio file to text.
+    Listen {
+        /// Audio file path.
+        file: String,
+        /// Language hint (e.g. "en", "id").
+        #[arg(short, long)]
+        language: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Eval subcommands (ported from hermes-rs)
+// ---------------------------------------------------------------------------
+
+/// Evaluation suites.
+#[derive(Debug, Clone, Subcommand)]
+pub enum EvalCmd {
+    /// List available suites without running them.
+    List,
+    /// Run a suite (path to JSONL file or `builtin:tools`).
+    Run {
+        /// Suite: JSONL file path or `builtin:tools`.
+        suite: String,
+        /// Write JSON report to this path.
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Pass threshold percent 0–100 (overrides config).
+        #[arg(long)]
+        threshold: Option<f64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +956,20 @@ mod tests {
         assert!(Cli::try_parse_from(vec!["hermes", "runtime-provider"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "memory-setup"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "pairing"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "webhook"]).is_err());
+    }
+
+    #[test]
+    fn ported_commands_parse() {
+        // Commands ported from hermes-rs must parse.
+        assert!(Cli::try_parse_from(vec!["hermes", "voice", "say", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "voice", "listen", "a.mp3"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "batch", "in.jsonl"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "eval", "list"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "eval", "run", "builtin:tools"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "webhook"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "webhook", "--port", "9000"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "run", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "tui"]).is_ok());
     }
 
     #[test]

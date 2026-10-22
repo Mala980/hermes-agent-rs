@@ -233,6 +233,15 @@ async fn main() {
         }
         CliCommand::Completion { shell } => run_completion(shell),
         CliCommand::Uninstall { yes } => run_uninstall(yes).await,
+        // ── Ported from hermes-rs ───────────────────────────────────
+        CliCommand::Voice { cmd } => cmd::voice::cmd_voice(&cli, &cmd).await,
+        CliCommand::Batch { input, out } => {
+            cmd::batch::cmd_batch(&cli, &input, out.as_deref()).await
+        }
+        CliCommand::Eval { cmd } => cmd::eval::cmd_eval(&cli, &cmd).await,
+        CliCommand::Webhook { port } => cmd::webhook::cmd_webhook(&cli, port).await,
+        CliCommand::Run { prompt } => cmd::run::cmd_run(cli, &prompt).await,
+        CliCommand::Tui => cmd::tui_cmd::cmd_tui(cli).await,
     };
 
     if let Err(e) = result {
