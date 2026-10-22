@@ -120,6 +120,29 @@ impl PlatformConfig {
             }
         }
     }
+
+    /// Union of the first-class `allowed_users` field and `extra["allowed_users"]`
+    /// (JSON array of strings or comma-separated string), trimmed, non-empty,
+    /// and deduplicated.
+    ///
+    /// The field is the canonical place (what the `gateway setup` wizard
+    /// writes); the `extra` fallback covers hand-written configs that nested
+    /// the list under `extra`.
+    pub fn allowed_users_union(&self) -> Vec<String> {
+        let mut users: Vec<String> = self
+            .allowed_users
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        if let Some(extra) = extra_string_list(self, "allowed_users") {
+            users.extend(extra);
+        }
+        users.sort();
+        users.dedup();
+        users
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +157,38 @@ pub fn extra_string(cfg: &PlatformConfig, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// `extra[key]` as a list of trimmed, non-empty strings.
+///
+/// Accepts either a JSON array of strings (e.g. `["123", "456"]`) or a
+/// single comma-separated string (hand-written configs, e.g. `"123, 456"`).
+/// Array items and CSV segments are trimmed and empties are dropped.
+/// Returns `None` when the key is absent, the value is of another JSON
+/// type, or no entries survive trimming.
+pub fn extra_string_list(cfg: &PlatformConfig, key: &str) -> Option<Vec<String>> {
+    let value = cfg.extra.get(key)?;
+    let entries: Vec<String> = match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        serde_json::Value::String(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => return None,
+    };
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
 }
 
 /// Bot token from [`PlatformConfig::token`] or `extra["token"]`, trimmed.
@@ -170,6 +225,58 @@ mod tests {
         pc.token = Some("  top  ".to_string());
         pc.extra.insert("token".to_string(), json!("extra"));
         assert_eq!(platform_token_or_extra(&pc).as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn extra_string_list_reads_json_array() {
+        let mut pc = PlatformConfig::default();
+        pc.extra
+            .insert("k".to_string(), json!([" 123 ", "", "456", 7]));
+        assert_eq!(
+            extra_string_list(&pc, "k"),
+            Some(vec!["123".to_string(), "456".to_string()])
+        );
+    }
+
+    #[test]
+    fn extra_string_list_accepts_comma_separated_string() {
+        let mut pc = PlatformConfig::default();
+        pc.extra.insert("k".to_string(), json!(" 123 , , 456 "));
+        assert_eq!(
+            extra_string_list(&pc, "k"),
+            Some(vec!["123".to_string(), "456".to_string()])
+        );
+    }
+
+    #[test]
+    fn extra_string_list_empty_inputs_are_none() {
+        let mut pc = PlatformConfig::default();
+        assert!(extra_string_list(&pc, "missing").is_none());
+        pc.extra.insert("empty_arr".to_string(), json!([]));
+        assert!(extra_string_list(&pc, "empty_arr").is_none());
+        pc.extra.insert("empty_csv".to_string(), json!(" , "));
+        assert!(extra_string_list(&pc, "empty_csv").is_none());
+        pc.extra.insert("wrong_type".to_string(), json!(42));
+        assert!(extra_string_list(&pc, "wrong_type").is_none());
+    }
+
+    #[test]
+    fn allowed_users_union_merges_field_and_extra() {
+        let mut pc = PlatformConfig::default();
+        pc.allowed_users = vec![" 123 ".to_string(), String::new(), "123".to_string()];
+        pc.extra
+            .insert("allowed_users".to_string(), json!(["456", " 789 "]));
+        // Field is trimmed, empties dropped, both sources merged, deduped.
+        assert_eq!(
+            pc.allowed_users_union(),
+            vec!["123".to_string(), "456".to_string(), "789".to_string()]
+        );
+    }
+
+    #[test]
+    fn allowed_users_union_empty_when_nothing_set() {
+        let pc = PlatformConfig::default();
+        assert!(pc.allowed_users_union().is_empty());
     }
 
     #[test]

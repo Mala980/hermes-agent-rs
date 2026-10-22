@@ -43,6 +43,9 @@ pub use paths::{
     cli_config_path, config_path, cron_dir, env_path, gateway_json_path, gateway_pid_path,
     gateway_pid_path_in, hermes_home, memory_path, sessions_dir, skills_dir, state_dir, user_path,
 };
-pub use platform::{extra_string, platform_token_or_extra, PlatformConfig, UnauthorizedDmBehavior};
+pub use platform::{
+    extra_string, extra_string_list, platform_token_or_extra, PlatformConfig,
+    UnauthorizedDmBehavior,
+};
 pub use session::{DailyReset, IdleReset, SessionConfig, SessionResetPolicy, SessionType};
 pub use streaming::StreamingConfig;

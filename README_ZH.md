@@ -6,14 +6,18 @@
 
 [Nous Research](https://nousresearch.com) 出品的 [Hermes Agent](https://github.com/NousResearch/hermes-agent) Rust 重写版。
 
-`110,000+ 行 Rust 代码` · `1,428 个测试` · `17 个 crate` · `~16MB 二进制`
+`110,000+ 行 Rust 代码` · `2,150+ 个测试` · `18 个 crate` · `~16MB 二进制`
 
 **[English](./README.md)** · **[中文](./README_ZH.md)** · **[日本語](./README_JA.md)** · **[한국어](./README_KO.md)**
 
 </div>
 
 > **v0.2：** 新增原生 Gemini（`GEMINI_API_KEY`）、Azure OpenAI（`AZURE_OPENAI_API_KEY`）与 AWS Bedrock（Converse + SigV4）提供商——文档中记录的 C1 Bedrock 兼容性缺口现已补齐，共 13 个提供商。
-> **v0.2（工具）：** 从最新上游移植 21 个工具——`x_search`、`feishu_doc_read`、`setup_beat`、`browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`、`computer_use`、`close_terminal`/`read_terminal`、`drive_preview`、`desktop_project`、`manage_connections`/`manage_catalog`，以及 7 个桌面 UI 桥接工具。审批引擎已加固（载荷提取、包装器解包、拒绝关机命令）。
+> **v0.2（批次 1–6，2026 年 10 月已移植）：**（1）安全加固——执行密钥黑名单、输出脱敏、WhatsApp/webhook HMAC-SHA256 默认关闭式验证、SSRF 防护、各平台白名单、`--readonly`/`--yes`；（2）网关可靠性——Discord 重连/去重、Matrix since-token 持久化、Signal 群组门控、WhatsApp 去重、429/`retry_after` 处理、围栏感知消息切分、Telegram 真实轮询循环；（3）Agent 主循环——工具调用屏障、先持久化再执行、严格校验、压缩接线、预算宽限、不可信数据分隔符；（4）提供商——请求形态、Gemini 多轮对话、Bedrock 真实流式 + IAM 凭证链、Anthropic OAuth/bearer + 用量统计、Azure Foundry、SSE 加固；（5）工具——18 工具看板家族、加密 `browser_vault`（HMAC-SHA256-CTR）、exec/edit/read/write 语义、`x_search` 切换至 xAI API；（6）CLI/ACP/TUI/cron——CLI 分级命令、12 个真实 ACP 方法、TUI 会话切换器（F3）/智能体面板（F4）/目标栏、统一 cron（多格式、时区、重试阶梯、tick 锁）。
+>
+> **配置：** YAML 键为 `llm_providers`（如 `llm_providers.openai.api_key`），环境变量包括 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`HERMES_LLM_API_KEY`、`<PROVIDER>_BASE_URL`、`HERMES_MODEL`。
+>
+> **Telegram 白名单（默认关闭，fail-closed）：** `TELEGRAM_ALLOWED_USERS`（逗号分隔 ID，`*`=所有人，未设置=全部拒绝）∪ 配置文件 telegram 平台的 `allowed_users`；`GATEWAY_ALLOWED_USERS` 为跨平台兜底。
 
 ---
 
@@ -23,7 +27,7 @@
 
 🧠 **自进化引擎** — 多臂老虎机模型选择、长任务规划、Prompt 与记忆自动塑形。用得越多，Agent 越聪明。
 
-🔌 **17 个平台 · 70+ 工具 · 8 个记忆后端** — Telegram、Discord、Slack、微信、钉钉、飞书、企业微信等 17 个平台。文件操作、浏览器、代码执行、视觉、语音、网页搜索、Home Assistant 等 70+ 工具。
+🔌 **17 个平台 · 90+ 工具 · 8 个记忆后端** — Telegram、Discord、Slack、微信、钉钉、飞书、企业微信等 17 个平台。文件操作、浏览器、代码执行、视觉、语音、网页搜索、Home Assistant、看板任务等 90+ 工具。
 
 ⚡ **真并发** — Rust tokio 运行时将工具调用分发到 OS 线程。30 秒的浏览器抓取不会阻塞 50ms 的文件读取。没有 GIL。
 
@@ -41,6 +45,8 @@ hermes
 ```
 
 就这样。你已经进入了一个带工具、记忆和流式输出的交互式会话。
+
+📖 完整配置指南：[docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ## 能做什么？
 
@@ -87,7 +93,7 @@ hermes-cli                    # 二进制入口、TUI、斜杠命令
 │   ├── hermes-core           # 共享类型、trait、错误层级
 │   ├── hermes-intelligence   # 模型路由、Prompt 构建、自进化
 │   └── hermes-config         # 配置加载、YAML/环境变量合并
-├── hermes-tools              # 70+ 工具后端、审批引擎
+├── hermes-tools              # 90+ 工具后端、审批引擎
 ├── hermes-gateway            # 17 个平台适配器、会话管理
 ├── hermes-environments       # 终端：Local/Docker/SSH/Daytona/Modal/Singularity
 ├── hermes-mcp                # Model Context Protocol 客户端/服务端
@@ -99,7 +105,7 @@ hermes-cli                    # 二进制入口、TUI、斜杠命令
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**核心 trait：** `LlmProvider`（13 个提供商）· `ToolHandler`（70+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
+**核心 trait：** `LlmProvider`（13 个提供商）· `ToolHandler`（90+ 后端）· `PlatformAdapter`（17 个平台）· `TerminalBackend`（6 个后端）· `MemoryProvider`（8 个插件）
 
 **工具调用解析器：** Hermes、Anthropic、OpenAI、Qwen、Llama、DeepSeek、Auto
 
@@ -127,7 +133,7 @@ docker run --rm -it -v ~/.hermes:/root/.hermes ghcr.io/lumio-research/hermes-age
 欢迎贡献。提交前请运行测试：
 
 ```bash
-cargo test --workspace        # 1,428 个测试
+cargo test --workspace        # 2,150+ 个测试
 cargo clippy --workspace      # 代码检查
 cargo fmt --all --check       # 格式检查
 ```

@@ -1,12 +1,12 @@
 
 
-# ⚡ Hermes Agent `v0.1`
+# ⚡ Hermes Agent `v0.2`
 
 **The self-evolving AI agent. One binary. Every platform.**
 
 Rust rewrite of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by [Nous Research](https://nousresearch.com).
 
-`110,000+ lines of Rust` · `1,428 tests` · `17 crates` · `~16MB binary`
+`110,000+ lines of Rust` · `2,150+ tests` · `18 crates` · `~16MB binary`
 
 **[English](./README.md)** · **[中文](./README_ZH.md)** · **[日本語](./README_JA.md)** · **[한국어](./README_KO.md)**
 
@@ -14,10 +14,13 @@ Rust rewrite of [Hermes Agent](https://github.com/NousResearch/hermes-agent) by 
 
 ---
 
-> **v0.1 Status:** Core agent loop, 10 LLM providers, 30 tool backends, 17 platform adapters, memory system, and CLI/TUI are production-ready.
+> **v0.2 Status:** Core agent loop, 13 LLM providers (3 native + 10 OpenAI-compatible), 90+ tool backends, 17 platform adapters, memory system, and CLI/TUI are production-ready.
 >
-> **v0.2:** Native Gemini (`GEMINI_API_KEY`), Azure OpenAI (`AZURE_OPENAI_API_KEY`), and AWS Bedrock (Converse + SigV4) providers added — closing the documented C1 Bedrock parity gap. 13 providers total.
-> **v0.2 (tools):** 21 tools ported from the latest upstream — `x_search`, `feishu_doc_read`, `setup_beat`, `browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`, `computer_use`, `close_terminal`/`read_terminal`, `drive_preview`, `desktop_project`, `manage_connections`/`manage_catalog`, plus 7 desktop-UI bridge tools. Approval engine hardened (payload extraction, wrapper unwrapping, shutdown denied).
+> **Waves 1–6 ported (Oct 2026):** (1) security hardening — exec secret blocklist, output redaction, WhatsApp/webhook HMAC-SHA256 fail-closed verification, SSRF guard, per-platform allowlists, `--readonly`/`--yes`; (2) gateway reliability — Discord reconnect/dedup, Matrix since-token persistence, Signal group gating, WhatsApp dedup, 429/`retry_after` handling, fence-aware message splitting, real Telegram poll loop; (3) agent loop — tool-call barriers, persist-before-execute, strict validation, compaction wiring, budget grace, untrusted-data delimiters; (4) providers — request shapes, Gemini multi-turn, Bedrock real streaming + IAM chain, Anthropic OAuth/bearer + usage accounting, Azure Foundry, SSE hardening; (5) tools — 18-tool kanban family, encrypted `browser_vault` (HMAC-SHA256-CTR), exec/edit/read/write semantics, `x_search` on the xAI API; (6) CLI/ACP/TUI/cron — CLI tiers, 12 real ACP methods, TUI session switcher (F3) / agents panel (F4) / goal bar, unified cron (formats, timezones, retry ladder, tick lock).
+>
+> **Providers:** native Gemini (`GEMINI_API_KEY`), Azure OpenAI (`AZURE_OPENAI_API_KEY`), and AWS Bedrock (Converse + SigV4) — the documented C1 Bedrock parity gap is closed. The config key is `llm_providers` (e.g. `llm_providers.openai.api_key`), with env vars such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HERMES_LLM_API_KEY`, `<PROVIDER>_BASE_URL`, and `HERMES_MODEL`.
+>
+> **Telegram allowlist (fail-closed):** `TELEGRAM_ALLOWED_USERS` (comma-separated IDs, `*` = everyone, unset = deny all) ∪ config-file `allowed_users` on the telegram platform; `GATEWAY_ALLOWED_USERS` is the cross-platform fallback.
 
 ## Project Status
 
@@ -37,7 +40,7 @@ from `main` or use a release newer than `v0.1.1` for that fix.
 
 🧠 **Self-evolution engine** — Multi-armed bandit model selection, long-task planning, and prompt/memory shaping. The agent gets better the more you use it.
 
-🔌 **17 platforms, 70+ tools, 8 memory backends** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, and 11 more. File ops, browser, code execution, vision, voice, web search, Home Assistant, and beyond.
+🔌 **17 platforms, 90+ tools, 8 memory backends** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix, and 11 more. File ops, browser, code execution, vision, voice, web search, Home Assistant, kanban task boards, and beyond.
 
 ⚡ **True concurrency** — Rust's tokio runtime dispatches tool calls across OS threads. A 30-second browser scrape doesn't block a 50ms file read. No GIL.
 
@@ -55,6 +58,8 @@ hermes
 ```
 
 That's it. You're in an interactive session with tool access, memory, and streaming.
+
+📖 Full configuration guide: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ## What Can It Do?
 
@@ -86,10 +91,22 @@ hermes serve --no-gateway --no-cron   # API only (minimal)
 hermes gateway start
 ```
 
+```bash
+# Telegram allowlist (fail-closed: unset = deny all)
+export TELEGRAM_ALLOWED_USERS="123456789,987654321"  # "*" = everyone
+# …or per-platform in ~/.hermes/config.yaml:
+# platforms.telegram.allowed_users: ["123456789"]   # unions with the env var
+```
+
 **Run anywhere** — Docker, SSH, or remote sandboxes:
 
 ```yaml
 # ~/.hermes/config.yaml
+llm_providers:
+  openai:
+    api_key: sk-...             # or OPENAI_API_KEY / HERMES_LLM_API_KEY
+    base_url: https://proxy.example.com/v1   # or OPENAI_BASE_URL
+
 terminal:
   backend: docker
   image: ubuntu:24.04
@@ -126,6 +143,7 @@ hermes-agent-rs/
 │   ├── hermes-skills           # Skill management and hub
 │   ├── hermes-cron             # Cron scheduling
 │   ├── hermes-bus              # In-process message bus (agent service abstraction)
+│   ├── hermes-transport        # Wire-level transport types + JSON schemas (server/cloud/SDKs)
 │   ├── hermes-eval             # SWE-bench, Terminal-Bench, YC Bench
 │   └── hermes-telemetry        # OpenTelemetry + Prometheus
 ├── apps/
@@ -135,7 +153,7 @@ hermes-agent-rs/
 └── scripts/                    # Install, CI, and convenience scripts
 ```
 
-**Key traits:** `LlmProvider` (13 providers) · `ToolHandler` (70+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
+**Key traits:** `LlmProvider` (13 providers) · `ToolHandler` (90+ backends) · `PlatformAdapter` (17 platforms) · `TerminalBackend` (6 backends) · `MemoryProvider` (8 plugins) · `AgentService` (local/remote transparent)
 
 **Tool call parsers:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 
@@ -148,17 +166,24 @@ hermes serve              # Start API server + gateway + cron
 hermes gateway            # Platform gateway only (no API)
 hermes config             # Configuration management
 hermes model              # Model / provider management
+hermes providers          # Provider management (keys, base URLs)
 hermes auth               # Authentication (login/logout/status)
 hermes tools              # Tool management
 hermes mcp                # MCP server management
+hermes acp                # Agent Communication Protocol server
 hermes skills             # Skill management
 hermes plugins            # Plugin management
 hermes sessions           # Session management
 hermes memory             # Memory provider management
 hermes cron               # Cron job management
+hermes logs               # Log management (--list/--name)
+hermes profile            # Profile management
+hermes backup             # Backup management
+hermes import             # Import from other tools
 hermes setup              # Interactive setup wizard
 hermes doctor             # Health check
 hermes status             # Running status
+hermes update             # Self-update
 hermes version            # Version info
 ```
 
@@ -274,7 +299,7 @@ Contributions welcome. Before submitting a PR:
 
 1. Run the full test suite:
    ```bash
-   cargo test --workspace                                    # 1,428 tests
+   cargo test --workspace                                    # 2,150+ tests
    cargo clippy --workspace --all-targets -- -D warnings     # Lint (warnings fail CI)
    cargo fmt --all --check                                   # Format
    ```

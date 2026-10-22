@@ -6,14 +6,18 @@
 
 [Nous Research](https://nousresearch.com) の [Hermes Agent](https://github.com/NousResearch/hermes-agent) を Rust で書き直したプロダクション版。
 
-`110,000行超の Rust` · `1,428 テスト` · `17 クレート` · `~16MB バイナリ`
+`110,000行超の Rust` · `2,150 超のテスト` · `18 クレート` · `~16MB バイナリ`
 
 **[English](./README.md)** · **[中文](./README_ZH.md)** · **[日本語](./README_JA.md)** · **[한국어](./README_KO.md)**
 
 </div>
 
 > **v0.2:** ネイティブ Gemini（`GEMINI_API_KEY`）、Azure OpenAI（`AZURE_OPENAI_API_KEY`）、AWS Bedrock（Converse + SigV4）プロバイダを追加——ドキュメントに記載の C1 Bedrock パリティギャップを解消しました。合計 13 プロバイダ。
-> **v0.2（ツール）:** 最新アップストリームから 21 ツールを移植 — `x_search`、`feishu_doc_read`、`setup_beat`、`browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`、`computer_use`、`close_terminal`/`read_terminal`、`drive_preview`、`desktop_project`、`manage_connections`/`manage_catalog`、および 7 つのデスクトップ UI ブリッジツール。承認エンジンを強化（ペイロード抽出、ラッパー展開、シャットダウン拒否）。
+> **v0.2（ウェーブ 1–6、2026年10月移植）：**（1）セキュリティ強化 — exec シークレットブロックリスト、出力リダクション、WhatsApp/webhook の HMAC-SHA256 fail-closed 検証、SSRF ガード、プラットフォーム別 allowlist、`--readonly`/`--yes`；（2）ゲートウェイ信頼性 — Discord 再接続/重複排除、Matrix since-token 永続化、Signal グループゲート、WhatsApp 重複排除、429/`retry_after` 処理、フェンス対応メッセージ分割、実際の Telegram ポーリングループ；（3）エージェントループ — ツール呼び出しバリア、persist-before-execute、厳格バリデーション、compaction 結線、バジェットグレース、非信頼データ区切り；（4）プロバイダ — リクエスト整形、Gemini マルチターン、Bedrock リアルストリーミング + IAM チェーン、Anthropic OAuth/bearer + 使用量集計、Azure Foundry、SSE 強化；（5）ツール — 18 ツールの kanban ファミリー、暗号化 `browser_vault`（HMAC-SHA256-CTR）、exec/edit/read/write セマンティクス、`x_search` の xAI API 移行；（6）CLI/ACP/TUI/cron — CLI ティア、12 個の実 ACP メソッド、TUI セッションスイッチャー（F3）/エージェントパネル（F4）/ゴールバー、統合 cron（フォーマット、タイムゾーン、リトライラダー、tick ロック）。
+>
+> **設定：** YAML キーは `llm_providers`（例：`llm_providers.openai.api_key`）、環境変数は `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`HERMES_LLM_API_KEY`、`<PROVIDER>_BASE_URL`、`HERMES_MODEL`。
+>
+> **Telegram allowlist（fail-closed）：** `TELEGRAM_ALLOWED_USERS`（カンマ区切り ID、`*=全員`、未設定=全拒否）∪ 設定ファイル telegram プラットフォームの `allowed_users`；`GATEWAY_ALLOWED_USERS` はクロスプラットフォームのフォールバック。
 
 ---
 
@@ -23,7 +27,7 @@
 
 🧠 **自己進化エンジン** — マルチアームドバンディットによるモデル選択、長期タスク計画、プロンプトとメモリの自動最適化。使うほどエージェントが賢くなる。
 
-🔌 **17 プラットフォーム · 30 以上のツール · 8 つのメモリバックエンド** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix ほか 11 プラットフォーム。ファイル操作、ブラウザ、コード実行、画像認識、音声、Web 検索、Home Assistant など。
+🔌 **17 プラットフォーム · 90 以上のツール · 8 つのメモリバックエンド** — Telegram、Discord、Slack、WhatsApp、Signal、Matrix ほか 11 プラットフォーム。ファイル操作、ブラウザ、コード実行、画像認識、音声、Web 検索、Home Assistant、kanban タスクボードなど。
 
 ⚡ **真の並行処理** — Rust の tokio ランタイムがツール呼び出しを OS スレッドに分散。30 秒のブラウザスクレイプが 50ms のファイル読み取りをブロックしない。GIL なし。
 
@@ -41,6 +45,8 @@ hermes
 ```
 
 これだけ。ツール、メモリ、ストリーミング出力が使えるインタラクティブセッションが始まる。
+
+📖 完全な構成ガイド: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ## 何ができる？
 
@@ -87,7 +93,7 @@ hermes-cli                    # バイナリエントリポイント、TUI、ス
 │   ├── hermes-core           # 共有型、trait、エラー階層
 │   ├── hermes-intelligence   # モデルルーティング、プロンプト構築、自己進化
 │   └── hermes-config         # 設定読み込み、YAML/環境変数マージ
-├── hermes-tools              # 70 以上のツールバックエンド、承認エンジン
+├── hermes-tools              # 90 以上のツールバックエンド、承認エンジン
 ├── hermes-gateway            # 17 プラットフォームアダプタ、セッション管理
 ├── hermes-environments       # ターミナル: Local/Docker/SSH/Daytona/Modal/Singularity
 ├── hermes-mcp                # Model Context Protocol クライアント/サーバー
@@ -99,7 +105,7 @@ hermes-cli                    # バイナリエントリポイント、TUI、ス
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**主要 trait：** `LlmProvider`（13 プロバイダ）· `ToolHandler`（70 以上のバックエンド）· `PlatformAdapter`（17 プラットフォーム）· `TerminalBackend`（6 バックエンド）· `MemoryProvider`（8 プラグイン）
+**主要 trait：** `LlmProvider`（13 プロバイダ）· `ToolHandler`（90 以上のバックエンド）· `PlatformAdapter`（17 プラットフォーム）· `TerminalBackend`（6 バックエンド）· `MemoryProvider`（8 プラグイン）
 
 **ツールコールパーサー：** Hermes、Anthropic、OpenAI、Qwen、Llama、DeepSeek、Auto
 
@@ -127,7 +133,7 @@ docker run --rm -it -v ~/.hermes:/root/.hermes ghcr.io/lumio-research/hermes-age
 コントリビュート歓迎。提出前にテストを実行してください：
 
 ```bash
-cargo test --workspace        # 1,428 テスト
+cargo test --workspace        # 2,150 超のテスト
 cargo clippy --workspace      # リント
 cargo fmt --all --check       # フォーマット
 ```

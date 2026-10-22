@@ -6,14 +6,18 @@
 
 [Nous Research](https://nousresearch.com)의 [Hermes Agent](https://github.com/NousResearch/hermes-agent)를 Rust로 재작성한 프로덕션 버전.
 
-`110,000줄 이상의 Rust` · `1,428개 테스트` · `17개 크레이트` · `~16MB 바이너리`
+`110,000줄 이상의 Rust` · `2,150개 이상의 테스트` · `18개 크레이트` · `~16MB 바이너리`
 
 **[English](./README.md)** · **[中文](./README_ZH.md)** · **[日本語](./README_JA.md)** · **[한국어](./README_KO.md)**
 
 </div>
 
 > **v0.2:** 네이티브 Gemini(`GEMINI_API_KEY`), Azure OpenAI(`AZURE_OPENAI_API_KEY`), AWS Bedrock(Converse + SigV4) 프로바이더 추가 — 문서에 기록된 C1 Bedrock 패리티 갭이 해소되었습니다. 총 13개 프로바이더.
-> **v0.2(도구):** 최신 업스트림에서 21개 도구 포팅 — `x_search`, `feishu_doc_read`, `setup_beat`, `browser_cdp`/`browser_dialog`/`browser_exec`/`browser_vault`, `computer_use`, `close_terminal`/`read_terminal`, `drive_preview`, `desktop_project`, `manage_connections`/`manage_catalog`, 7개 데스크톱 UI 브리지 도구 포함. 승인 엔진 강화(페이로드 추출, 래퍼 해제, 종료 명령 거부).
+> **v0.2(웨이브 1–6, 2026년 10월 포팅):** (1) 보안 강화 — exec 시크릿 블록리스트, 출력 리댁션, WhatsApp/webhook HMAC-SHA256 fail-closed 검증, SSRF 가드, 플랫폼별 allowlist, `--readonly`/`--yes`; (2) 게이트웨이 신뢰성 — Discord 재연결/중복 제거, Matrix since-token 영속화, Signal 그룹 게이팅, WhatsApp 중복 제거, 429/`retry_after` 처리, fence-aware 메시지 분할, 실제 Telegram 폴링 루프; (3) 에이전트 루프 — tool-call barrier, persist-before-execute, 엄격한 검증, compaction 배선, budget grace, untrusted-data 구분자; (4) 프로바이더 — 요청 형태, Gemini 멀티턴, Bedrock 실제 스트리밍 + IAM 체인, Anthropic OAuth/bearer + 사용량 집계, Azure Foundry, SSE 강화; (5) 도구 — 18개 kanban 패밀리, 암호화된 `browser_vault`(HMAC-SHA256-CTR), exec/edit/read/write 시맨틱, `x_search`의 xAI API 전환; (6) CLI/ACP/TUI/cron — CLI 티어, 12개 실제 ACP 메서드, TUI 세션 스위처(F3)/에이전트 패널(F4)/골 바, 통합 cron(포맷, 타임존, 재시도 래더, tick lock).
+>
+> **설정:** YAML 키는 `llm_providers`(예: `llm_providers.openai.api_key`), 환경변수는 `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `HERMES_LLM_API_KEY`, `<PROVIDER>_BASE_URL`, `HERMES_MODEL`.
+>
+> **Telegram allowlist(fail-closed):** `TELEGRAM_ALLOWED_USERS`(쉼표 구분 ID, `*`=전체, 미설정=전체 거부) ∪ 설정 파일 telegram 플랫폼의 `allowed_users`; `GATEWAY_ALLOWED_USERS`는 크로스 플랫폼 폴백.
 
 ---
 
@@ -23,7 +27,7 @@
 
 🧠 **자기 진화 엔진** — 멀티 암드 밴딧 모델 선택, 장기 태스크 계획, 프롬프트·메모리 자동 최적화. 쓸수록 에이전트가 똑똑해진다.
 
-🔌 **17개 플랫폼 · 30개 이상의 도구 · 8개 메모리 백엔드** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix 외 11개 플랫폼. 파일 작업, 브라우저, 코드 실행, 비전, 음성, 웹 검색, Home Assistant 등.
+🔌 **17개 플랫폼 · 90개 이상의 도구 · 8개 메모리 백엔드** — Telegram, Discord, Slack, WhatsApp, Signal, Matrix 외 11개 플랫폼. 파일 작업, 브라우저, 코드 실행, 비전, 음성, 웹 검색, Home Assistant, kanban 작업 보드 등.
 
 ⚡ **진정한 동시성** — Rust의 tokio 런타임이 도구 호출을 OS 스레드에 분산. 30초짜리 브라우저 스크래핑이 50ms 파일 읽기를 차단하지 않음. GIL 없음.
 
@@ -41,6 +45,8 @@ hermes
 ```
 
 끝. 도구, 메모리, 스트리밍 출력이 갖춰진 대화형 세션이 시작된다.
+
+📖 전체 구성 가이드: [docs/CONFIGURATION.md](docs/CONFIGURATION.md)
 
 ## 무엇을 할 수 있나?
 
@@ -87,7 +93,7 @@ hermes-cli                    # 바이너리 진입점, TUI, 슬래시 명령
 │   ├── hermes-core           # 공유 타입, trait, 에러 계층
 │   ├── hermes-intelligence   # 모델 라우팅, 프롬프트 구축, 자기 진화
 │   └── hermes-config         # 설정 로딩, YAML/환경변수 병합
-├── hermes-tools              # 70개 이상의 도구 백엔드, 승인 엔진
+├── hermes-tools              # 90개 이상의 도구 백엔드, 승인 엔진
 ├── hermes-gateway            # 17개 플랫폼 어댑터, 세션 관리
 ├── hermes-environments       # 터미널: Local/Docker/SSH/Daytona/Modal/Singularity
 ├── hermes-mcp                # Model Context Protocol 클라이언트/서버
@@ -99,7 +105,7 @@ hermes-cli                    # 바이너리 진입점, TUI, 슬래시 명령
 └── hermes-telemetry          # OpenTelemetry + Prometheus
 ```
 
-**핵심 trait:** `LlmProvider` (13개 프로바이더) · `ToolHandler` (70개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
+**핵심 trait:** `LlmProvider` (13개 프로바이더) · `ToolHandler` (90개 이상 백엔드) · `PlatformAdapter` (17개 플랫폼) · `TerminalBackend` (6개 백엔드) · `MemoryProvider` (8개 플러그인)
 
 **도구 호출 파서:** Hermes, Anthropic, OpenAI, Qwen, Llama, DeepSeek, Auto
 
@@ -127,7 +133,7 @@ docker run --rm -it -v ~/.hermes:/root/.hermes ghcr.io/lumio-research/hermes-age
 기여를 환영합니다. 제출 전에 테스트를 실행해 주세요:
 
 ```bash
-cargo test --workspace        # 1,428개 테스트
+cargo test --workspace        # 2,150개 이상의 테스트
 cargo clippy --workspace      # 린트
 cargo fmt --all --check       # 포맷
 ```
