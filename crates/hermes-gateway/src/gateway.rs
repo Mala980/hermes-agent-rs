@@ -1865,6 +1865,7 @@ mod tests {
     use crate::hook_payloads;
     use crate::hooks::{HookEvent, HookHandler, HookRegistry};
     use crate::session::SessionManager;
+    use crate::streaming::is_not_modified_error;
     use async_trait::async_trait;
     use hermes_config::session::SessionConfig;
     use std::sync::Mutex;
