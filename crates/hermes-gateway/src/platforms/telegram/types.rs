@@ -72,6 +72,14 @@ pub struct TelegramConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_menu_max: Option<usize>,
 
+    /// Include available skills in Telegram's `setMyCommands` menu (M-C2).
+    /// When true, skill names (builtin skills merged with `SKILL.md` files
+    /// discovered in the skills directory) are appended after the extension
+    /// commands, in the non-priority alphabetical bucket; names colliding
+    /// with builtin/extension commands are skipped. Defaults to true.
+    #[serde(default = "default_true")]
+    pub command_menu_skills: bool,
+
     /// Opt-in message reactions (M-T4): when true, the adapter sets a 👀
     /// reaction on an inbound message when processing starts, replacing it
     /// with 👍 once the agent's reply is delivered, or 👎 when processing

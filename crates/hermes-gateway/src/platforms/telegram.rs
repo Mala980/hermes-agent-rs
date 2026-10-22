@@ -1,5 +1,6 @@
 //! Telegram Bot API adapter.
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 
@@ -47,6 +48,11 @@ pub struct TelegramAdapter {
     /// The bot's own Telegram user ID, resolved via `getMe` in `start()`.
     /// `0` means unknown — the own-message filter is fail-open until then.
     bot_id: AtomicI64,
+    /// Chat IDs known to be forum supergroups with topics (M-G5). Learned
+    /// from inbound `message_thread_id`s and from threaded outbound sends.
+    /// Used to (a) target the typing bubble at the right topic and (b) avoid
+    /// sending `message_thread_id` to chats that have no topics.
+    forum_chats: std::sync::Mutex<HashSet<i64>>,
 }
 
 impl TelegramAdapter {
@@ -76,6 +82,7 @@ impl TelegramAdapter {
             consecutive_errors: AtomicU64::new(0),
             typing_cooldown_until: std::sync::Mutex::new(HashMap::new()),
             bot_id: AtomicI64::new(0),
+            forum_chats: std::sync::Mutex::new(HashSet::new()),
         })
     }
     /// Get a reference to the configuration.
@@ -93,6 +100,70 @@ impl TelegramAdapter {
     pub(crate) fn notify_message_sent(&self, chat_id: &str) {
         if let Ok(mut cooldowns) = self.typing_cooldown_until.lock() {
             cooldowns.remove(chat_id);
+        }
+    }
+
+    /// Record a chat as a forum supergroup with topics (M-G5).
+    ///
+    /// Returns `true` the first time a given chat is seen with topics, so
+    /// callers can run once-per-chat setup (e.g. the scoped command menu).
+    pub(crate) fn note_forum_chat(&self, chat_id: i64) -> bool {
+        self.forum_chats
+            .lock()
+            .map(|mut chats| chats.insert(chat_id))
+            .unwrap_or(false)
+    }
+
+    /// Normalize a forum thread id for `sendMessage` (M-G5).
+    ///
+    /// The Bot API rejects `message_thread_id: 1` (the forum's General
+    /// topic, which is the default target anyway), and only ids > 1 are real
+    /// topics — so thread 1 and unparseable values map to `None`, meaning the
+    /// field is omitted from the request body.
+    fn normalize_send_thread(thread_id: Option<&str>) -> Option<i64> {
+        thread_id
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|&t| t > 1)
+    }
+
+    /// Resolve the thread to send a message into, recording the chat as a
+    /// forum chat when a real topic id is given.
+    fn resolve_send_thread(&self, chat_id: &str, thread_id: Option<&str>) -> Option<i64> {
+        let thread = Self::normalize_send_thread(thread_id);
+        if let (Some(_), Ok(cid)) = (thread, chat_id.parse::<i64>()) {
+            self.note_forum_chat(cid);
+        }
+        thread
+    }
+
+    /// Resolve the `message_thread_id` for `sendChatAction` (M-G5).
+    ///
+    /// Unlike `sendMessage`, `sendChatAction` *needs* the thread id: without
+    /// it the typing bubble lands in the forum's General topic. Thread 1 is
+    /// accepted here (it targets General explicitly). When no thread was
+    /// given but the chat is a known forum chat, fall back to General (1);
+    /// plain chats and DMs get no `message_thread_id` at all.
+    fn resolve_typing_thread(&self, chat_id: &str, thread_id: Option<&str>) -> Option<i64> {
+        match thread_id
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|&t| t >= 1)
+        {
+            Some(t) => {
+                if let Ok(cid) = chat_id.parse::<i64>() {
+                    self.note_forum_chat(cid);
+                }
+                Some(t)
+            }
+            None => chat_id
+                .parse::<i64>()
+                .ok()
+                .filter(|cid| {
+                    self.forum_chats
+                        .lock()
+                        .map(|chats| chats.contains(cid))
+                        .unwrap_or(false)
+                })
+                .map(|_| 1),
         }
     }
 }
@@ -157,6 +228,40 @@ impl PlatformAdapter for TelegramAdapter {
         self.send_text(chat_id, text, pm, None).await
     }
 
+    /// Send a text message into a forum topic (M-G5): includes
+    /// `message_thread_id` in the `sendMessage` body when a real topic id
+    /// is given. Thread 1 (General) is omitted — the Bot API rejects
+    /// `message_thread_id: 1` and General is the default target anyway.
+    async fn send_message_threaded(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        thread_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let pm = self.resolve_parse_mode(parse_mode);
+        let thread = self.resolve_send_thread(chat_id, thread_id);
+        self.send_text_inner(chat_id, text, pm, None, None, thread)
+            .await?;
+        Ok(())
+    }
+
+    /// Threaded variant of [`send_message_raw`](Self::send_message_raw):
+    /// the placeholder is created inside the forum topic so streaming edits
+    /// stay in that topic (M-G5).
+    async fn send_message_raw_threaded(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<i64>, GatewayError> {
+        let pm = self.resolve_parse_mode(parse_mode);
+        let thread = self.resolve_send_thread(chat_id, thread_id);
+        self.send_text_inner(chat_id, text, pm, None, None, thread)
+            .await
+    }
+
     async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<(), GatewayError> {
         // Path resolution prefers the inherent method, so this calls the
         // best-effort delete above rather than recursing into the trait.
@@ -193,7 +298,23 @@ impl PlatformAdapter for TelegramAdapter {
         "telegram"
     }
 
+    /// Unthreaded typing: delegates to [`send_typing_threaded`](Self::send_typing_threaded)
+    /// with no thread (falls back to General for known forum chats).
     async fn send_typing(&self, chat_id: &str) -> Result<(), GatewayError> {
+        self.send_typing_threaded(chat_id, None).await
+    }
+
+    /// Typing indicator targeting a forum topic (M-G5): passes
+    /// `message_thread_id` to `sendChatAction` so the bubble appears in the
+    /// topic the user wrote in. Unlike `sendMessage`, `sendChatAction`
+    /// accepts thread 1, and a known forum chat with no thread given falls
+    /// back to General (1) since the bubble would otherwise land there
+    /// without a thread.
+    async fn send_typing_threaded(
+        &self,
+        chat_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
         // Typing cooldown: skip the ping when a recent sendChatAction for
         // this chat failed, so the keep-alive task can't retry-storm the
         // API on 429/failure.
@@ -204,10 +325,13 @@ impl PlatformAdapter for TelegramAdapter {
         // Fire-and-forget UI hint: never fail the message flow on a typing
         // error, just log at debug.
         let url = format!("{}/sendChatAction", self.api_base);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": chat_id,
             "action": "typing",
         });
+        if let Some(thread) = self.resolve_typing_thread(chat_id, thread_id) {
+            body["message_thread_id"] = serde_json::Value::Number(thread.into());
+        }
         match self.post_json::<serde_json::Value>(&url, &body).await {
             Ok(_) => {
                 // Success clears any stale cooldown entry for this chat.
@@ -294,6 +418,7 @@ pub(crate) mod test_helpers {
             group_require_mention: false,
             command_menu_max: None,
             message_reactions: false,
+            command_menu_skills: true,
         }
     }
     pub(crate) fn test_adapter() -> TelegramAdapter {
@@ -362,6 +487,7 @@ pub(crate) mod test_helpers {
             group_require_mention: false,
             command_menu_max: None,
             message_reactions: false,
+            command_menu_skills: true,
         };
         TelegramAdapter::new(config).unwrap()
     }
@@ -420,6 +546,46 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
     use crate::platforms::telegram::test_helpers::*;
+
+    /// M-G5: forum-chat learning dedupes — only the first sighting of a
+    /// chat returns true (drives once-per-chat menu scope registration).
+    #[test]
+    fn note_forum_chat_dedupes() {
+        let adapter = test_adapter();
+        assert!(adapter.note_forum_chat(123));
+        assert!(!adapter.note_forum_chat(123));
+        assert!(adapter.note_forum_chat(456));
+    }
+
+    /// M-G5: sendMessage normalization — only real topic ids (> 1) survive;
+    /// General (1), non-positive and unparseable values are omitted from the
+    /// request body.
+    #[test]
+    fn normalize_send_thread_rules() {
+        assert_eq!(TelegramAdapter::normalize_send_thread(Some("7")), Some(7));
+        assert_eq!(TelegramAdapter::normalize_send_thread(Some("1")), None);
+        assert_eq!(TelegramAdapter::normalize_send_thread(Some("0")), None);
+        assert_eq!(TelegramAdapter::normalize_send_thread(None), None);
+        assert_eq!(TelegramAdapter::normalize_send_thread(Some("abc")), None);
+    }
+
+    /// M-G5: sendChatAction thread resolution — explicit threads pass
+    /// through (thread 1 is valid here), a known forum chat without a thread
+    /// falls back to General (1), unknown chats get no thread id.
+    #[test]
+    fn resolve_typing_thread_rules() {
+        let adapter = test_adapter();
+        // Unknown chat, no thread: plain sendChatAction, no thread id.
+        assert_eq!(adapter.resolve_typing_thread("555", None), None);
+        // Explicit threads pass through, including General (1).
+        assert_eq!(adapter.resolve_typing_thread("555", Some("1")), Some(1));
+        assert_eq!(adapter.resolve_typing_thread("555", Some("9")), Some(9));
+        // Known forum chat without a thread: General (1).
+        assert!(adapter.note_forum_chat(777));
+        assert_eq!(adapter.resolve_typing_thread("777", None), Some(1));
+        // Unparseable thread on an unknown chat: no thread id.
+        assert_eq!(adapter.resolve_typing_thread("888", Some("nope")), None);
+    }
 
     #[test]
     fn config_allowlist_registered_on_adapter_new() {

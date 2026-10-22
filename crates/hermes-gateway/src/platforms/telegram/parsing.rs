@@ -239,6 +239,9 @@ impl TelegramAdapter {
             user_id: parsed.user_id.map(|u| u.to_string()).unwrap_or_default(),
             text,
             message_id: Some(parsed.message_id.to_string()),
+            // M-G5: forum topic the message arrived in; gateway replies
+            // target the same thread via `send_message_threaded`.
+            thread_id: parsed.message_thread_id.map(|t| t.to_string()),
             is_dm: parsed.chat_type == ChatKind::Private,
         }
     }
@@ -642,6 +645,47 @@ mod tests {
         assert_eq!(incoming.message_thread_id, Some(999));
         assert!(incoming.is_group);
         assert_eq!(incoming.chat_type, ChatKind::Supergroup);
+    }
+    #[test]
+    fn parsed_to_incoming_carries_forum_thread_id() {
+        // M-G5: a topic message's message_thread_id must reach the gateway
+        // IncomingMessage so replies can target the same thread.
+        let json = serde_json::json!({
+            "update_id": 104,
+            "message": {
+                "message_id": 3,
+                "chat": {"id": -1001, "type": "supergroup"},
+                "from": {"id": 42, "first_name": "U"},
+                "text": "in a topic",
+                "message_thread_id": 7
+            }
+        });
+        let update: Update = serde_json::from_value(json).unwrap();
+        let incoming = TelegramAdapter::parse_update(&update).unwrap();
+        assert_eq!(incoming.message_thread_id, Some(7));
+
+        let gw = TelegramAdapter::parsed_to_incoming(&incoming);
+        assert_eq!(gw.platform, "telegram");
+        assert_eq!(gw.thread_id, Some("7".to_string()));
+        assert!(!gw.is_dm);
+    }
+    #[test]
+    fn parsed_to_incoming_thread_id_none_without_topic() {
+        let json = serde_json::json!({
+            "update_id": 105,
+            "message": {
+                "message_id": 4,
+                "chat": {"id": 900, "type": "private"},
+                "from": {"id": 42, "first_name": "U"},
+                "text": "dm"
+            }
+        });
+        let update: Update = serde_json::from_value(json).unwrap();
+        let incoming = TelegramAdapter::parse_update(&update).unwrap();
+
+        let gw = TelegramAdapter::parsed_to_incoming(&incoming);
+        assert_eq!(gw.thread_id, None);
+        assert!(gw.is_dm);
     }
     #[test]
     fn parse_update_sender_chat_fallback() {
