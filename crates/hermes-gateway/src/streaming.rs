@@ -18,6 +18,10 @@ use hermes_core::traits::PlatformAdapter;
 pub(crate) struct StreamEditState {
     pub(crate) adapter: Arc<dyn PlatformAdapter>,
     pub(crate) chat_id: String,
+    /// Forum topic/thread the stream belongs to (e.g. Telegram's
+    /// `message_thread_id` as a string); used by the `send_message` fallbacks
+    /// so a stream without a placeholder still lands in the right topic.
+    pub(crate) thread_id: Option<String>,
     /// Platform id of the placeholder message (`None` when the adapter
     /// doesn't report message ids — flushes fall back to `send_message`).
     pub(crate) placeholder_id: Option<i64>,
@@ -49,7 +53,7 @@ impl StreamEditState {
             // of sending the accumulated content as a new message.
             let _ = self
                 .adapter
-                .send_message(&self.chat_id, content, None)
+                .send_message_threaded(&self.chat_id, content, None, self.thread_id.as_deref())
                 .await;
             *self.last_sent_text.lock().unwrap() = content.to_string();
             return;
@@ -121,7 +125,7 @@ impl StreamEditState {
             let _ = self.adapter.delete_message(&self.chat_id, pid).await;
         }
         self.adapter
-            .send_message(&self.chat_id, response, None)
+            .send_message_threaded(&self.chat_id, response, None, self.thread_id.as_deref())
             .await
     }
 

@@ -48,22 +48,20 @@ fn truncate_caption(caption: &str) -> String {
 }
 
 impl TelegramAdapter {
-    /// Register the bot's / command menu via `setMyCommands`.
+    /// Build the `setMyCommands` request body for the dynamic command menu.
     ///
-    /// Mirrors the original's `_register_command_menu`: exposes the gateway's
-    /// slash commands in Telegram's UI. Dynamic — built from
-    /// [`crate::commands::telegram_menu_commands`] (builtins + extensions),
-    /// ordered by [`crate::commands::TELEGRAM_MENU_PRIORITY`] and capped at
-    /// `TelegramConfig::command_menu_max` (default 60, mirroring the original
-    /// so the payload stays under Telegram's ~4KB menu limit).
-    /// Best-effort — failures are returned so the caller can log them, but
-    /// must not fail startup.
-    pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
+    /// When `chat_scope` is `Some`, the commands are scoped to that single
+    /// chat via `scope: {"type": "chat", "chat_id": ...}` (used for forum
+    /// chats — see [`register_command_menu`]).
+    fn command_menu_body(&self, chat_scope: Option<i64>) -> serde_json::Value {
         let max = self
             .config
             .command_menu_max
             .unwrap_or(crate::commands::TELEGRAM_MENU_DEFAULT_MAX);
-        let menu = crate::commands::telegram_menu_commands(max);
+        let menu = crate::commands::telegram_menu_commands_with_skills(
+            max,
+            self.config.command_menu_skills,
+        );
 
         let commands: Vec<serde_json::Value> = menu
             .iter()
@@ -73,15 +71,40 @@ impl TelegramAdapter {
             })
             .collect();
 
+        let mut body = serde_json::json!({ "commands": commands });
+        if let Some(chat_id) = chat_scope {
+            body["scope"] = serde_json::json!({ "type": "chat", "chat_id": chat_id });
+        }
+        body
+    }
+
+    /// Register the bot's / command menu via `setMyCommands`.
+    ///
+    /// Mirrors the original's `_register_command_menu`: exposes the gateway's
+    /// slash commands in Telegram's UI. Dynamic — built from
+    /// [`crate::commands::telegram_menu_commands_with_skills`] (builtins +
+    /// extensions + skills), ordered by [`crate::commands::TELEGRAM_MENU_PRIORITY`]
+    /// and capped at `TelegramConfig::command_menu_max` (default 60, mirroring
+    /// the original so the payload stays under Telegram's ~4KB menu limit).
+    /// Skills are included unless `TelegramConfig::command_menu_skills` is
+    /// false. Best-effort — failures are returned so the caller can log them,
+    /// but must not fail startup.
+    ///
+    /// Limitation (M-G5): the default scope registered here only surfaces
+    /// the menu in a forum supergroup's *General* topic — Telegram does not
+    /// apply default-scope commands inside topics. The adapter compensates
+    /// with [`spawn_forum_command_menu`], which registers a per-chat
+    /// `{"type": "chat", ...}` scope the first time a topic message arrives
+    /// in a forum chat, so `/` commands are visible inside topics too.
+    pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
+        let body = self.command_menu_body(None);
         let url = format!("{}/setMyCommands", self.api_base);
-        let body = serde_json::json!({ "commands": commands });
         let resp: TelegramResponse<serde_json::Value> = self.post_json(&url, &body).await?;
 
         if resp.ok {
             tracing::info!(
-                "Telegram setMyCommands OK ({} commands, cap {})",
-                menu.len(),
-                max
+                "Telegram setMyCommands OK ({} commands)",
+                body["commands"].as_array().map(|a| a.len()).unwrap_or(0)
             );
         } else {
             tracing::warn!(
@@ -90,6 +113,39 @@ impl TelegramAdapter {
             );
         }
         Ok(())
+    }
+
+    /// Register the command menu scoped to one forum chat (M-G5), in the
+    /// background.
+    ///
+    /// The default-scope menu from [`register_command_menu`] does not show
+    /// inside forum topics; a `{"type": "chat", "chat_id": ...}` scope makes
+    /// the commands visible there. Callers must dedupe (e.g. via
+    /// [`TelegramAdapter::note_forum_chat`]) — this spawns one fire-and-forget
+    /// task per call and never fails the inbound path.
+    pub(crate) fn spawn_forum_command_menu(&self, chat_id: i64) {
+        let client = self.client.clone();
+        let api_base = self.api_base.clone();
+        let body = self.command_menu_body(Some(chat_id));
+        tokio::spawn(async move {
+            let url = format!("{api_base}/setMyCommands");
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    tracing::debug!(
+                        chat_id,
+                        status = %resp.status(),
+                        "Telegram scoped setMyCommands sent for forum chat"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        chat_id,
+                        error = %e,
+                        "Telegram scoped setMyCommands failed for forum chat"
+                    );
+                }
+            }
+        });
     }
 
     /// Send a text message, splitting into multiple messages if it exceeds
@@ -908,6 +964,186 @@ mod tests {
             .send_typing(chat)
             .await
             .expect("typing is fire-and-forget");
+    }
+    /// M-G5: a real topic id lands in the sendMessage body as
+    /// `message_thread_id`.
+    #[tokio::test]
+    async fn send_message_threaded_includes_thread_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        adapter
+            .send_message_threaded("12345", "hello", None, Some("7"))
+            .await
+            .expect("send ok");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["message_thread_id"], serde_json::json!(7));
+    }
+    /// M-G5: thread "1" (General) is normalized away — the Bot API rejects
+    /// `message_thread_id: 1` and General is the default target anyway.
+    /// No thread at all must also omit the field.
+    #[tokio::test]
+    async fn send_message_threaded_omits_general_and_missing_thread() {
+        for thread in [Some("1"), None] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/sendMessage"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "message_id": 42 }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let adapter = mock_server_adapter(&server.uri());
+            adapter
+                .send_message_threaded("12345", "hello", None, thread)
+                .await
+                .expect("send ok");
+
+            let requests = server.received_requests().await.expect("requests");
+            assert_eq!(requests.len(), 1);
+            let body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).expect("json body");
+            assert!(
+                body.get("message_thread_id").is_none(),
+                "thread {:?} must not produce message_thread_id",
+                thread
+            );
+        }
+    }
+    /// M-G5: the threaded raw variant (streaming placeholder) also carries
+    /// the thread id.
+    #[tokio::test]
+    async fn send_message_raw_threaded_includes_thread_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 9 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        let ids = adapter
+            .send_message_raw_threaded("12345", "...", None, Some("7"))
+            .await
+            .expect("send ok");
+        assert_eq!(ids, vec![9]);
+
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["message_thread_id"], serde_json::json!(7));
+    }
+    /// M-G5: the typing bubble needs `message_thread_id` on sendChatAction
+    /// or it lands in the forum's General topic. Unlike sendMessage,
+    /// sendChatAction accepts thread 1.
+    #[tokio::test]
+    async fn send_typing_threaded_includes_thread_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        adapter
+            .send_typing_threaded("12345", Some("9"))
+            .await
+            .expect("typing is fire-and-forget");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["action"], serde_json::json!("typing"));
+        assert_eq!(body["message_thread_id"], serde_json::json!(9));
+    }
+    /// M-G5: a known forum chat with no explicit thread falls back to
+    /// General (1) for typing; a plain chat omits the field entirely.
+    #[tokio::test]
+    async fn send_typing_threaded_known_forum_falls_back_to_general() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 42 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        // A threaded send teaches the adapter that 12345 is a forum chat.
+        adapter
+            .send_message_threaded("12345", "hello", None, Some("7"))
+            .await
+            .expect("send ok");
+
+        // Thread-less typing in the known forum chat targets General (1).
+        adapter
+            .send_typing("12345")
+            .await
+            .expect("typing is fire-and-forget");
+
+        // Thread-less typing in an unknown chat sends no thread id.
+        adapter
+            .send_typing("99999")
+            .await
+            .expect("typing is fire-and-forget");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 3);
+        let forum_typing: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).expect("json body");
+        assert_eq!(forum_typing["message_thread_id"], serde_json::json!(1));
+        let plain_typing: serde_json::Value =
+            serde_json::from_slice(&requests[2].body).expect("json body");
+        assert!(plain_typing.get("message_thread_id").is_none());
+    }
+    /// M-G5: the per-forum-chat menu scope body carries the chat scope.
+    #[test]
+    fn command_menu_body_scoped_for_forum_chat() {
+        let adapter = test_adapter();
+        let scoped = adapter.command_menu_body(Some(-1001234));
+        assert_eq!(
+            scoped["scope"],
+            serde_json::json!({"type": "chat", "chat_id": -1001234})
+        );
+        assert!(scoped["commands"].as_array().is_some());
+
+        let default = adapter.command_menu_body(None);
+        assert!(default.get("scope").is_none());
     }
     #[test]
     fn max_edit_chars_matches_telegram_limit() {

@@ -382,6 +382,15 @@ impl TelegramAdapter {
                 .await;
         }
 
+        // M-G5: forum topics — remember chats with topics so outbound replies
+        // and typing indicators can target the right thread. The first time
+        // a topic message arrives in a chat, also register a per-chat
+        // command menu scope (the default `setMyCommands` scope only shows
+        // the menu in the forum's General topic).
+        if parsed.message_thread_id.is_some() && self.note_forum_chat(parsed.chat_id) {
+            self.spawn_forum_command_menu(parsed.chat_id);
+        }
+
         tx.send(Self::parsed_to_incoming(&parsed)).await.is_ok()
     }
 }
