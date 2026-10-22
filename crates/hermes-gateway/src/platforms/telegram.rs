@@ -1242,6 +1242,23 @@ impl PlatformAdapter for TelegramAdapter {
     fn platform_name(&self) -> &str {
         "telegram"
     }
+
+    async fn send_typing(&self, chat_id: &str) -> Result<(), GatewayError> {
+        // Fire-and-forget UI hint: never fail the message flow on a typing
+        // error, just log at debug.
+        let url = format!("{}/sendChatAction", self.api_base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "action": "typing",
+        });
+        match self.post_json::<serde_json::Value>(&url, &body).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tracing::debug!("Telegram sendChatAction failed for chat {chat_id}: {e}");
+                Ok(())
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

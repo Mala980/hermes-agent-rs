@@ -104,6 +104,16 @@ pub trait PlatformAdapter: Send + Sync {
     /// Return the name of this platform (e.g. "telegram", "discord").
     fn platform_name(&self) -> &str;
 
+    /// Send a "typing..." indicator to a chat.
+    ///
+    /// Default is a no-op. Platforms with a typing/chat-action API (e.g.
+    /// Telegram's `sendChatAction`) override this. Failures should be
+    /// swallowed by the implementation (logged at debug) — a typing hint
+    /// must never break message delivery.
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
     /// Periodic maintenance: prune token caches, dedup maps, etc.
     ///
     /// Default is a no-op. Adapters with long-lived in-memory caches should
