@@ -148,6 +148,54 @@ pub trait PlatformAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Send a text message to a specific forum topic/thread of a chat.
+    ///
+    /// `thread_id` is a platform-specific topic identifier (e.g. Telegram's
+    /// `message_thread_id` as a string). Default ignores the thread and
+    /// forwards to [`send_message`]. Adapters with topic support (e.g.
+    /// Telegram forum supergroups) override this so replies land in the same
+    /// topic the user wrote in instead of the chat's default view.
+    async fn send_message_threaded(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        _thread_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        self.send_message(chat_id, text, parse_mode).await
+    }
+
+    /// Send a text message to a specific forum topic/thread and return the
+    /// platform message ids of the delivered message(s).
+    ///
+    /// Default ignores the thread and forwards to [`send_message_raw`].
+    /// Adapters that report message ids and support topics (e.g. Telegram)
+    /// override this so streaming placeholders can be created in the right
+    /// topic and edited in place there.
+    async fn send_message_raw_threaded(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        _thread_id: Option<&str>,
+    ) -> Result<Vec<i64>, GatewayError> {
+        self.send_message_raw(chat_id, text, parse_mode).await
+    }
+
+    /// Send a "typing..." indicator targeting a specific forum topic/thread.
+    ///
+    /// Default ignores the thread and forwards to [`send_typing`]. Platforms
+    /// whose chat-action API needs the thread (e.g. Telegram's
+    /// `sendChatAction`, which otherwise shows the bubble in the forum's
+    /// General topic) override this.
+    async fn send_typing_threaded(
+        &self,
+        chat_id: &str,
+        _thread_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        self.send_typing(chat_id).await
+    }
+
     /// Periodic maintenance: prune token caches, dedup maps, etc.
     ///
     /// Default is a no-op. Adapters with long-lived in-memory caches should

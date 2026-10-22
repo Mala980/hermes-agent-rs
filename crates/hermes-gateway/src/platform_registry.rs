@@ -188,6 +188,7 @@ pub async fn register_platforms(
                         group_require_mention: false,
                         command_menu_max: None,
                         message_reactions: false,
+                        command_menu_skills: true,
                     };
                     match TelegramAdapter::new(telegram_config) {
                         Ok(adapter) => {

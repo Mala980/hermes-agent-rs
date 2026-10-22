@@ -206,6 +206,7 @@ mod tests {
             text: "".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         let s = agent_start(&incoming, "sk", true);
         assert_eq!(
@@ -286,6 +287,7 @@ mod tests {
             text: "/status".into(),
             message_id: None,
             is_dm: false,
+            thread_id: None,
         };
         let v = command_context(&incoming, "sk", "status", "/status");
         assert_eq!(
