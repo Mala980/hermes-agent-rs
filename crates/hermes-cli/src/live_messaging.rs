@@ -52,7 +52,10 @@ fn register_live_send_message_tool(registry: &ToolRegistry, gateway: Arc<Gateway
     let schema = handler.schema();
     let name = schema.name.clone();
     let desc = schema.description.clone();
-    registry.register(
+    // Intentional override of the default `send_message`: the live
+    // gateway-backed handler replaces the stub. `replace` skips the
+    // "already registered" warning that `register` would emit.
+    registry.replace(
         name,
         "messaging",
         schema,

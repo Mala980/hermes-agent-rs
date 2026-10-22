@@ -13,6 +13,10 @@
 //! is allowed and inbound messages are skipped with a warn log. Configure one
 //! of the env vars (or the allow-all dev switch) to admit users.
 //!
+//! Config-file allowlists: platforms whose adapter carries an `allowed_users`
+//! list (e.g. telegram) register it via [`register_config_allowlist`]; it is
+//! unioned with the env allowlist in [`is_platform_user_allowed`].
+//!
 //! Supported platforms: `discord`, `slack`, `matrix`, `email`, `telegram`.
 //! Signal is gated separately by groupId (see [`signal_group_allowlist`];
 //! DMs are never gated). Other platform names are not gated here (legacy
@@ -29,7 +33,48 @@
 //! gate; its authorized/admin state is in-memory only, whereas this allowlist
 //! is env-driven and survives restarts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, RwLock};
+
+/// Config-file allowlists registered by platform adapters at startup.
+///
+/// Keyed by platform name (`"telegram"`, ...); unioned with the env allowlist
+/// in [`is_platform_user_allowed`]. Adapters with a config-file `allowed_users`
+/// list (e.g. telegram's `TelegramConfig.allowed_users`) register it here so
+/// the gateway-level fail-closed gate honors config as well as env.
+static CONFIG_ALLOWLISTS: LazyLock<RwLock<HashMap<String, HashSet<String>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Register a platform's config-file allowlist (unioned with env in the gate).
+///
+/// Called by platform adapters at startup. Replaces any previous registration
+/// for the platform. Empty lists are stored as-is (no-op in the union).
+pub fn register_config_allowlist(platform: &str, user_ids: Vec<String>) {
+    let set: HashSet<String> = user_ids.into_iter().collect();
+    CONFIG_ALLOWLISTS
+        .write()
+        .expect("config allowlist lock poisoned")
+        .insert(platform.to_string(), set);
+}
+
+/// Clear a platform's registered config allowlist (mainly for tests).
+#[cfg(test)]
+pub(crate) fn clear_config_allowlist(platform: &str) {
+    CONFIG_ALLOWLISTS
+        .write()
+        .expect("config allowlist lock poisoned")
+        .remove(platform);
+}
+
+/// True when the user is in the platform's registered config-file allowlist.
+fn is_config_allowlisted(platform: &str, user_id: &str) -> bool {
+    CONFIG_ALLOWLISTS
+        .read()
+        .expect("config allowlist lock poisoned")
+        .get(platform)
+        .map(|set| set.contains("*") || set.contains(user_id))
+        .unwrap_or(false)
+}
 
 /// Lock serializing env-mutating allowlist tests. Rust runs tests in
 /// parallel and these tests share env vars (`*_ALLOWED_USERS`, ...), so
@@ -113,6 +158,11 @@ pub fn is_platform_user_allowed(platform: &str, user_id: &str) -> bool {
         return true;
     }
     if platform_allow_all(platform) {
+        return true;
+    }
+    // Config-file allowlist (registered by the platform adapter at startup)
+    // is unioned with the env allowlist.
+    if is_config_allowlisted(platform, user_id) {
         return true;
     }
     match platform_allowlist(platform) {

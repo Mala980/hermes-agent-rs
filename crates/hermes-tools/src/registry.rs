@@ -83,6 +83,7 @@ impl ToolRegistry {
     /// Register a new tool.
     ///
     /// If a tool with the same name already exists, logs a warning and overwrites.
+    /// Use [`ToolRegistry::replace`] for intentional overwrites (no warning).
     pub fn register(
         &self,
         name: impl Into<String>,
@@ -101,6 +102,43 @@ impl ToolRegistry {
         if inner.tools.contains_key(&name) {
             warn!("Tool '{}' already registered; overwriting", name);
         }
+        inner.tools.insert(
+            name.clone(),
+            ToolEntry {
+                name: name.clone(),
+                toolset: toolset.into(),
+                schema,
+                handler,
+                check_fn,
+                env_deps,
+                is_async,
+                description: description.into(),
+                emoji: emoji.into(),
+                max_result_size_chars,
+            },
+        );
+    }
+
+    /// Replace a tool registration without warning.
+    ///
+    /// Same as [`ToolRegistry::register`], but silent when the name already
+    /// exists. Use for intentional overrides (e.g. `hermes chat` swapping the
+    /// default `send_message` for the live gateway-backed version).
+    pub fn replace(
+        &self,
+        name: impl Into<String>,
+        toolset: impl Into<String>,
+        schema: ToolSchema,
+        handler: Arc<dyn ToolHandler>,
+        check_fn: Arc<dyn Fn() -> bool + Send + Sync>,
+        env_deps: Vec<String>,
+        is_async: bool,
+        description: impl Into<String>,
+        emoji: impl Into<String>,
+        max_result_size_chars: Option<usize>,
+    ) {
+        let name = name.into();
+        let mut inner = self.inner.lock().unwrap();
         inner.tools.insert(
             name.clone(),
             ToolEntry {
@@ -341,6 +379,42 @@ mod tests {
         let registry = ToolRegistry::new();
         let result = registry.dispatch("nonexistent", Value::Null);
         assert!(result.contains("error"));
+    }
+
+    #[test]
+    fn test_replace_overwrites_silently() {
+        let registry = ToolRegistry::new();
+        let handler = Arc::new(EchoHandler);
+        let schema = handler.schema();
+        // First registration via `register`.
+        registry.register(
+            "echo",
+            "test",
+            schema.clone(),
+            handler.clone(),
+            Arc::new(|| true),
+            vec![],
+            false,
+            "Echo tool",
+            "🔊",
+            None,
+        );
+        // Intentional override via `replace`: no panic, single entry, same schema.
+        registry.replace(
+            "echo",
+            "test",
+            schema,
+            handler,
+            Arc::new(|| true),
+            vec![],
+            false,
+            "Echo tool",
+            "🔊",
+            None,
+        );
+        let defs = registry.get_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "echo");
     }
 
     #[test]
