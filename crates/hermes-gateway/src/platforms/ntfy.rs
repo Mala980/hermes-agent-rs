@@ -410,6 +410,7 @@ impl NtfyAdapter {
             text,
             message_id: msg_id,
             is_dm: true,
+            thread_id: None,
         };
         if let Some(tx) = inner.inbound_tx.read().await.clone() {
             tokio::spawn(async move {

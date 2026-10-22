@@ -724,6 +724,7 @@ async fn forward_inbound(inner: &LineInner, msg: LineTextMessage) {
             text: msg.text,
             message_id: msg.message_id,
             is_dm: msg.is_dm,
+            thread_id: None,
         };
         if tx.send(inbound).await.is_err() {
             warn!("LINE: inbound channel closed; dropping message");

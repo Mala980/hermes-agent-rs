@@ -627,6 +627,7 @@ impl IrcSession {
             user_id: sender.clone(),
             text: body,
             message_id: None,
+            thread_id: None,
             is_dm,
         };
         if let Some(tx) = self.inner.inbound_tx.lock().await.clone() {
