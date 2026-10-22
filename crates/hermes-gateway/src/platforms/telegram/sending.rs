@@ -11,6 +11,16 @@ use super::types::*;
 use super::TelegramAdapter;
 use crate::markdown_split::split_markdown;
 
+/// Reaction emoji set on an inbound message while the agent processes it
+/// (M-T4, opt-in via [`TelegramConfig::message_reactions`]).
+pub(crate) const REACTION_PROCESSING: &str = "👀";
+/// Reaction emoji replacing the processing reaction once the agent's reply
+/// has been delivered (M-T4).
+pub(crate) const REACTION_SUCCESS: &str = "👍";
+/// Reaction emoji replacing the processing reaction when processing the
+/// message fails (M-T4).
+pub(crate) const REACTION_ERROR: &str = "👎";
+
 /// Maximum message length for Telegram (4096 characters).
 pub(crate) const MAX_MESSAGE_LENGTH: usize = 4096;
 
@@ -42,11 +52,18 @@ impl TelegramAdapter {
     ///
     /// Mirrors the original's `_register_command_menu`: exposes the gateway's
     /// slash commands in Telegram's UI. Dynamic — built from
-    /// [`crate::commands::telegram_menu_commands`] (builtins + extensions).
+    /// [`crate::commands::telegram_menu_commands`] (builtins + extensions),
+    /// ordered by [`crate::commands::TELEGRAM_MENU_PRIORITY`] and capped at
+    /// `TelegramConfig::command_menu_max` (default 60, mirroring the original
+    /// so the payload stays under Telegram's ~4KB menu limit).
     /// Best-effort — failures are returned so the caller can log them, but
     /// must not fail startup.
     pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
-        let menu = crate::commands::telegram_menu_commands();
+        let max = self
+            .config
+            .command_menu_max
+            .unwrap_or(crate::commands::TELEGRAM_MENU_DEFAULT_MAX);
+        let menu = crate::commands::telegram_menu_commands(max);
 
         let commands: Vec<serde_json::Value> = menu
             .iter()
@@ -61,7 +78,11 @@ impl TelegramAdapter {
         let resp: TelegramResponse<serde_json::Value> = self.post_json(&url, &body).await?;
 
         if resp.ok {
-            tracing::info!("Telegram setMyCommands OK ({} commands)", menu.len());
+            tracing::info!(
+                "Telegram setMyCommands OK ({} commands, cap {})",
+                menu.len(),
+                max
+            );
         } else {
             tracing::warn!(
                 "Telegram setMyCommands returned ok=false: {:?}",
@@ -185,6 +206,11 @@ impl TelegramAdapter {
             }
         }
 
+        // M-T2: Telegram clears the typing bubble when a message lands. Drop
+        // any typing cooldown so the keep-alive task re-arms typing on its
+        // next tick instead of waiting out the full cooldown window.
+        self.notify_message_sent(chat_id);
+
         Ok(message_ids)
     }
     /// Resend a chunk body with `parse_mode` removed (plain-text retry).
@@ -248,6 +274,50 @@ impl TelegramAdapter {
         if let Err(e) = self.post_json::<serde_json::Value>(&url, &body).await {
             tracing::debug!(
                 "Telegram deleteMessage failed for chat {chat_id} message {message_id}: {e}"
+            );
+        }
+        Ok(())
+    }
+    /// Set an emoji reaction on a message via `setMessageReaction`.
+    ///
+    /// Lifecycle (M-T4, opt-in via `TelegramConfig::message_reactions`,
+    /// mirrors the original):
+    /// - 👀 ([`REACTION_PROCESSING`]) when
+    ///   [`TelegramAdapter::process_update`] accepts an inbound message for
+    ///   processing,
+    /// - 👍 ([`REACTION_SUCCESS`]) once the agent's reply has been delivered,
+    /// - 👎 ([`REACTION_ERROR`]) when processing the message fails.
+    ///
+    /// The 👀 hook is wired in `process_update`; the 👍/👎 transitions
+    /// belong in `Gateway::route_message` (crates/hermes-gateway/src/gateway.rs):
+    /// on the `route_result` `Ok` path call this with 👍, on the `Err`
+    /// path with 👎, using `incoming.chat_id` and `incoming.message_id`
+    /// (the Telegram message id as a string — parse back to `i64`). That
+    /// wiring is deliberately deferred — gateway.rs sits at the 120KB push
+    /// cap — so the adapter side is complete and each call site is a single
+    /// `set_message_reaction` call away.
+    ///
+    /// Fire-and-forget: when the feature is disabled this is a pure no-op
+    /// (no network traffic at all), and API failures are logged at debug
+    /// and swallowed so a reaction can never break the message flow.
+    pub async fn set_message_reaction(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<(), GatewayError> {
+        if !self.config.message_reactions {
+            return Ok(());
+        }
+        let url = format!("{}/setMessageReaction", self.api_base);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [{ "type": "emoji", "emoji": emoji }],
+        });
+        if let Err(e) = self.post_json::<serde_json::Value>(&url, &body).await {
+            tracing::debug!(
+                "Telegram setMessageReaction failed for chat {chat_id} message {message_id} ({emoji}): {e}"
             );
         }
         Ok(())
@@ -790,6 +860,55 @@ mod tests {
             .expect("send ok");
         assert_eq!(ids, vec![42]);
     }
+    #[tokio::test]
+    async fn send_text_rearms_typing_after_cooldown() {
+        let server = MockServer::start().await;
+        // sendChatAction fails (403) -> 30s typing cooldown engaged.
+        Mock::given(method("POST"))
+            .and(path("/sendChatAction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 403,
+                "description": "Forbidden: bot was blocked by the user"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        // sendMessage succeeds.
+        Mock::given(method("POST"))
+            .and(path("/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        let chat = "12345";
+
+        // First typing ping fails -> cooldown engaged, next tick would skip.
+        adapter
+            .send_typing(chat)
+            .await
+            .expect("typing is fire-and-forget");
+        assert!(typing_on_cooldown(&adapter.typing_cooldown_until, chat));
+
+        // A message lands -> M-T2 clears the cooldown.
+        let ids = adapter
+            .send_text(chat, "hello", None, None)
+            .await
+            .expect("send ok");
+        assert_eq!(ids, vec![7]);
+        assert!(!typing_on_cooldown(&adapter.typing_cooldown_until, chat));
+
+        // The next keep-alive tick re-arms typing immediately (2nd POST).
+        adapter
+            .send_typing(chat)
+            .await
+            .expect("typing is fire-and-forget");
+    }
     #[test]
     fn max_edit_chars_matches_telegram_limit() {
         let adapter = test_adapter();
@@ -831,5 +950,83 @@ mod tests {
 
         // Other chats unaffected.
         assert!(!typing_on_cooldown(&cooldowns, "other"));
+    }
+    #[tokio::test]
+    async fn set_message_reaction_posts_correct_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter_with_reactions(&server.uri());
+        adapter
+            .set_message_reaction("12345", 777, REACTION_PROCESSING)
+            .await
+            .expect("reaction ok");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["chat_id"], serde_json::json!("12345"));
+        assert_eq!(body["message_id"], serde_json::json!(777));
+        let reactions = body["reaction"].as_array().expect("reaction array");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0]["type"], serde_json::json!("emoji"));
+        assert_eq!(reactions[0]["emoji"], serde_json::json!("👀"));
+    }
+    #[tokio::test]
+    async fn set_message_reaction_swallows_api_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "Bad Request: message not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter_with_reactions(&server.uri());
+        // Fire-and-forget: a failed reaction must never fail the flow.
+        adapter
+            .set_message_reaction("12345", 777, REACTION_SUCCESS)
+            .await
+            .expect("reaction failure is swallowed");
+    }
+    #[tokio::test]
+    async fn set_message_reaction_disabled_sends_no_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // Default config has message_reactions=false: pure no-op.
+        let adapter = mock_server_adapter(&server.uri());
+        assert!(!adapter.config().message_reactions);
+        adapter
+            .set_message_reaction("12345", 777, REACTION_PROCESSING)
+            .await
+            .expect("disabled reaction is a no-op");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty(), "disabled reactions must send nothing");
+    }
+    #[test]
+    fn reaction_emoji_constants_match_original() {
+        assert_eq!(REACTION_PROCESSING, "👀");
+        assert_eq!(REACTION_SUCCESS, "👍");
+        assert_eq!(REACTION_ERROR, "👎");
     }
 }

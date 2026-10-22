@@ -63,6 +63,21 @@ pub struct TelegramConfig {
     /// setting.
     #[serde(default)]
     pub group_require_mention: bool,
+
+    /// Maximum number of commands registered in Telegram's `setMyCommands`
+    /// menu. Commands in [`crate::commands::TELEGRAM_MENU_PRIORITY`] survive
+    /// the cap first (in priority order); the rest fill alphabetically.
+    /// Defaults to 60 when unset — mirrors the original, keeping the
+    /// payload under Telegram's undocumented ~4KB menu limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_menu_max: Option<usize>,
+
+    /// Opt-in message reactions (M-T4): when true, the adapter sets a 👀
+    /// reaction on an inbound message when processing starts, replacing it
+    /// with 👍 once the agent's reply is delivered, or 👎 when processing
+    /// fails (mirrors the original). Defaults to false (disabled).
+    #[serde(default)]
+    pub message_reactions: bool,
 }
 
 fn default_true() -> bool {
@@ -565,6 +580,22 @@ mod tests {
         assert!(!cfg.parse_html);
         assert_eq!(cfg.poll_timeout, DEFAULT_POLL_TIMEOUT);
         assert!(cfg.bot_username.is_none());
+        // M-C3: menu cap defaults to None -> sending path falls back to 60.
+        assert!(cfg.command_menu_max.is_none());
+        // M-T4: reactions are opt-in — default off.
+        assert!(!cfg.message_reactions);
+    }
+    #[test]
+    fn config_message_reactions_opt_in() {
+        let json = r#"{"token": "abc", "message_reactions": true}"#;
+        let cfg: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.message_reactions);
+    }
+    #[test]
+    fn config_with_command_menu_max() {
+        let json = r#"{"token": "abc", "command_menu_max": 25}"#;
+        let cfg: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.command_menu_max, Some(25));
     }
     #[test]
     fn config_with_bot_username() {

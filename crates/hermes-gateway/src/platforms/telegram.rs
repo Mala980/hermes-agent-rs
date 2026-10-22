@@ -82,6 +82,19 @@ impl TelegramAdapter {
     pub fn config(&self) -> &TelegramConfig {
         &self.config
     }
+    /// Re-arm typing after an outbound message lands (M-T2).
+    ///
+    /// Telegram clears the typing bubble as soon as a message arrives. The
+    /// gateway's keep-alive task re-sends typing every 4s, but a failed
+    /// `sendChatAction` leaves a per-chat cooldown (30s default) that would
+    /// keep the bubble dead for the full window after each intermediate
+    /// message. Clearing it here lets the next keep-alive tick re-arm typing
+    /// immediately instead of waiting out the cooldown.
+    pub(crate) fn notify_message_sent(&self, chat_id: &str) {
+        if let Ok(mut cooldowns) = self.typing_cooldown_until.lock() {
+            cooldowns.remove(chat_id);
+        }
+    }
 }
 
 #[async_trait]
@@ -228,7 +241,6 @@ pub(crate) mod test_helpers {
     use super::TelegramAdapter;
     use super::TelegramConfig;
     use crate::adapter::AdapterProxyConfig;
-    use std::sync::Arc;
 
     pub(crate) fn make_chat(id: i64, chat_type: &str) -> Chat {
         Chat {
@@ -280,6 +292,8 @@ pub(crate) mod test_helpers {
             bot_username: None,
             allowed_users: None,
             group_require_mention: false,
+            command_menu_max: None,
+            message_reactions: false,
         }
     }
     pub(crate) fn test_adapter() -> TelegramAdapter {
@@ -346,6 +360,8 @@ pub(crate) mod test_helpers {
             bot_username: username.map(|s| s.to_string()),
             allowed_users: None,
             group_require_mention: false,
+            command_menu_max: None,
+            message_reactions: false,
         };
         TelegramAdapter::new(config).unwrap()
     }
@@ -389,13 +405,21 @@ pub(crate) mod test_helpers {
         adapter.api_base = server_uri.to_string();
         adapter
     }
+    /// Test adapter with M-T4 message reactions enabled, pointed at a mock
+    /// server instead of api.telegram.org.
+    pub(crate) fn mock_server_adapter_with_reactions(server_uri: &str) -> TelegramAdapter {
+        let mut config = test_adapter_config();
+        config.message_reactions = true;
+        let mut adapter = TelegramAdapter::new(config).unwrap();
+        adapter.api_base = server_uri.to_string();
+        adapter
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platforms::telegram::test_helpers::*;
-    use crate::platforms::telegram::*;
 
     #[test]
     fn config_allowlist_registered_on_adapter_new() {
@@ -418,5 +442,37 @@ mod tests {
             "telegram",
             "565903951"
         ));
+    }
+    #[test]
+    fn notify_message_sent_clears_typing_cooldown() {
+        let adapter = test_adapter();
+        let chat = "12345";
+
+        // Seed a cooldown the way a failed sendChatAction would.
+        adapter.typing_cooldown_until.lock().unwrap().insert(
+            chat.to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        assert!(typing_on_cooldown(&adapter.typing_cooldown_until, chat));
+
+        adapter.notify_message_sent(chat);
+
+        assert!(!typing_on_cooldown(&adapter.typing_cooldown_until, chat));
+    }
+    #[test]
+    fn notify_message_sent_leaves_other_chats_alone() {
+        let adapter = test_adapter();
+        let other = "999";
+
+        adapter.typing_cooldown_until.lock().unwrap().insert(
+            other.to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        // No-op for a chat that was never on cooldown.
+        adapter.notify_message_sent("12345");
+
+        // The other chat's cooldown survives.
+        assert!(typing_on_cooldown(&adapter.typing_cooldown_until, other));
     }
 }
