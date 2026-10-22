@@ -290,8 +290,14 @@ impl CronScheduler {
             let completion_tx = completion_tx.clone();
             let in_flight = in_flight.clone();
             tokio::spawn(async move {
-                // Guard releases the id from the in-flight set when the task
-                // ends — including on panic — so the job never wedges.
+                // Guard releases the id from the in-flight set — including on
+                // panic — so the job never wedges. It is dropped explicitly
+                // right after mark_executed/mark_failed (below), BEFORE the
+                // async store: at that point next_run has advanced (or the
+                // job is failed/completed), so a concurrent tick cannot
+                // double-start, and observers seeing run_count increment can
+                // rely on the in-flight slot being released (no await between
+                // the mark and the drop).
                 let _guard = RunningGuard::new(in_flight, tracked.then(|| job.id.clone()));
                 let job_id = job.id.clone();
                 let job_name = job.name.clone().unwrap_or_else(|| job_id.clone());
@@ -325,6 +331,8 @@ impl CronScheduler {
                         job.mark_failed();
                     }
                 }
+                // Release the in-flight slot synchronously with the mark above.
+                drop(_guard);
 
                 if job.is_oneshot() {
                     // One-shot: remove from the store after firing exactly
@@ -670,6 +678,27 @@ mod tests {
         sched.load_persisted_jobs().await.unwrap();
     }
 
+    /// Wait until the persisted JSON file reflects the given run_count.
+    ///
+    /// `store_job` updates in-memory state before the async file write lands;
+    /// a `force_due` rewrite racing that file write would be clobbered. Wait
+    /// for the file to catch up first so the rewrite is stable.
+    async fn wait_persisted_run_count(dir: &TempDir, id: &str, expected: u32) {
+        let path = dir.path().join(format!("{id}.json"));
+        poll_until(
+            || {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("run_count").and_then(|n| n.as_u64()))
+                    .map(|n| n as u32 == expected)
+                    .unwrap_or(false)
+            },
+            "persisted run_count catches up",
+        )
+        .await;
+    }
+
     /// Poll until `cond()` is true (timeout keeps the suite hang-free).
     async fn poll_until(cond: impl Fn() -> bool, what: &str) {
         tokio::time::timeout(StdDuration::from_secs(10), async {
@@ -981,6 +1010,9 @@ mod tests {
             "first run completed",
         )
         .await;
+        // Ensure the async persist (file write) has landed before rewriting
+        // the file in force_due, or the rewrite races and gets clobbered.
+        wait_persisted_run_count(&dir, &id, 1).await;
 
         // The in-flight set must have been released: force due again and the
         // next tick starts a second run. Snapshot total calls first — the
