@@ -8,6 +8,7 @@
 //! does not own the command. Extensions run **before** built-ins so custom
 //! commands can be handled without forking core routing.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Result of processing a gateway slash command.
@@ -373,34 +374,58 @@ pub const TELEGRAM_MENU_DEFAULT_MAX: usize = 60;
 /// Build the (command, description) list for Telegram's `setMyCommands` menu.
 ///
 /// Dynamic: combines builtin [`all_commands`] with any registered
-/// [`SlashCommandExtension`] entries. Names are stripped of the leading `/`
+/// [`SlashCommandExtension`] entries and the available skills (see
+/// [`discover_menu_skills`]). Names are stripped of the leading `/`
 /// and sanitized for Telegram (lowercase alphanumeric + underscore).
 ///
 /// Ordering: commands in [`TELEGRAM_MENU_PRIORITY`] come first, in
 /// priority-list order (only those actually present); the remaining commands
-/// follow alphabetically. The result is truncated to `max_commands`.
+/// follow alphabetically. Skills always land in the alphabetical bucket (the
+/// priority names are all builtin commands, and skill names colliding with
+/// them are skipped). The result is truncated to `max_commands`.
 pub fn telegram_menu_commands(max_commands: usize) -> Vec<(String, String)> {
-    fn sanitize(name: &str) -> Option<String> {
-        let clean: String = name
-            .trim_start_matches('/')
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        let clean = clean.trim_matches('_').to_string();
-        if clean.is_empty() || clean.len() > 32 {
-            None
-        } else {
-            Some(clean)
-        }
-    }
+    telegram_menu_commands_with_skills(max_commands, true)
+}
 
+/// [`telegram_menu_commands`] with control over skill inclusion (M-C2). Set
+/// `include_skills` to false to leave skills out of the menu — wired to
+/// `TelegramConfig::command_menu_skills` by the Telegram adapter.
+pub fn telegram_menu_commands_with_skills(
+    max_commands: usize,
+    include_skills: bool,
+) -> Vec<(String, String)> {
+    let skills = if include_skills {
+        discover_menu_skills()
+    } else {
+        Vec::new()
+    };
+    build_menu(max_commands, skills)
+}
+
+/// Sanitize a command/skill name for Telegram's menu: lowercase
+/// alphanumeric + underscore, stripped of the leading `/`, max 32 chars.
+fn sanitize_menu_name(name: &str) -> Option<String> {
+    let clean: String = name
+        .trim_start_matches('/')
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let clean = clean.trim_matches('_').to_string();
+    if clean.is_empty() || clean.len() > 32 {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn build_menu(max_commands: usize, skills: Vec<(String, String)>) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
 
     // Builtins first (canonical names only, no aliases).
     for info in all_commands() {
-        if let Some(name) = sanitize(info.name) {
+        if let Some(name) = sanitize_menu_name(info.name) {
             if seen.insert(name.clone()) {
                 out.push((name, info.description.to_string()));
             }
@@ -413,12 +438,21 @@ pub fn telegram_menu_commands(max_commands: usize) -> Vec<(String, String)> {
             for entry in ext.extension_help_entries() {
                 // usage is like "/cmd args" — take the first token as the name.
                 let raw_name = entry.usage.split_whitespace().next().unwrap_or("");
-                if let Some(name) = sanitize(raw_name) {
+                if let Some(name) = sanitize_menu_name(raw_name) {
                     if seen.insert(name.clone()) {
                         out.push((name, entry.description.clone()));
                     }
                 }
             }
+        }
+    }
+
+    // Then skills (M-C2): already sanitized and deduplicated by
+    // `discover_menu_skills`; the `seen` check skips any skill colliding
+    // with a builtin or extension command.
+    for (name, description) in skills {
+        if seen.insert(name.clone()) {
+            out.push((name, description));
         }
     }
 
@@ -442,6 +476,156 @@ pub fn telegram_menu_commands(max_commands: usize) -> Vec<(String, String)> {
     menu.extend(rest);
     menu.truncate(max_commands);
     menu
+}
+
+// ---------------------------------------------------------------------------
+// Skill entries in the Telegram command menu (M-C2)
+// ---------------------------------------------------------------------------
+
+/// Built-in skill names surfaced in the command menu. Mirrors
+/// `hermes_skills::SkillManager::BUILTIN_SKILLS`; kept in sync manually so
+/// `hermes-gateway` does not need to depend on `hermes-skills`.
+const MENU_BUILTIN_SKILLS: [&str; 26] = [
+    "planning",
+    "debugging",
+    "refactoring",
+    "testing",
+    "docs",
+    "git",
+    "review",
+    "web-research",
+    "terminal",
+    "file-edit",
+    "security",
+    "performance",
+    "api-design",
+    "db-migrations",
+    "incident-response",
+    "release",
+    "prompting",
+    "agent-orchestration",
+    "mcp",
+    "gateway",
+    "voice-mode",
+    "cron",
+    "memory",
+    "session-search",
+    "tool-authoring",
+    "skill-authoring",
+];
+
+/// Skills directory for the menu, mirroring
+/// `FileSkillStore::default_dir()` in `hermes-skills` (the platform data dir,
+/// e.g. `~/.local/share/hermes/skills` on Linux).
+fn menu_skills_dir() -> PathBuf {
+    directories::ProjectDirs::from("com", "hermes", "hermes")
+        .map(|dirs| dirs.data_dir().join("skills"))
+        .unwrap_or_else(|| PathBuf::from(".hermes/skills"))
+}
+
+/// Strip a single pair of surrounding single/double quotes from a
+/// frontmatter scalar value.
+fn unquote_frontmatter_value(value: &str) -> String {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if value.len() >= 2
+        && ((bytes[0] == b'"' && bytes[value.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[value.len() - 1] == b'\''))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Parse the YAML frontmatter of a `SKILL.md` file into
+/// `(name, description)`. Tiny and forgiving: the file must start with a
+/// `---` line and scanning stops at the closing `---` line; only the first
+/// `name:` and `description:` lines are used. Returns `None` when the file
+/// cannot be read or has no usable `name:`.
+fn parse_skill_frontmatter(path: &Path) -> Option<(String, Option<String>)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let mut lines = raw.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut name: Option<String> = None;
+    let mut description: Option<String> = None;
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("name:") {
+            if name.is_none() {
+                name = Some(unquote_frontmatter_value(rest));
+            }
+        } else if let Some(rest) = line.strip_prefix("description:") {
+            if description.is_none() {
+                description = Some(unquote_frontmatter_value(rest));
+            }
+        }
+    }
+    let name = name.filter(|n| !n.is_empty())?;
+    let description = description.filter(|d| !d.is_empty());
+    Some((name, description))
+}
+
+/// Discover skills for the command menu from the default skills directory:
+/// builtin skill names merged with `SKILL.md` files found at
+/// `<dir>/*/SKILL.md` and `<dir>/*/*/SKILL.md` (categorized skills).
+/// Returns `(command_name, description)` pairs — sanitized, deduplicated,
+/// sorted alphabetically. Filesystem skills win over builtins when two
+/// names sanitize to the same command.
+fn discover_menu_skills() -> Vec<(String, String)> {
+    discover_menu_skills_in(&menu_skills_dir())
+}
+
+/// If `skill_dir` contains a `SKILL.md` with usable frontmatter, push
+/// `(name, description)` onto `found` (description falls back to
+/// `Skill: <name>`).
+fn collect_skill_dir(skill_dir: &Path, found: &mut Vec<(String, String)>) {
+    if let Some((name, desc)) = parse_skill_frontmatter(&skill_dir.join("SKILL.md")) {
+        let description = desc.unwrap_or_else(|| format!("Skill: {name}"));
+        found.push((name, description));
+    }
+}
+
+fn discover_menu_skills_in(dir: &Path) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
+
+    // `<dir>/*/SKILL.md`, plus one extra level for categorized skills
+    // (`<dir>/<category>/*/SKILL.md`).
+    let mut dirs_to_scan = vec![dir.to_path_buf()];
+    if let Ok(top) = std::fs::read_dir(dir) {
+        dirs_to_scan.extend(top.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    for scan_dir in dirs_to_scan {
+        if let Ok(entries) = std::fs::read_dir(&scan_dir) {
+            for entry in entries.flatten() {
+                collect_skill_dir(&entry.path(), &mut found);
+            }
+        }
+    }
+
+    for builtin in MENU_BUILTIN_SKILLS {
+        found.push((builtin.to_string(), format!("Skill: {builtin}")));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<(String, String)> = found
+        .into_iter()
+        .filter_map(|(name, description)| {
+            let sanitized = sanitize_menu_name(&name)?;
+            if seen.insert(sanitized.clone()) {
+                Some((sanitized, description))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Parse and dispatch a gateway slash command.
@@ -981,5 +1165,162 @@ mod tests {
             "expected 20+ commands under the default cap, got {}",
             menu.len()
         );
+    }
+
+    // -- M-C2: skill entries in the command menu -------------------------
+
+    fn write_skill_md(dir: &std::path::Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().expect("skill md has parent"))
+            .expect("create skill dir");
+        std::fs::write(&path, contents).expect("write SKILL.md");
+    }
+
+    fn fake_skills_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Top-level skill with a name needing sanitization + a description.
+        write_skill_md(
+            tmp.path(),
+            "cooler/SKILL.md",
+            "---\nname: \"My Cool Skill!\"\ndescription: Does cool things\n---\n# My Cool Skill\n",
+        );
+        // Categorized skill colliding with a builtin command name.
+        write_skill_md(
+            tmp.path(),
+            "cat/statusskill/SKILL.md",
+            "---\nname: status\ndescription: A skill, not the /status command\n---\nbody\n",
+        );
+        // Skill without a description gets the fallback.
+        write_skill_md(
+            tmp.path(),
+            "nodesc/SKILL.md",
+            "---\nname: no-desc-skill\n---\nbody\n",
+        );
+        // No frontmatter at all — ignored.
+        write_skill_md(tmp.path(), "junk/SKILL.md", "# just markdown\n");
+        tmp
+    }
+
+    #[test]
+    fn menu_skill_frontmatter_parsing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_skill_md(
+            tmp.path(),
+            "quoted/SKILL.md",
+            "---\nname: 'Quoted Name'\ndescription: \"Quoted desc\"\n---\nbody\n",
+        );
+        assert_eq!(
+            parse_skill_frontmatter(&tmp.path().join("quoted/SKILL.md")),
+            Some(("Quoted Name".to_string(), Some("Quoted desc".to_string())))
+        );
+        // Missing name: unusable.
+        write_skill_md(
+            tmp.path(),
+            "noname/SKILL.md",
+            "---\ndescription: x\n---\nbody\n",
+        );
+        assert_eq!(
+            parse_skill_frontmatter(&tmp.path().join("noname/SKILL.md")),
+            None
+        );
+        // Missing file: unusable.
+        assert_eq!(
+            parse_skill_frontmatter(&tmp.path().join("missing/SKILL.md")),
+            None
+        );
+    }
+
+    #[test]
+    fn menu_skill_discovery_sanitizes_and_dedupes() {
+        let tmp = fake_skills_dir();
+        let skills = discover_menu_skills_in(tmp.path());
+        let names: Vec<&str> = skills.iter().map(|(n, _)| n.as_str()).collect();
+        // Sanitized name lands in the list with its description.
+        assert!(skills
+            .iter()
+            .any(|(n, d)| n == "my_cool_skill" && d == "Does cool things"));
+        // Missing description falls back to "Skill: <name>".
+        assert!(skills
+            .iter()
+            .any(|(n, d)| n == "no_desc_skill" && d == "Skill: no-desc-skill"));
+        // No-frontmatter file ignored; names unique.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names.len(), sorted.len(), "duplicate skill names");
+        // Builtin skills are merged in.
+        assert!(names.contains(&"planning"));
+    }
+
+    #[test]
+    fn menu_skill_collisions_with_builtins_are_skipped() {
+        let tmp = fake_skills_dir();
+        let skills = discover_menu_skills_in(tmp.path());
+        let menu = build_menu(100, skills);
+        let status_entries: Vec<&(String, String)> =
+            menu.iter().filter(|(n, _)| n == "status").collect();
+        assert_eq!(status_entries.len(), 1, "status must appear exactly once");
+        assert!(
+            !status_entries[0]
+                .1
+                .contains("A skill, not the /status command"),
+            "builtin /status description must win over the colliding skill"
+        );
+    }
+
+    #[test]
+    fn menu_skills_land_in_alphabetical_tail() {
+        let tmp = fake_skills_dir();
+        let skills = discover_menu_skills_in(tmp.path());
+        let menu = build_menu(100, skills);
+        let tail_start = TELEGRAM_MENU_PRIORITY
+            .iter()
+            .filter(|p| menu.iter().any(|(n, _)| n == **p))
+            .count();
+        let tail: Vec<&str> = menu
+            .iter()
+            .skip(tail_start)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(tail.contains(&"my_cool_skill"));
+        assert!(tail.contains(&"planning"));
+        let mut sorted = tail.clone();
+        sorted.sort_unstable();
+        assert_eq!(tail, sorted, "non-priority tail must be alphabetical");
+        assert!(
+            tail.iter().all(|n| !TELEGRAM_MENU_PRIORITY.contains(n)),
+            "no priority command may appear in the tail"
+        );
+    }
+
+    #[test]
+    fn menu_skills_flag_off_excludes_them() {
+        let tmp = fake_skills_dir();
+        let skills = discover_menu_skills_in(tmp.path());
+        let with = build_menu(100, skills);
+        let without = build_menu(100, Vec::new());
+        assert!(with.iter().any(|(n, _)| n == "my_cool_skill"));
+        assert!(without.iter().all(|(n, _)| n != "my_cool_skill"));
+        assert!(without.iter().all(|(n, _)| n != "planning"));
+        // The flag-off path of the public entry point is hermetic for names
+        // that cannot exist in the real environment.
+        assert!(telegram_menu_commands_with_skills(100, false)
+            .iter()
+            .all(|(n, _)| n != "my_cool_skill"));
+        // Backward compatibility: the original entry point includes skills.
+        assert!(telegram_menu_commands(100)
+            .iter()
+            .any(|(n, _)| n == "planning"));
+    }
+
+    #[test]
+    fn menu_skills_cap_respected() {
+        let tmp = fake_skills_dir();
+        let skills = discover_menu_skills_in(tmp.path());
+        let menu = build_menu(3, skills);
+        assert_eq!(menu.len(), 3);
+        assert!(menu
+            .iter()
+            .all(|(n, _)| TELEGRAM_MENU_PRIORITY.contains(&n.as_str())));
     }
 }
