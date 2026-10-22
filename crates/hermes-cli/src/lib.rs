@@ -50,6 +50,7 @@ pub mod skin_engine;
 pub mod theme;
 pub mod tools_config;
 pub mod tui;
+pub mod tui_visual;
 pub mod update;
 pub mod webhook_delivery;
 

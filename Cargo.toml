@@ -101,3 +101,4 @@ jsonwebtoken = "9"
 indexmap = { version = "2", features = ["serde"] }
 once_cell = "1"
 proptest = "1"
+pulldown-cmark = "0.13"
