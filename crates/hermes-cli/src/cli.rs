@@ -12,6 +12,7 @@
 //! hermes gateway                  # platform gateway only (no API)
 //! hermes config                   # configuration management
 //! hermes model                    # model / provider management
+//! hermes providers                # list configured LLM providers
 //! hermes auth                     # authentication (login/logout/status)
 //! hermes tools                    # tool management
 //! hermes mcp                      # MCP server management
@@ -175,9 +176,10 @@ pub enum CliCommand {
     ///   hermes config                   — show full configuration
     ///   hermes config get model         — get a specific config key
     ///   hermes config set model gpt-4o  — set a config key
+    ///   hermes config unset model       — reset a config key to its default
     ///   hermes config set region us-east-1 — set API region
     Config {
-        /// Action: "get", "set", "show", "path", "edit", "check", "migrate".
+        /// Action: "get", "set", "unset", "show", "path", "edit", "check", "migrate".
         action: Option<String>,
         /// Configuration key.
         key: Option<String>,
@@ -199,6 +201,17 @@ pub enum CliCommand {
         sub_action: Option<String>,
         /// Third positional for sub-action arguments.
         sub_arg: Option<String>,
+    },
+
+    /// List configured LLM providers (top-level alias for
+    /// `hermes model provider list`).
+    ///
+    /// Examples:
+    ///   hermes providers                — list providers
+    ///   hermes providers list           — list providers
+    Providers {
+        /// Action: "list" (default), "set <name>", or "status".
+        action: Option<String>,
     },
 
     /// Authentication management (login, logout, status).
@@ -223,9 +236,16 @@ pub enum CliCommand {
 
     // ── Tools & Extensions ──────────────────────────────────────────
     /// List or manage available tools.
+    ///
+    /// Examples:
+    ///   hermes tools                    — list tools
+    ///   hermes tools disable web_search — disable a tool (persisted in config)
+    ///   hermes tools enable web_search  — re-enable a tool
     Tools {
         /// Action: "list", "enable <name>", or "disable <name>".
         action: Option<String>,
+        /// Tool name (for enable/disable).
+        name: Option<String>,
     },
 
     /// MCP server management.
@@ -267,10 +287,11 @@ pub enum CliCommand {
     ///
     /// Examples:
     ///   hermes sessions                 — list sessions
+    ///   hermes sessions show --id abc   — show a session's summary + messages
     ///   hermes sessions export --id abc — export a session
     ///   hermes sessions stats           — usage analytics
     Sessions {
-        /// Action: list/export/delete/prune/stats/rename/browse/dump.
+        /// Action: list/show/export/delete/prune/stats/rename/browse/dump.
         action: Option<String>,
         /// Session ID.
         #[arg(long)]
@@ -290,11 +311,19 @@ pub enum CliCommand {
     ///   hermes memory setup             — run setup wizard
     ///   hermes memory setup redis       — configure redis
     ///   hermes memory off               — disable memory provider
+    ///   hermes memory remember "prefers dark mode" — save a memory note
+    ///   hermes memory recall "dark mode" — search memory notes
+    ///   hermes memory forget "dark mode" — delete matching memory notes
     Memory {
-        /// Action: setup/status/off.
+        /// Action: setup/status/off/remember/recall/forget.
         action: Option<String>,
-        /// Provider name (e.g. "redis", "qdrant", "mem0").
-        provider: Option<String>,
+        /// Action argument: provider name (setup), or query text
+        /// (remember/recall/forget).
+        arg: Option<String>,
+        /// Memory store for remember/recall/forget: "memory" (agent notes,
+        /// default), "user" (user profile), or "all" (recall/forget only).
+        #[arg(long, default_value = "memory")]
+        target: String,
     },
 
     /// Cron job management.
@@ -304,12 +333,21 @@ pub enum CliCommand {
         /// Job id.
         #[arg(long)]
         id: Option<String>,
-        /// Cron schedule (create), e.g. "0 9 * * *".
+        /// Cron schedule (create), e.g. "0 9 * * *". Also accepts
+        /// "every 15m", "daily", "at 2030-01-01T09:00:00+08:00", etc.
         #[arg(long)]
         schedule: Option<String>,
         /// Prompt text (create).
         #[arg(long)]
         prompt: Option<String>,
+        /// IANA timezone for the schedule's wall-clock (create),
+        /// e.g. "Asia/Makassar". Default: system-local timezone.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// Overlap policy when a tick arrives while the previous run is
+        /// still in flight (create): "skip" (default) or "allow".
+        #[arg(long)]
+        overlap: Option<String>,
     },
 
     /// ACP (Agent Communication Protocol) server.
@@ -326,7 +364,14 @@ pub enum CliCommand {
     Doctor,
 
     /// Show running status (active sessions, model, uptime).
-    Status,
+    Status {
+        /// Show the full detail section (config path, log sizes, disabled tools).
+        #[arg(long)]
+        full: bool,
+        /// Deep checks (implies --full): verify provider credentials.
+        #[arg(long)]
+        deep: bool,
+    },
 
     /// Show recent logs.
     Logs {
@@ -336,6 +381,13 @@ pub enum CliCommand {
         /// Tail the log file in real-time.
         #[arg(short, long)]
         follow: bool,
+        /// List available log files instead of showing log content.
+        #[arg(long)]
+        list: bool,
+        /// Which log to read (default: hermes.log). Accepts a bare name
+        /// ("gateway") or a file name ("gateway.log").
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Profile management (list, switch, create).
@@ -445,6 +497,64 @@ mod tests {
     }
 
     #[test]
+    fn cli_parse_cron_create_with_timezone_and_overlap() {
+        let cli = Cli::try_parse_from(vec![
+            "hermes",
+            "cron",
+            "create",
+            "--schedule",
+            "every 15m",
+            "--prompt",
+            "say hi",
+            "--timezone",
+            "Asia/Makassar",
+            "--overlap",
+            "allow",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::Cron {
+                action,
+                schedule,
+                prompt,
+                timezone,
+                overlap,
+                ..
+            }) => {
+                assert_eq!(action.as_deref(), Some("create"));
+                assert_eq!(schedule.as_deref(), Some("every 15m"));
+                assert_eq!(prompt.as_deref(), Some("say hi"));
+                assert_eq!(timezone.as_deref(), Some("Asia/Makassar"));
+                assert_eq!(overlap.as_deref(), Some("allow"));
+            }
+            _ => panic!("Expected Cron command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_cron_defaults_without_new_flags() {
+        let cli = Cli::try_parse_from(vec![
+            "hermes",
+            "cron",
+            "create",
+            "--schedule",
+            "0 9 * * *",
+            "--prompt",
+            "x",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::Cron {
+                timezone, overlap, ..
+            }) => {
+                assert_eq!(timezone, None);
+                assert_eq!(overlap, None);
+            }
+            _ => panic!("Expected Cron command"),
+        }
+    }
+
+    #[test]
     fn cli_parse_config_set() {
         let cli = Cli::try_parse_from(vec!["hermes", "config", "set", "model", "gpt-4o"]).unwrap();
         match cli.command {
@@ -454,6 +564,156 @@ mod tests {
                 assert_eq!(value.as_deref(), Some("gpt-4o"));
             }
             _ => panic!("Expected Config command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_config_unset() {
+        let cli = Cli::try_parse_from(vec!["hermes", "config", "unset", "personality"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Config { action, key, value }) => {
+                assert_eq!(action.as_deref(), Some("unset"));
+                assert_eq!(key.as_deref(), Some("personality"));
+                assert!(value.is_none());
+            }
+            _ => panic!("Expected Config command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_providers_list() {
+        let cli = Cli::try_parse_from(vec!["hermes", "providers", "list"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Providers { action }) => {
+                assert_eq!(action.as_deref(), Some("list"));
+            }
+            _ => panic!("Expected Providers command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_providers_default_action() {
+        let cli = Cli::try_parse_from(vec!["hermes", "providers"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Providers { action }) => {
+                assert!(action.is_none());
+            }
+            _ => panic!("Expected Providers command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_status_full_deep() {
+        let cli = Cli::try_parse_from(vec!["hermes", "status", "--full", "--deep"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Status { full, deep }) => {
+                assert!(full);
+                assert!(deep);
+            }
+            _ => panic!("Expected Status command"),
+        }
+
+        let cli = Cli::try_parse_from(vec!["hermes", "status"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Status { full, deep }) => {
+                assert!(!full);
+                assert!(!deep);
+            }
+            _ => panic!("Expected Status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_logs_list_and_name() {
+        let cli =
+            Cli::try_parse_from(vec!["hermes", "logs", "--list", "--name", "gateway"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Logs {
+                lines,
+                follow,
+                list,
+                name,
+            }) => {
+                assert_eq!(lines, 20);
+                assert!(!follow);
+                assert!(list);
+                assert_eq!(name.as_deref(), Some("gateway"));
+            }
+            _ => panic!("Expected Logs command"),
+        }
+
+        // Positional line count still parses.
+        let cli = Cli::try_parse_from(vec!["hermes", "logs", "50", "-f"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Logs {
+                lines,
+                follow,
+                list,
+                ..
+            }) => {
+                assert_eq!(lines, 50);
+                assert!(follow);
+                assert!(!list);
+            }
+            _ => panic!("Expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_tools_enable_disable() {
+        let cli = Cli::try_parse_from(vec!["hermes", "tools", "disable", "web_search"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Tools { action, name }) => {
+                assert_eq!(action.as_deref(), Some("disable"));
+                assert_eq!(name.as_deref(), Some("web_search"));
+            }
+            _ => panic!("Expected Tools command"),
+        }
+
+        let cli = Cli::try_parse_from(vec!["hermes", "tools", "enable", "web_search"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Tools { action, name }) => {
+                assert_eq!(action.as_deref(), Some("enable"));
+                assert_eq!(name.as_deref(), Some("web_search"));
+            }
+            _ => panic!("Expected Tools command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_memory_recall_target() {
+        let cli = Cli::try_parse_from(vec![
+            "hermes",
+            "memory",
+            "recall",
+            "dark mode",
+            "--target",
+            "user",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::Memory {
+                action,
+                arg,
+                target,
+            }) => {
+                assert_eq!(action.as_deref(), Some("recall"));
+                assert_eq!(arg.as_deref(), Some("dark mode"));
+                assert_eq!(target, "user");
+            }
+            _ => panic!("Expected Memory command"),
+        }
+    }
+
+    #[test]
+    fn cli_parse_sessions_show() {
+        let cli = Cli::try_parse_from(vec!["hermes", "sessions", "show", "--id", "abc"]).unwrap();
+        match cli.command {
+            Some(CliCommand::Sessions { action, id, .. }) => {
+                assert_eq!(action.as_deref(), Some("show"));
+                assert_eq!(id.as_deref(), Some("abc"));
+            }
+            _ => panic!("Expected Sessions command"),
         }
     }
 
@@ -568,9 +828,9 @@ mod tests {
     fn cli_parse_memory_with_provider() {
         let cli = Cli::try_parse_from(vec!["hermes", "memory", "setup", "redis"]).unwrap();
         match cli.command {
-            Some(CliCommand::Memory { action, provider }) => {
+            Some(CliCommand::Memory { action, arg, .. }) => {
                 assert_eq!(action.as_deref(), Some("setup"));
-                assert_eq!(provider.as_deref(), Some("redis"));
+                assert_eq!(arg.as_deref(), Some("redis"));
             }
             _ => panic!("Expected Memory command"),
         }
