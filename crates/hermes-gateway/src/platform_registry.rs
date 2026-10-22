@@ -159,6 +159,9 @@ pub async fn register_platforms(
                 } else if let Some(token) = hermes_config::platform_token_or_extra(platform_cfg) {
                     use crate::platforms::telegram::{TelegramAdapter, TelegramConfig};
 
+                    // Config-file allowlist: union of the first-class
+                    // `allowed_users` field and `extra["allowed_users"]`.
+                    let cfg_allowed = platform_cfg.allowed_users_union();
                     let telegram_config = TelegramConfig {
                         token,
                         webhook_url: hermes_config::extra_string(platform_cfg, "webhook_url"),
@@ -168,6 +171,11 @@ pub async fn register_platforms(
                         parse_html: false,
                         poll_timeout: 30,
                         bot_username: hermes_config::extra_string(platform_cfg, "bot_username"),
+                        allowed_users: if cfg_allowed.is_empty() {
+                            None
+                        } else {
+                            Some(cfg_allowed)
+                        },
                     };
                     match TelegramAdapter::new(telegram_config) {
                         Ok(adapter) => {

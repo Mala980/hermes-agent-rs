@@ -824,6 +824,13 @@ async fn run_gateway_setup(cli: &Cli) -> Result<(), AgentError> {
                 if !home.trim().is_empty() {
                     tg.home_channel = Some(home.trim().to_string());
                 }
+                let allowed = prompt_line(
+                    "Allowed Telegram user IDs (comma-separated, blank = use env / deny-all): ",
+                )
+                .await?;
+                if !allowed.trim().is_empty() {
+                    tg.allowed_users = parse_csv_list(&allowed);
+                }
             }
             other => configure_platform_basic_prompts(&mut disk, other).await?,
         }
@@ -956,6 +963,20 @@ mod tests {
             DmManager::with_pair_behavior(),
             hermes_gateway::gateway::GatewayConfig::default(),
         ))
+    }
+
+    #[test]
+    fn parse_csv_list_parses_allowed_user_ids() {
+        // Wizard parsing for telegram `allowed_users`: trims, drops empties.
+        assert_eq!(
+            parse_csv_list("123, 456 ,789"),
+            vec!["123", "456", "789"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert!(parse_csv_list("").is_empty());
+        assert!(parse_csv_list("  , , ").is_empty());
     }
 
     #[test]
