@@ -379,6 +379,53 @@ impl TelegramAdapter {
         &self.config
     }
 
+    /// Register the bot's / command menu via `setMyCommands`.
+    ///
+    /// Mirrors the original's `_register_command_menu`: exposes the gateway's
+    /// slash commands in Telegram's UI. Best-effort — failures are returned
+    /// so the caller can log them, but must not fail startup.
+    pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
+        // Keep in sync with `crate::commands::dispatch_builtin_command`.
+        // (command, description) pairs shown in Telegram's / menu.
+        const COMMANDS: &[(&str, &str)] = &[
+            ("new", "Start a new conversation"),
+            ("reset", "Reset the current session"),
+            ("retry", "Retry the last message"),
+            ("model", "Show or switch model"),
+            ("personality", "Show or switch personality"),
+            ("approve", "Approve a user (admin)"),
+            ("deny", "Deny a user (admin)"),
+            ("compress", "Compress context"),
+            ("usage", "Show token usage"),
+            ("stop", "Stop the agent"),
+            ("status", "Show session status"),
+            ("provider", "Show or switch provider"),
+            ("profile", "Show or switch profile"),
+            ("verbose", "Toggle verbose mode"),
+            ("yolo", "Toggle auto-approve mode"),
+            ("help", "Show available commands"),
+        ];
+
+        let commands: Vec<serde_json::Value> = COMMANDS
+            .iter()
+            .map(|(cmd, desc)| serde_json::json!({ "command": cmd, "description": desc }))
+            .collect();
+
+        let url = format!("{}/setMyCommands", self.api_base);
+        let body = serde_json::json!({ "commands": commands });
+        let resp: TelegramResponse<serde_json::Value> = self.post_json(&url, &body).await?;
+
+        if resp.ok {
+            tracing::info!("Telegram setMyCommands OK ({} commands)", COMMANDS.len());
+        } else {
+            tracing::warn!(
+                "Telegram setMyCommands returned ok=false: {:?}",
+                resp.description
+            );
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Sending messages
     // -----------------------------------------------------------------------
@@ -1186,6 +1233,11 @@ impl PlatformAdapter for TelegramAdapter {
             &self.config.token[..8.min(self.config.token.len())]
         );
         self.base.mark_running();
+        // Register the / command menu so users see available commands
+        // (mirrors the original's setMyCommands). Best-effort: never fail startup.
+        if let Err(e) = self.register_command_menu().await {
+            tracing::warn!("Telegram setMyCommands failed: {e}");
+        }
         Ok(())
     }
 
