@@ -51,18 +51,6 @@ pub struct WeComCallbackConfig {
     pub proxy: AdapterProxyConfig,
 }
 
-impl Default for WeComCallbackConfig {
-    fn default() -> Self {
-        Self {
-            host: default_host(),
-            port: default_port(),
-            path: default_path(),
-            apps: Vec::new(),
-            proxy: AdapterProxyConfig::default(),
-        }
-    }
-}
-
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -619,6 +607,7 @@ async fn handle_callback_request(
                         text,
                         message_id: Some(msg_id),
                         is_dm: true,
+                        thread_id: None,
                     })
                     .await;
             }

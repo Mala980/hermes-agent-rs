@@ -993,6 +993,7 @@ impl WeChatAdapter {
                 Some(msg_id)
             },
             is_dm: chat_type == "dm",
+            thread_id: None,
         };
         if let Some(tx) = inner.inbound_tx.read().await.clone() {
             tokio::spawn(async move {
