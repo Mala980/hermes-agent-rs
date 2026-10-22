@@ -90,6 +90,11 @@ pub struct IncomingMessage {
     pub text: String,
     /// Platform-specific message ID (for reply threading).
     pub message_id: Option<String>,
+    /// Forum topic/thread the message arrived in (e.g. Telegram's
+    /// `message_thread_id`, as a string). `None` for DMs, regular groups,
+    /// and platforms without topic support. Replies should target the same
+    /// thread via `PlatformAdapter::send_message_threaded`.
+    pub thread_id: Option<String>,
     /// Whether this is a DM (direct message) or group message.
     pub is_dm: bool,
 }
@@ -459,8 +464,7 @@ impl Gateway {
                 DmDecision::Pair { message } => {
                     // Send pairing message and return
                     if let Some(msg) = message {
-                        self.send_message(&incoming.platform, &incoming.chat_id, &msg, None)
-                            .await?;
+                        self.send_reply(incoming, &msg, None).await?;
                     }
                     return Ok(());
                 }
@@ -528,11 +532,16 @@ impl Gateway {
         // 4b. Keep-typing indicator: Telegram's bubble expires after ~5s, so
         // refresh every 4s while the agent works. Aborted when processing ends.
         // Fire-and-forget per tick; send_typing itself never fails loudly.
+        // M-G5: pass the forum thread so the bubble appears in the topic the
+        // user wrote in, not in the forum's General topic.
         let typing_handle = self.get_adapter(&incoming.platform).await.map(|adapter| {
             let chat_id = incoming.chat_id.clone();
+            let thread_id = incoming.thread_id.clone();
             tokio::spawn(async move {
                 loop {
-                    let _ = adapter.send_typing(&chat_id).await;
+                    let _ = adapter
+                        .send_typing_threaded(&chat_id, thread_id.as_deref())
+                        .await;
                     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 }
             })
@@ -585,8 +594,7 @@ impl Gateway {
             GatewayCommandResult::Reply(text)
             | GatewayCommandResult::ShowHelp(text)
             | GatewayCommandResult::Unknown(text) => {
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ResetSession(reply) => {
@@ -601,16 +609,14 @@ impl Gateway {
                     hook_payloads::session_lifecycle_from_incoming(incoming, session_key),
                 )
                 .await;
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchModel { model, reply } => {
                 let mut states = self.runtime_state.write().await;
                 states.entry(session_key.to_string()).or_default().model = Some(model);
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchPersonality { name, reply } => {
@@ -620,28 +626,21 @@ impl Gateway {
                     .or_default()
                     .personality = Some(name);
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ApproveUser { user_id } => {
                 let mut dm = self.dm_manager.write().await;
                 if !dm.is_admin(&incoming.user_id) {
                     drop(dm);
-                    self.send_message(
-                        &incoming.platform,
-                        &incoming.chat_id,
-                        "🚫 /approve requires admin privileges.",
-                        None,
-                    )
-                    .await?;
+                    self.send_reply(incoming, "🚫 /approve requires admin privileges.", None)
+                        .await?;
                     return Ok(true);
                 }
                 dm.authorize_user(user_id.clone());
                 drop(dm);
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!("✅ User '{}' has been approved for DM access.", user_id),
                     None,
                 )
@@ -652,20 +651,14 @@ impl Gateway {
                 let mut dm = self.dm_manager.write().await;
                 if !dm.is_admin(&incoming.user_id) {
                     drop(dm);
-                    self.send_message(
-                        &incoming.platform,
-                        &incoming.chat_id,
-                        "🚫 /deny requires admin privileges.",
-                        None,
-                    )
-                    .await?;
+                    self.send_reply(incoming, "🚫 /deny requires admin privileges.", None)
+                        .await?;
                     return Ok(true);
                 }
                 dm.deauthorize_user(&user_id);
                 drop(dm);
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!("⛔ User '{}' has been removed from DM allowlist.", user_id),
                     None,
                 )
@@ -678,26 +671,22 @@ impl Gateway {
                         let _ = self.background_tasks.cancel(&task_id);
                     }
                 }
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ShowUsage(_) => {
                 let text = self.build_usage_text(session_key).await;
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::CompressContext(_) => {
                 let removed = self.compress_context(session_key, 24).await;
                 let reply = format!("📦 Context compressed. Removed {} old messages.", removed);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ShowInsights(text) => {
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ToggleVerbose(_) => {
@@ -709,8 +698,7 @@ impl Gateway {
                     if state.verbose { "ON" } else { "OFF" }
                 );
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ToggleYolo(_) => {
@@ -719,8 +707,7 @@ impl Gateway {
                 state.yolo = !state.yolo;
                 let reply = format!("🤠 YOLO mode: {}", if state.yolo { "ON" } else { "OFF" });
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SetHome { path, reply } => {
@@ -732,14 +719,12 @@ impl Gateway {
                 } else {
                     format!("❌ Path not found or not a directory: {}", path)
                 };
-                self.send_message(&incoming.platform, &incoming.chat_id, &response, None)
-                    .await?;
+                self.send_reply(incoming, &response, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ShowStatus(_) => {
                 let text = self.build_status_text(session_key).await;
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ReloadMcp => {
@@ -747,9 +732,8 @@ impl Gateway {
                 *generation += 1;
                 let current = *generation;
                 drop(generation);
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!("🔄 MCP registry reloaded (generation {}).", current),
                     None,
                 )
@@ -760,16 +744,14 @@ impl Gateway {
                 let mut states = self.runtime_state.write().await;
                 states.entry(session_key.to_string()).or_default().provider = Some(provider);
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchProfile { profile, reply } => {
                 let mut states = self.runtime_state.write().await;
                 states.entry(session_key.to_string()).or_default().profile = Some(profile);
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchBranch { branch } => {
@@ -791,8 +773,7 @@ impl Gateway {
                         format!("🌿 Current branch context: {}", branch)
                     }
                 };
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::Rollback { steps } => {
@@ -809,9 +790,8 @@ impl Gateway {
                         break;
                     }
                 }
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!("↪️ Rolled back {} message(s).", removed),
                     None,
                 )
@@ -846,8 +826,7 @@ impl Gateway {
                     if state.reasoning { "ON" } else { "OFF" }
                 );
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchFast(_) => {
@@ -855,13 +834,8 @@ impl Gateway {
                 states.entry(session_key.to_string()).or_default().model =
                     Some("openai:gpt-4o-mini".to_string());
                 drop(states);
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
-                    "⚡ Fast model enabled: openai:gpt-4o-mini",
-                    None,
-                )
-                .await?;
+                self.send_reply(incoming, "⚡ Fast model enabled: openai:gpt-4o-mini", None)
+                    .await?;
                 Ok(true)
             }
             GatewayCommandResult::Retry => {
@@ -873,13 +847,8 @@ impl Gateway {
                     messages.pop();
                 }
                 if messages.is_empty() {
-                    self.send_message(
-                        &incoming.platform,
-                        &incoming.chat_id,
-                        "No previous message to retry.",
-                        None,
-                    )
-                    .await?;
+                    self.send_reply(incoming, "No previous message to retry.", None)
+                        .await?;
                     return Ok(true);
                 }
                 self.session_manager
@@ -907,8 +876,7 @@ impl Gateway {
                 } else {
                     format!("↩️ Removed {} message(s) from current session.", removed)
                 };
-                self.send_message(&incoming.platform, &incoming.chat_id, &reply, None)
-                    .await?;
+                self.send_reply(incoming, &reply, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ListTools { filter } => {
@@ -920,14 +888,12 @@ impl Gateway {
                     "🔧 Tools{}.\nRegistered MCP tools are resolved at runtime after reload.",
                     suffix
                 );
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::EnableTool { name } => {
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!(
                         "✅ Tool enabled: `{}` (effective on next agent turn).",
                         name
@@ -938,9 +904,8 @@ impl Gateway {
                 Ok(true)
             }
             GatewayCommandResult::DisableTool { name } => {
-                self.send_message(
-                    &incoming.platform,
-                    &incoming.chat_id,
+                self.send_reply(
+                    incoming,
                     &format!(
                         "⛔ Tool disabled: `{}` (effective on next agent turn).",
                         name
@@ -976,8 +941,7 @@ impl Gateway {
                     out.push_str("\nUse `/sessions <key or id>` to switch.");
                     out
                 };
-                self.send_message(&incoming.platform, &incoming.chat_id, &text, None)
-                    .await?;
+                self.send_reply(incoming, &text, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::SwitchSession { session_id } => {
@@ -1005,8 +969,7 @@ impl Gateway {
                         session_id
                     )
                 };
-                self.send_message(&incoming.platform, &incoming.chat_id, &msg, None)
-                    .await?;
+                self.send_reply(incoming, &msg, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::ShowBudget { new_budget } => {
@@ -1025,8 +988,7 @@ impl Gateway {
                     },
                 };
                 drop(states);
-                self.send_message(&incoming.platform, &incoming.chat_id, &msg, None)
-                    .await?;
+                self.send_reply(incoming, &msg, None).await?;
                 Ok(true)
             }
             GatewayCommandResult::Noop => Ok(true),
@@ -1088,8 +1050,7 @@ impl Gateway {
             .await;
 
         // Send response back to the platform
-        self.send_message(&incoming.platform, &incoming.chat_id, &response, None)
-            .await?;
+        self.send_reply(incoming, &response, None).await?;
         self.flush_post_delivery_messages(
             &incoming.platform,
             &incoming.chat_id,
@@ -1150,13 +1111,19 @@ impl Gateway {
             ))
         })?;
         let placeholder_id: Option<i64> = stream_adapter
-            .send_message_raw(&incoming.chat_id, "...", None)
+            .send_message_raw_threaded(
+                &incoming.chat_id,
+                "...",
+                None,
+                incoming.thread_id.as_deref(),
+            )
             .await?
             .into_iter()
             .next();
         let edit_state = StreamEditState {
             adapter: stream_adapter,
             chat_id: incoming.chat_id.clone(),
+            thread_id: incoming.thread_id.clone(),
             placeholder_id,
             last_sent_text: Arc::new(StdMutex::new("...".to_string())),
             finalized: Arc::new(AtomicBool::new(false)),
@@ -1474,8 +1441,7 @@ impl Gateway {
                 }
                 out
             };
-            self.send_message(&incoming.platform, &incoming.chat_id, &summary, None)
-                .await?;
+            self.send_reply(incoming, &summary, None).await?;
             return Ok(true);
         }
         if let Some(task_id) = trimmed.strip_prefix("cancel ").map(str::trim) {
@@ -1485,8 +1451,7 @@ impl Gateway {
             } else {
                 format!("Task {} was not running or not found", task_id)
             };
-            self.send_message(&incoming.platform, &incoming.chat_id, &msg, None)
-                .await?;
+            self.send_reply(incoming, &msg, None).await?;
             return Ok(true);
         }
         if let Some(task_id) = trimmed.strip_prefix("status ").map(str::trim) {
@@ -1503,8 +1468,7 @@ impl Gateway {
                 Some(TaskStatus::Cancelled) => format!("Task {} was cancelled", task_id),
                 None => format!("Task {} not found", task_id),
             };
-            self.send_message(&incoming.platform, &incoming.chat_id, &msg, None)
-                .await?;
+            self.send_reply(incoming, &msg, None).await?;
             return Ok(true);
         }
 
@@ -1526,8 +1490,7 @@ impl Gateway {
                 preview, task_id
             )
         };
-        self.send_message(&incoming.platform, &incoming.chat_id, &ack, None)
-            .await?;
+        self.send_reply(incoming, &ack, None).await?;
 
         let legacy_handler = self.message_handler.read().await.as_ref().cloned();
         let context_handler = self
@@ -1629,6 +1592,35 @@ impl Gateway {
             GatewayError::Platform(format!("No adapter registered for platform: {}", platform))
         })?;
         adapter.send_message(chat_id, text, parse_mode).await
+    }
+
+    /// Reply to an incoming message, preserving its forum topic/thread.
+    ///
+    /// Unlike [`send_message`](Self::send_message), this routes through the
+    /// adapter's `send_message_threaded` so the reply lands in the same
+    /// forum topic the user wrote in (M-G5; e.g. Telegram's
+    /// `message_thread_id`) instead of the chat's default view. Platforms
+    /// without topic support fall back to a plain send (trait default).
+    pub async fn send_reply(
+        &self,
+        incoming: &IncomingMessage,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<(), GatewayError> {
+        let adapter = self.get_adapter(&incoming.platform).await.ok_or_else(|| {
+            GatewayError::Platform(format!(
+                "No adapter registered for platform: {}",
+                incoming.platform
+            ))
+        })?;
+        adapter
+            .send_message_threaded(
+                &incoming.chat_id,
+                text,
+                parse_mode,
+                incoming.thread_id.as_deref(),
+            )
+            .await
     }
 
     /// Edit an existing message on a specific platform chat.
@@ -1943,6 +1935,146 @@ mod tests {
         }
     }
 
+    /// Test adapter that records the thread id passed to
+    /// `send_message_threaded` (M-G5).
+    struct ThreadRecordingAdapter {
+        sent: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for ThreadRecordingAdapter {
+        async fn start(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn send_message(
+            &self,
+            chat_id: &str,
+            text: &str,
+            _parse_mode: Option<ParseMode>,
+        ) -> Result<(), GatewayError> {
+            self.messages(chat_id, text, None);
+            Ok(())
+        }
+
+        async fn send_message_threaded(
+            &self,
+            chat_id: &str,
+            text: &str,
+            _parse_mode: Option<ParseMode>,
+            thread_id: Option<&str>,
+        ) -> Result<(), GatewayError> {
+            self.messages(chat_id, text, thread_id.map(|t| t.to_string()));
+            Ok(())
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _file_path: &str,
+            _caption: Option<&str>,
+        ) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn platform_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    impl ThreadRecordingAdapter {
+        fn messages(&self, chat_id: &str, text: &str, thread_id: Option<String>) {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string(), thread_id));
+        }
+    }
+
+    /// M-G5: `Gateway::send_reply` routes through `send_message_threaded`
+    /// with the incoming message's thread id.
+    #[tokio::test]
+    async fn gateway_send_reply_preserves_forum_thread() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(ThreadRecordingAdapter { sent: sent.clone() });
+
+        let session_mgr = Arc::new(SessionManager::new(SessionConfig::default()));
+        let dm_manager = DmManager::with_ignore_behavior();
+        let gw = Gateway::new(session_mgr, dm_manager, GatewayConfig::default());
+        gw.register_adapter("test", adapter).await;
+
+        let incoming = IncomingMessage {
+            platform: "test".into(),
+            chat_id: "chat1".into(),
+            user_id: "user1".into(),
+            text: "hello".into(),
+            message_id: None,
+            thread_id: Some("7".into()),
+            is_dm: false,
+        };
+
+        gw.send_reply(&incoming, "reply", None)
+            .await
+            .expect("send_reply ok");
+
+        let msgs = sent.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].0, "chat1");
+        assert_eq!(msgs[0].1, "reply");
+        assert_eq!(msgs[0].2, Some("7".to_string()));
+    }
+
+    /// M-G5: the trait default for `send_message_threaded` ignores the
+    /// thread and forwards to `send_message`, so platforms without topic
+    /// support keep working unchanged.
+    #[tokio::test]
+    async fn gateway_send_reply_thread_default_forwards_to_send_message() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(TestAdapter {
+            messages: sent.clone(),
+        });
+
+        let session_mgr = Arc::new(SessionManager::new(SessionConfig::default()));
+        let dm_manager = DmManager::with_ignore_behavior();
+        let gw = Gateway::new(session_mgr, dm_manager, GatewayConfig::default());
+        gw.register_adapter("test", adapter).await;
+
+        let incoming = IncomingMessage {
+            platform: "test".into(),
+            chat_id: "chat1".into(),
+            user_id: "user1".into(),
+            text: "hello".into(),
+            message_id: None,
+            thread_id: Some("7".into()),
+            is_dm: false,
+        };
+
+        gw.send_reply(&incoming, "reply", None)
+            .await
+            .expect("send_reply ok");
+
+        let msgs = sent.lock().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], ("chat1".to_string(), "reply".to_string()));
+    }
+
     #[test]
     fn gateway_config_default() {
         let cfg = GatewayConfig::default();
@@ -1973,6 +2105,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
 
         // Should succeed (deny silently)
@@ -1994,6 +2127,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
 
         // Should fail because no message handler is set
@@ -2014,6 +2148,7 @@ mod tests {
             text: "hello group".into(),
             message_id: None,
             is_dm: false, // Group message, no DM check
+            thread_id: None,
         };
 
         // Should fail because no handler, but DM check is skipped
@@ -2041,6 +2176,7 @@ mod tests {
             text: "/status".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
 
         let result = gw.route_message(&incoming).await;
@@ -2080,6 +2216,7 @@ mod tests {
             text: "/background ping".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&start).await.is_ok());
 
@@ -2106,6 +2243,7 @@ mod tests {
             text: format!("/background status {}", task_id),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&status).await.is_ok());
 
@@ -2133,6 +2271,7 @@ mod tests {
             text: "/approve user2".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&approve).await.is_ok());
 
@@ -2144,6 +2283,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&authorized_dm).await.is_err());
 
@@ -2154,6 +2294,7 @@ mod tests {
             text: "/deny user2".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&deny).await.is_ok());
 
@@ -2165,6 +2306,7 @@ mod tests {
             text: "hello again".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&denied_dm).await.is_ok());
     }
@@ -2189,6 +2331,7 @@ mod tests {
             text: "/provider openrouter".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&provider).await.is_ok());
 
@@ -2199,6 +2342,7 @@ mod tests {
             text: "/profile prod".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&profile).await.is_ok());
 
@@ -2209,6 +2353,7 @@ mod tests {
             text: "/reload_mcp".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&reload).await.is_ok());
 
@@ -2219,6 +2364,7 @@ mod tests {
             text: "/status".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&status).await.is_ok());
 
@@ -2276,6 +2422,7 @@ mod tests {
             text: "/provider openai".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&set_provider).await.is_ok());
 
@@ -2286,6 +2433,7 @@ mod tests {
             text: "/model gpt-4o".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&set_model).await.is_ok());
 
@@ -2296,6 +2444,7 @@ mod tests {
             text: "/profile prod".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&set_profile).await.is_ok());
 
@@ -2306,6 +2455,7 @@ mod tests {
             text: "/branch feature/parity".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&set_branch).await.is_ok());
 
@@ -2316,6 +2466,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&normal).await.is_ok());
 
@@ -2386,6 +2537,7 @@ mod tests {
                 text: cmd.to_string(),
                 message_id: None,
                 is_dm: true,
+                thread_id: None,
             };
             assert!(gw.route_message(&incoming).await.is_ok());
         }
@@ -2397,6 +2549,7 @@ mod tests {
             text: "run".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&normal).await.is_ok());
 
@@ -2461,6 +2614,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2518,6 +2672,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2576,6 +2731,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2627,6 +2783,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2711,6 +2868,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2762,6 +2920,7 @@ mod tests {
             text: "/status".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2800,6 +2959,7 @@ mod tests {
             text: "  /nosuchplugincmd_xyz arg  ".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&incoming).await.is_ok());
 
@@ -2849,6 +3009,7 @@ mod tests {
             text: "hello".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&normal).await.is_ok());
 
@@ -2859,6 +3020,7 @@ mod tests {
             text: "/reset".into(),
             message_id: None,
             is_dm: true,
+            thread_id: None,
         };
         assert!(gw.route_message(&reset).await.is_ok());
 
@@ -2910,6 +3072,7 @@ mod tests {
             text: "hello group".into(),
             message_id: None,
             is_dm: false, // group message: previously bypassed the DM gate entirely
+            thread_id: None,
         };
 
         // Fail-closed: no env set → group message from anyone is skipped
@@ -2960,6 +3123,7 @@ mod tests {
             StreamEditState {
                 adapter: Arc::new(self.clone_inner()),
                 chat_id: "chat1".to_string(),
+                thread_id: None,
                 placeholder_id,
                 last_sent_text: Arc::new(StdMutex::new("...".to_string())),
                 finalized: Arc::new(AtomicBool::new(false)),
