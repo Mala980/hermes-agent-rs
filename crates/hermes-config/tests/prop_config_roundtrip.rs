@@ -9,10 +9,10 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 use hermes_config::{
-    AgentLoopBehaviorConfig, ApprovalConfig, DailyReset, GatewayConfig, IdleReset, PlatformConfig,
-    ProfileConfig, SessionConfig, SessionResetPolicy, SkillsSettings, SmartModelRoutingConfig,
-    StreamingConfig, TerminalConfig, ToolCapabilityConfig, ToolsSettings, TuiConfig,
-    UnauthorizedDmBehavior,
+    AgentLoopBehaviorConfig, ApprovalConfig, DailyReset, DisplayConfig, GatewayConfig, IdleReset,
+    MoaConfig, PlatformConfig, ProfileConfig, SessionConfig, SessionResetPolicy, SkillsSettings,
+    SmartModelRoutingConfig, StreamingConfig, TerminalConfig, ToolCapabilityConfig, ToolsSettings,
+    TuiConfig, UnauthorizedDmBehavior,
 };
 use hermes_core::BudgetConfig;
 
@@ -133,6 +133,9 @@ fn arb_gateway_config() -> impl Strategy<Value = GatewayConfig> {
                 profile: ProfileConfig::default(),
                 agent: AgentLoopBehaviorConfig::default(),
                 tui: TuiConfig::default(),
+                display: DisplayConfig::default(),
+                fallback_providers: Vec::new(),
+                moa: MoaConfig::default(),
                 home_dir: None,
             },
         )
