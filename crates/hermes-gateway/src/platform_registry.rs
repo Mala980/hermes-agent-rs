@@ -271,8 +271,27 @@ pub async fn register_platforms(
                     };
                     match DiscordAdapter::new(discord_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("discord", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // Supervised gateway WS loop: spawn the driver and
+                            // register the adapter with its inbound channel,
+                            // mirroring the telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "discord",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let ws_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                ws_adapter.run_supervised().await;
+                            }));
                             registered.push("discord".to_string());
+                            tracing::info!("Discord supervised gateway loop started");
                         }
                         Err(e) => errors.push(("discord".to_string(), e.to_string())),
                     }
@@ -297,8 +316,23 @@ pub async fn register_platforms(
                     };
                     match SlackAdapter::new(slack_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("slack", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // Socket Mode receive loop: spawn the supervised
+                            // driver and register the adapter with its inbound
+                            // channel, mirroring the telegram pattern. (The
+                            // loop no-ops when socket_mode is disabled.)
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("slack", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let socket_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                socket_adapter.run_socket_loop(inbound_tx).await;
+                            }));
                             registered.push("slack".to_string());
+                            tracing::info!("Slack Socket Mode loop started");
                         }
                         Err(e) => errors.push(("slack".to_string(), e.to_string())),
                     }
@@ -333,8 +367,28 @@ pub async fn register_platforms(
                     };
                     match MatrixAdapter::new(matrix_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("matrix", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // /sync loop: spawn the driver and register the
+                            // adapter with its inbound channel, mirroring the
+                            // telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "matrix",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let sync_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                if let Err(e) = sync_adapter.run_sync_loop(inbound_tx).await {
+                                    tracing::error!("Matrix sync loop failed: {e}");
+                                }
+                            }));
                             registered.push("matrix".to_string());
+                            tracing::info!("Matrix sync loop started");
                         }
                         Err(e) => errors.push(("matrix".to_string(), e.to_string())),
                     }
@@ -364,10 +418,26 @@ pub async fn register_platforms(
                     };
                     match MattermostAdapter::new(mm_cfg) {
                         Ok(adapter) => {
-                            gateway
-                                .register_adapter("mattermost", Arc::new(adapter))
+                            let adapter = Arc::new(adapter);
+                            // WebSocket receive loop: spawn the supervised
+                            // driver and register the adapter with its inbound
+                            // channel, mirroring the telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "mattermost",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
                                 .await;
+                            sidecar_tasks.push(inbound_task);
+                            let ws_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                ws_adapter.run_ws_loop(inbound_tx).await;
+                            }));
                             registered.push("mattermost".to_string());
+                            tracing::info!("Mattermost WebSocket loop started");
                         }
                         Err(e) => errors.push(("mattermost".to_string(), e.to_string())),
                     }
@@ -395,8 +465,26 @@ pub async fn register_platforms(
                     };
                     match SignalAdapter::new(signal_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("signal", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // signal-cli receive poll loop: spawn the driver
+                            // and register the adapter with its inbound
+                            // channel, mirroring the telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "signal",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let poll_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                poll_adapter.run_poll_loop(inbound_tx).await;
+                            }));
                             registered.push("signal".to_string());
+                            tracing::info!("Signal receive poll loop started");
                         }
                         Err(e) => errors.push(("signal".to_string(), e.to_string())),
                     }
@@ -430,14 +518,35 @@ pub async fn register_platforms(
                                     .ok()
                                     .filter(|s| !s.is_empty())
                             }),
+                        webhook_host: hermes_config::extra_string(platform_cfg, "webhook_host"),
+                        webhook_port: platform_cfg
+                            .extra
+                            .get("webhook_port")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u16),
+                        webhook_path: hermes_config::extra_string(platform_cfg, "webhook_path"),
                         proxy: Default::default(),
                     };
                     match WhatsAppAdapter::new(wa_cfg) {
                         Ok(adapter) => {
-                            gateway
-                                .register_adapter("whatsapp", Arc::new(adapter))
+                            let adapter = Arc::new(adapter);
+                            // Inbound webhook server: `start()` binds it and
+                            // forwards verified messages via the inbound
+                            // sender. Register with the inbound channel like
+                            // the weixin pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "whatsapp",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
                                 .await;
+                            sidecar_tasks.push(inbound_task);
                             registered.push("whatsapp".to_string());
+                            tracing::info!("WhatsApp webhook inbound wired");
                         }
                         Err(e) => errors.push(("whatsapp".to_string(), e.to_string())),
                     }
@@ -457,10 +566,24 @@ pub async fn register_platforms(
                     let ding_cfg = DingTalkConfig::from_platform_config(platform_cfg);
                     match DingTalkAdapter::new(ding_cfg) {
                         Ok(adapter) => {
-                            gateway
-                                .register_adapter("dingtalk", Arc::new(adapter))
+                            let adapter = Arc::new(adapter);
+                            // DingTalk is self-driving: `start()` spawns the
+                            // supervised stream loop, which forwards parsed
+                            // callbacks to the gateway via the inbound sender.
+                            // Wire the channel like weixin's inbound pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "dingtalk",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
                                 .await;
+                            sidecar_tasks.push(inbound_task);
                             registered.push("dingtalk".to_string());
+                            tracing::info!("DingTalk stream inbound wired");
                         }
                         Err(e) => errors.push(("dingtalk".to_string(), e.to_string())),
                     }
@@ -489,12 +612,35 @@ pub async fn register_platforms(
                             "verification_token",
                         ),
                         encrypt_key: hermes_config::extra_string(platform_cfg, "encrypt_key"),
+                        webhook_host: hermes_config::extra_string(platform_cfg, "webhook_host"),
+                        webhook_port: platform_cfg
+                            .extra
+                            .get("webhook_port")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u16),
+                        webhook_path: hermes_config::extra_string(platform_cfg, "webhook_path"),
                         proxy: Default::default(),
                     };
                     match FeishuAdapter::new(feishu_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("feishu", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // Inbound event webhook: `start()` binds the
+                            // server and forwards verified message events via
+                            // the inbound sender. Register with the inbound
+                            // channel like the weixin pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "feishu",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
                             registered.push("feishu".to_string());
+                            tracing::info!("Feishu webhook inbound wired");
                         }
                         Err(e) => errors.push(("feishu".to_string(), e.to_string())),
                     }
@@ -538,16 +684,55 @@ pub async fn register_platforms(
         #[cfg(feature = "wecom-callback")]
         if let Some(platform_cfg) = config.platforms.get("wecom_callback") {
             if platform_cfg.enabled {
+                use crate::platforms::wecom_callback::{WeComCallbackAdapter, WeComCallbackConfig};
+
                 if let Some(msg) = fatal_by_platform.remove("wecom_callback") {
                     errors.push(("wecom_callback".to_string(), msg));
                 } else {
-                    // Simplified version - actual implementation would need more setup
-                    // For now, just log that we would set it up
-                    tracing::info!("WeCom callback adapter would be set up here");
-                    errors.push((
-                    "wecom_callback".to_string(),
-                    "wecom_callback adapter requires additional setup (simplified implementation)".to_string(),
-                ));
+                    // `extra["apps"]` is a JSON array of WeComCallbackApp
+                    // objects (name, corp_id, corp_secret, agent_id, token,
+                    // encoding_aes_key).
+                    let apps: Vec<crate::platforms::wecom_callback::WeComCallbackApp> =
+                        platform_cfg
+                            .extra
+                            .get("apps")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                    let mut cb_cfg = WeComCallbackConfig {
+                        apps,
+                        ..Default::default()
+                    };
+                    if let Some(host) = hermes_config::extra_string(platform_cfg, "host") {
+                        cb_cfg.host = host;
+                    }
+                    if let Some(port) = platform_cfg.extra.get("port").and_then(|v| v.as_u64()) {
+                        cb_cfg.port = port as u16;
+                    }
+                    if let Some(path) = hermes_config::extra_string(platform_cfg, "path") {
+                        cb_cfg.path = path;
+                    }
+                    match WeComCallbackAdapter::new(cb_cfg) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            // Self-driving: `start()` spawns the callback
+                            // HTTP server, which forwards decrypted messages
+                            // to the gateway via the inbound sender.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "wecom_callback",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("wecom_callback".to_string());
+                            tracing::info!("WeCom callback inbound wired");
+                        }
+                        Err(e) => errors.push(("wecom_callback".to_string(), e.to_string())),
+                    }
                 }
             }
         }
@@ -577,8 +762,23 @@ pub async fn register_platforms(
                     };
                     match QqBotAdapter::new(qq_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("qqbot", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // Gateway WS loop: spawn the supervised driver
+                            // and register the adapter with its inbound
+                            // channel, mirroring the telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("qqbot", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let ws_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                ws_adapter.run_ws_loop().await;
+                            }));
                             registered.push("qqbot".to_string());
+                            tracing::info!("QQBot gateway loop started");
                         }
                         Err(e) => errors.push(("qqbot".to_string(), e.to_string())),
                     }
@@ -602,14 +802,35 @@ pub async fn register_platforms(
                     let bb_cfg = BlueBubblesConfig {
                         server_url,
                         password,
+                        webhook_host: hermes_config::extra_string(platform_cfg, "webhook_host"),
+                        webhook_port: platform_cfg
+                            .extra
+                            .get("webhook_port")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u16),
+                        webhook_path: hermes_config::extra_string(platform_cfg, "webhook_path"),
                         proxy: Default::default(),
                     };
                     match BlueBubblesAdapter::new(bb_cfg) {
                         Ok(adapter) => {
-                            gateway
-                                .register_adapter("bluebubbles", Arc::new(adapter))
+                            let adapter = Arc::new(adapter);
+                            // Inbound webhook: `start()` binds the server and
+                            // forwards verified message events via the
+                            // inbound sender. Register with the inbound
+                            // channel like the weixin pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "bluebubbles",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
                                 .await;
+                            sidecar_tasks.push(inbound_task);
                             registered.push("bluebubbles".to_string());
+                            tracing::info!("BlueBubbles webhook inbound wired");
                         }
                         Err(e) => errors.push(("bluebubbles".to_string(), e.to_string())),
                     }
@@ -650,8 +871,22 @@ pub async fn register_platforms(
                     };
                     match EmailAdapter::new(email_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("email", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // IMAP poll loop: spawn the driver and register the
+                            // adapter with its inbound channel, mirroring the
+                            // telegram pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("email", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            let poll_adapter = adapter.clone();
+                            sidecar_tasks.push(tokio::spawn(async move {
+                                poll_adapter.run_poll_loop(inbound_tx).await;
+                            }));
                             registered.push("email".to_string());
+                            tracing::info!("Email IMAP poll loop started");
                         }
                         Err(e) => errors.push(("email".to_string(), e.to_string())),
                     }
@@ -680,12 +915,32 @@ pub async fn register_platforms(
                         account_sid,
                         auth_token,
                         from_number,
+                        webhook_host: hermes_config::extra_string(platform_cfg, "webhook_host"),
+                        webhook_port: platform_cfg
+                            .extra
+                            .get("webhook_port")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u16),
+                        webhook_path: hermes_config::extra_string(platform_cfg, "webhook_path"),
+                        webhook_url: hermes_config::extra_string(platform_cfg, "webhook_url"),
                         proxy: Default::default(),
                     };
                     match SmsAdapter::new(sms_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("sms", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            // Inbound Twilio webhook: `start()` binds the
+                            // server and forwards verified SMS via the inbound
+                            // sender. Register with the inbound channel like
+                            // the weixin pattern.
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("sms", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
                             registered.push("sms".to_string());
+                            tracing::info!("SMS webhook inbound wired");
                         }
                         Err(e) => errors.push(("sms".to_string(), e.to_string())),
                     }
