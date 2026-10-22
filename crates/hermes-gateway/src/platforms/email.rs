@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tracing::{debug, info};
 
 use hermes_core::errors::GatewayError;
@@ -100,52 +100,6 @@ impl EmailAdapter {
         })
         .await
         .map_err(|e| GatewayError::Platform(format!("IMAP task join error: {e}")))?
-    }
-
-    /// Clone of the stop `Notify`, signaled by [`EmailAdapter::stop`].
-    ///
-    /// The poll loop ([`EmailAdapter::run_poll_loop`]) selects on this so
-    /// it terminates promptly when the adapter is stopped.
-    pub fn stop_notifier(&self) -> Arc<Notify> {
-        self.stop_signal.clone()
-    }
-
-    /// Run the IMAP poll loop, forwarding each unseen message as a
-    /// platform-agnostic [`crate::gateway::IncomingMessage`] on `tx`.
-    ///
-    /// One [`EmailAdapter::poll_imap`] pass per `poll_interval_secs`, with
-    /// the interval sleep interruptible via the stop signal. The loop ends
-    /// when [`EmailAdapter::stop`] signals, or when the `tx` receiver is
-    /// dropped (the gateway pump task going away).
-    pub async fn run_poll_loop(
-        self: &Arc<Self>,
-        tx: mpsc::Sender<crate::gateway::IncomingMessage>,
-    ) {
-        info!("Email IMAP poll loop started");
-        let interval = std::time::Duration::from_secs(self.config.poll_interval_secs.max(1));
-        loop {
-            match self.poll_imap().await {
-                Ok(messages) => {
-                    for msg in &messages {
-                        if tx.send(msg.clone()).await.is_err() {
-                            info!("Email poll loop stopping (inbound receiver dropped)");
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("Email IMAP poll failed: {e}");
-                }
-            }
-            tokio::select! {
-                _ = self.stop_signal.notified() => {
-                    info!("Email poll loop stopping (stop signaled)");
-                    break;
-                }
-                _ = tokio::time::sleep(interval) => {}
-            }
-        }
-        info!("Email IMAP poll loop stopped");
     }
 }
 
@@ -527,6 +481,7 @@ fn imap_fetch_unseen(
                 },
                 message_id: Some(mid.clone()),
                 is_dm: true,
+                thread_id: None,
             });
         }
     }

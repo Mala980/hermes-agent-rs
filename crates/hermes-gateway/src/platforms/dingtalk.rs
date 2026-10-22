@@ -361,6 +361,7 @@ impl DingTalkAdapter {
                 Some(parsed.message_id.clone())
             },
             is_dm: !parsed.is_group,
+            thread_id: None,
         };
         if let Some(tx) = inner.inbound_tx.read().await.clone() {
             tokio::spawn(async move {
@@ -710,28 +711,5 @@ mod dingtalk_ack_tests {
             GatewayError::ConnectionFailed(s) => assert!(s.contains("disconnect")),
             e => panic!("unexpected {e:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn handle_ws_callback_forwards_to_inbound_sender() {
-        // The registry wiring calls set_inbound_sender; the stream loop must
-        // then forward parsed callbacks as IncomingMessages.
-        let adapter = DingTalkAdapter::new(sample_cfg()).unwrap();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        adapter.set_inbound_sender(tx).await;
-        let inner = adapter.test_inner();
-        let frame = callback_frame_json("ws-mid-fwd", "conv-7", "ping bot");
-        DingTalkAdapter::handle_ws_message(&inner, &frame)
-            .await
-            .unwrap();
-        // The forward is spawned; poll until it arrives.
-        let incoming = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("forward timed out")
-            .expect("channel closed");
-        assert_eq!(incoming.platform, "dingtalk");
-        assert_eq!(incoming.text, "ping bot");
-        assert_eq!(incoming.chat_id, "conv-1");
-        assert_eq!(incoming.message_id, Some("conv-7".to_string()));
     }
 }

@@ -931,6 +931,7 @@ async fn handle_message_send(
         text,
         message_id: Some(message_id),
         is_dm: true,
+        thread_id: None,
     };
     let forwarded = match shared.inbound_tx.read().await.clone() {
         Some(tx) => tx.send(incoming).await.is_ok(),
