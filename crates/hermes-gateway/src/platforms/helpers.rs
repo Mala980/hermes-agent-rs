@@ -269,6 +269,145 @@ pub fn verify_hmac_sha256_signature(secret: &str, body: &[u8], header: &str) -> 
     mac.verify((&expected).into()).is_ok()
 }
 
+/// Constant-time string comparison (no early-exit byte comparison), for
+/// webhook verify-token checks.
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ---------------------------------------------------------------------------
+// Minimal HTTP server helpers for inbound webhook receivers
+// ---------------------------------------------------------------------------
+
+/// One parsed HTTP request: request line, lowercased header pairs, raw body.
+pub type HttpRequest = (String, Vec<(String, String)>, Vec<u8>);
+
+/// Read one HTTP request from `stream`: header block then `Content-Length`
+/// body bytes, bounded by `max_body_bytes`.
+pub async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+    max_body_bytes: usize,
+) -> Result<HttpRequest, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err("connection closed".into());
+        }
+        head.extend_from_slice(&chunk[..n]);
+        if head.len() > 65536 {
+            return Err("request header too large".into());
+        }
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let header_end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .unwrap_or(head.len());
+    let header_text = String::from_utf8_lossy(&head[..header_end]).to_string();
+    let mut lines = header_text.lines();
+    let request_line = lines.next().unwrap_or("").to_string();
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_lowercase(), v.trim().to_string()));
+        }
+    }
+    let content_length: usize = headers
+        .iter()
+        .find(|(k, _)| k == "content-length")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0)
+        .min(max_body_bytes);
+    let mut body = head[header_end..].to_vec();
+    body.truncate(content_length);
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        let take = (content_length - body.len()).min(n);
+        body.extend_from_slice(&chunk[..take]);
+    }
+    Ok((request_line, headers, body))
+}
+
+/// Write a minimal HTTP response on `stream`.
+pub async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncWriteExt;
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Parse a URL query string into key/value pairs.
+pub fn parse_http_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((http_url_decode(k), http_url_decode(v)))
+        })
+        .collect()
+}
+
+/// Minimal percent-decoding for query parameters.
+pub fn http_url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.as_bytes().iter();
+    while let Some(&b) = bytes.next() {
+        if b == b'%' {
+            let hi = bytes.next().copied().unwrap_or(b'0');
+            let lo = bytes.next().copied().unwrap_or(b'0');
+            let hex = |c: u8| match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                b'A'..=b'F' => c - b'A' + 10,
+                _ => 0,
+            };
+            out.push((hex(hi) << 4 | hex(lo)) as char);
+        } else if b == b'+' {
+            out.push(' ');
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 /// Decode a 64-char hex string into 32 bytes; `None` when malformed.
 fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     let bytes = s.as_bytes();
@@ -768,5 +907,36 @@ mod rate_limit_tests {
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1, "no retry expected on success");
+    }
+}
+
+#[cfg(test)]
+mod webhook_http_tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_matches() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "ab"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn parse_http_query_decodes() {
+        let q = parse_http_query("hub.mode=subscribe&hub.verify_token=tok%20123&empty=&x=a+b");
+        let get = |k: &str| q.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("hub.mode").as_deref(), Some("subscribe"));
+        assert_eq!(get("hub.verify_token").as_deref(), Some("tok 123"));
+        assert_eq!(get("x").as_deref(), Some("a b"));
+    }
+
+    #[test]
+    fn http_url_decode_forms() {
+        assert_eq!(http_url_decode("hello%20world"), "hello world");
+        assert_eq!(http_url_decode("a+b"), "a b");
+        assert_eq!(http_url_decode("%2B1555"), "+1555");
+        assert_eq!(http_url_decode("plain"), "plain");
     }
 }
