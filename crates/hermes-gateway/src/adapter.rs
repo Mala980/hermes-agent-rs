@@ -4,6 +4,8 @@
 //! `BasePlatformAdapter` with common fields (token, webhook_url, proxy)
 //! and helper methods shared by all platform adapters.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +36,16 @@ pub struct AdapterProxyConfig {
 // ---------------------------------------------------------------------------
 // BasePlatformAdapter
 // ---------------------------------------------------------------------------
+
+/// Default total-request timeout applied to every adapter HTTP client.
+///
+/// Telegram long-polling holds the `getUpdates` connection for up to the
+/// configured poll timeout (default 30 s). The client timeout must exceed
+/// that hold time with a generous margin (~30 s): a healthy long-poll must
+/// never be killed before Telegram responds, while a genuinely stuck
+/// (half-open TCP) request is still bounded instead of wedging the poll loop
+/// forever with no watchdog.
+pub const HTTP_CLIENT_TIMEOUT_SECS: u64 = 65;
 
 /// Common configuration and helpers shared by all platform adapters.
 ///
@@ -102,6 +114,12 @@ impl BasePlatformAdapter {
             builder = builder.proxy(proxy);
         }
 
+        // Bound every request: long-polling holds the getUpdates connection
+        // for up to the poll timeout (default 30 s), so this must exceed that
+        // hold with margin; without it a half-open TCP connection would wedge
+        // the poll loop forever.
+        builder = builder.timeout(Duration::from_secs(HTTP_CLIENT_TIMEOUT_SECS));
+
         builder.build().map_err(|e| {
             GatewayError::ConnectionFailed(format!("Failed to build HTTP client: {}", e))
         })
@@ -143,6 +161,17 @@ mod tests {
 
     #[test]
     fn base_adapter_build_client_no_proxy() {
+        let base = BasePlatformAdapter::new("token");
+        assert!(base.build_client().is_ok());
+    }
+
+    #[test]
+    fn build_client_sets_bounded_timeout() {
+        // The timeout isn't introspectable on a built Client; this documents
+        // the constant's intent: it must be positive and comfortably larger
+        // than a healthy Telegram long-poll hold (~30 s) so the watchdog
+        // can't kill a legitimate poll.
+        assert!(HTTP_CLIENT_TIMEOUT_SECS >= 60);
         let base = BasePlatformAdapter::new("token");
         assert!(base.build_client().is_ok());
     }

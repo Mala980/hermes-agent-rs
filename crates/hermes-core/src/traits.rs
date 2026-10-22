@@ -82,6 +82,22 @@ pub trait PlatformAdapter: Send + Sync {
         parse_mode: Option<ParseMode>,
     ) -> Result<(), GatewayError>;
 
+    /// Send a text message and return the platform message ids of the
+    /// delivered message(s).
+    ///
+    /// Default implementation sends via [`send_message`] and returns an
+    /// empty id list. Adapters that can report message ids (e.g. Telegram)
+    /// override this so callers can later edit or delete the sent message.
+    async fn send_message_raw(
+        &self,
+        chat_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<Vec<i64>, GatewayError> {
+        self.send_message(chat_id, text, parse_mode).await?;
+        Ok(Vec::new())
+    }
+
     /// Edit an existing message.
     async fn edit_message(
         &self,
@@ -89,6 +105,24 @@ pub trait PlatformAdapter: Send + Sync {
         message_id: &str,
         text: &str,
     ) -> Result<(), GatewayError>;
+
+    /// Delete a previously sent message (best-effort cleanup).
+    ///
+    /// Default is a no-op. Adapters with a delete API (e.g. Telegram's
+    /// `deleteMessage`) override this. Implementations should swallow
+    /// failures (logged at debug) — cleanup must never break delivery.
+    async fn delete_message(&self, _chat_id: &str, _message_id: i64) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    /// Maximum characters the platform accepts in a single message edit.
+    ///
+    /// Default is `usize::MAX` (no known limit). Adapters with a hard cap
+    /// (e.g. Telegram's 4096) override this so streaming can fall back to
+    /// sending split messages when a response is too long for one edit.
+    fn max_edit_chars(&self) -> usize {
+        usize::MAX
+    }
 
     /// Send a file to a chat with an optional caption.
     async fn send_file(
