@@ -469,6 +469,163 @@ pub enum CliCommand {
 
     /// Launch the TUI directly.
     Tui,
+
+    // ── Quick-wins port (NousResearch/hermes-agent parity) ─────────────
+    /// OpenClaw migration helpers (ported from the original).
+    ///
+    /// Examples:
+    ///   hermes claw               — check for legacy OpenClaw artefacts
+    ///   hermes claw migrate       — import OpenClaw settings into Hermes
+    ///   hermes claw cleanup       — remove legacy OpenClaw directories
+    Claw {
+        /// Action: "migrate", "cleanup", or "status" (defaults to "status").
+        action: Option<String>,
+    },
+
+    /// Device pairing management (ported from the original).
+    ///
+    /// Examples:
+    ///   hermes pairing                          — list paired devices
+    ///   hermes pairing approve --device-id <id> — approve a device
+    ///   hermes pairing revoke --device-id <id>  — revoke a device
+    ///   hermes pairing clear-pending             — drop pending requests
+    Pairing {
+        /// Action: "list", "approve", "revoke", or "clear-pending" (defaults to "list").
+        action: Option<String>,
+        /// Device id for "approve" / "revoke".
+        #[arg(long)]
+        device_id: Option<String>,
+    },
+
+    /// List, switch, and tweak skins (ported from the original).
+    ///
+    /// `set` changes ONE color of the active skin in place; editing a
+    /// built-in skin forks it into `<name>-custom.yaml` so the built-in
+    /// stays intact.
+    ///
+    /// Examples:
+    ///   hermes skin                  — list skins
+    ///   hermes skin use ares         — switch to the ares skin
+    ///   hermes skin set ui_accent #FF0000
+    Skin {
+        /// Action: "list", "use", or "set" (defaults to "list").
+        action: Option<String>,
+        /// For "use": the skin name. For "set": the color key (e.g. `ui_accent`).
+        key: Option<String>,
+        /// For "set": the `#rrggbb` value.
+        value: Option<String>,
+        /// Skin override for "set" (defaults to the active skin).
+        #[arg(long)]
+        skin: Option<String>,
+    },
+
+    /// Emergency stop: pause cron/kanban dispatch and new gateway turns.
+    ///
+    /// Writes the ESTOP sentinel at `$HERMES_HOME/ESTOP`; in-flight work is
+    /// never killed. Run `hermes resume` to lift the pause.
+    Pause {
+        /// Optional reason stored in the sentinel and shown to users.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
+    /// Lift the emergency stop set by `hermes pause`.
+    Resume,
+
+    /// Real-profile browsing helpers (ported from the original).
+    ///
+    /// `close-profile` terminates the browser process tree holding your
+    /// default profile so Hermes can copy it — DESTRUCTIVE (unsaved tabs
+    /// in that browser are lost). Run only with the user's explicit OK.
+    Browser {
+        /// Action: "close-profile" (defaults to showing help).
+        action: Option<String>,
+        /// Override the detected default browser
+        /// (chrome/edge/brave/brave-origin/chromium).
+        #[arg(long)]
+        browser: Option<String>,
+    },
+
+    /// Manage the fallback provider chain (ported from the original).
+    ///
+    /// Fallbacks are tried in order when the primary route fails
+    /// (rate-limit, 5xx, connection errors).
+    ///
+    /// Examples:
+    ///   hermes fallback                                    — list the chain
+    ///   hermes fallback add --provider openai --model gpt-4o
+    ///   hermes fallback remove 1
+    ///   hermes fallback clear
+    Fallback {
+        /// Action: "list"/"ls", "add", "remove"/"rm", or "clear" (defaults to "list").
+        action: Option<String>,
+        /// Provider id for "add".
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model name for "add".
+        #[arg(long)]
+        model: Option<String>,
+        /// Base URL override for "add".
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Entry for "remove": 1-based index or provider/model match.
+        target: Option<String>,
+    },
+
+    /// Manage Mixture-of-Agents model presets (ported from the original).
+    ///
+    /// Examples:
+    ///   hermes moa                                             — list presets
+    ///   hermes moa configure --reference openai:gpt-4o --aggregator anthropic:claude-opus-4-6
+    ///   hermes moa delete my-preset
+    Moa {
+        /// Action: "list"/"ls", "configure"/"config", or "delete" (defaults to "list").
+        action: Option<String>,
+        /// Preset name for "configure" / "delete".
+        name: Option<String>,
+        /// Reference model slot for "configure", `provider:model` (repeatable).
+        #[arg(long)]
+        reference: Vec<String>,
+        /// Aggregator model for "configure", `provider:model`.
+        #[arg(long)]
+        aggregator: Option<String>,
+    },
+
+    /// Slack helpers (ported from the original).
+    ///
+    /// Examples:
+    ///   hermes slack manifest                  — print the app manifest JSON
+    ///   hermes slack manifest --write           — write to ~/.hermes/slack-manifest.json
+    ///   hermes slack manifest --slashes-only    — only the slash_commands section
+    Slack {
+        /// Action: "manifest" (defaults to "manifest").
+        action: Option<String>,
+        /// App name for the manifest (default: "Hermes").
+        #[arg(long)]
+        name: Option<String>,
+        /// Short description for the manifest.
+        #[arg(long)]
+        description: Option<String>,
+        /// Long description text.
+        #[arg(long)]
+        long_description: Option<String>,
+        /// Read the long description from a file.
+        #[arg(long)]
+        long_description_file: Option<String>,
+        /// Print only the `slash_commands` section.
+        #[arg(long)]
+        slashes_only: bool,
+        /// Use the agent messaging experience instead of assistant.
+        #[arg(long)]
+        agent_view: bool,
+        /// No assistant/agent messaging experience.
+        #[arg(long)]
+        no_assistant: bool,
+        /// Write the manifest to a file: `--write [path]`
+        /// (bare `--write` uses `~/.hermes/slack-manifest.json`).
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        write: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -948,14 +1105,95 @@ mod tests {
         assert!(Cli::try_parse_from(vec!["hermes", "insights"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "clipboard"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "whatsapp"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "claw"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "lumio"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "region"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "subscription"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "codex-models"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "runtime-provider"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "memory-setup"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "pairing"]).is_err());
+    }
+
+    #[test]
+    fn quick_wins_commands_parse() {
+        // Quick-wins port from NousResearch/hermes-agent.
+        assert!(Cli::try_parse_from(vec!["hermes", "claw"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "claw", "migrate"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "pairing"]).is_ok());
+        assert!(
+            Cli::try_parse_from(vec!["hermes", "pairing", "approve", "--device-id", "abc"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(vec!["hermes", "skin"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "skin", "use", "ares"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "skin", "set", "ui_accent", "#FF0000"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "pause", "--reason", "testing"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "resume"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "browser", "close-profile"]).is_ok());
+        assert!(Cli::try_parse_from(vec![
+            "hermes",
+            "browser",
+            "close-profile",
+            "--browser",
+            "brave"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "fallback", "list"]).is_ok());
+        assert!(Cli::try_parse_from(vec![
+            "hermes",
+            "fallback",
+            "add",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "fallback", "remove", "1"]).is_ok());
+        assert!(Cli::try_parse_from(vec![
+            "hermes",
+            "moa",
+            "configure",
+            "--aggregator",
+            "openai:gpt-4o"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest", "--slashes-only"]).is_ok());
+        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest", "--write"]).is_ok());
+
+        // Field-level checks.
+        let cli = Cli::try_parse_from(vec!["hermes", "claw", "migrate"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Claw { action }) if action.as_deref() == Some("migrate")
+        ));
+        let cli = Cli::try_parse_from(vec![
+            "hermes",
+            "fallback",
+            "add",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(CliCommand::Fallback {
+                action,
+                provider,
+                model,
+                ..
+            }) => {
+                assert_eq!(action.as_deref(), Some("add"));
+                assert_eq!(provider.as_deref(), Some("openai"));
+                assert_eq!(model.as_deref(), Some("gpt-4o"));
+            }
+            _ => panic!("Expected Fallback command"),
+        }
+        let cli = Cli::try_parse_from(vec!["hermes", "pause", "--reason", "testing"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Pause { reason }) if reason.as_deref() == Some("testing")
+        ));
     }
 
     #[test]

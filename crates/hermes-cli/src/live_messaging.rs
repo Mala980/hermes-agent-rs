@@ -272,6 +272,10 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                             .ok()
                             .filter(|s| !s.is_empty())
                     }),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: extra_string(platform_cfg, "webhook_port")
+                        .and_then(|s| s.parse::<u16>().ok()),
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match WhatsAppAdapter::new(wa_cfg) {
@@ -312,6 +316,10 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     app_secret,
                     verification_token: extra_string(platform_cfg, "verification_token"),
                     encrypt_key: extra_string(platform_cfg, "encrypt_key"),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: extra_string(platform_cfg, "webhook_port")
+                        .and_then(|s| s.parse::<u16>().ok()),
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match FeishuAdapter::new(feishu_cfg) {
@@ -382,6 +390,10 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                 let bb_cfg = BlueBubblesConfig {
                     server_url,
                     password,
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: extra_string(platform_cfg, "webhook_port")
+                        .and_then(|s| s.parse::<u16>().ok()),
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match BlueBubblesAdapter::new(bb_cfg) {
@@ -445,6 +457,11 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     account_sid,
                     auth_token,
                     from_number,
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: extra_string(platform_cfg, "webhook_port")
+                        .and_then(|s| s.parse::<u16>().ok()),
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
+                    webhook_url: extra_string(platform_cfg, "webhook_url"),
                     proxy: Default::default(),
                 };
                 match SmsAdapter::new(sms_cfg) {

@@ -65,6 +65,32 @@ pub fn register_builtin_tools_with_approval_mode(
         );
     }
 
+    /// Like `reg`, but with a real availability check (env-gated tools).
+    fn regc(
+        registry: &ToolRegistry,
+        toolset: &str,
+        handler: Arc<dyn ToolHandler>,
+        emoji: &str,
+        env_deps: Vec<String>,
+        check_fn: fn() -> bool,
+    ) {
+        let schema = handler.schema();
+        let name = schema.name.clone();
+        let desc = schema.description.clone();
+        registry.register(
+            name,
+            toolset,
+            schema,
+            handler,
+            Arc::new(check_fn),
+            env_deps,
+            true,
+            desc,
+            emoji,
+            None,
+        );
+    }
+
     // -- Web tools -----------------------------------------------------------
     reg(
         registry,
@@ -718,6 +744,77 @@ pub fn register_builtin_tools_with_approval_mode(
         "📄",
         vec!["FEISHU_APP_ID".to_string(), "FEISHU_APP_SECRET".to_string()],
     );
+    // -- Discord server tools (env-gated: check_fn requires DISCORD_BOT_TOKEN) --
+    regc(
+        registry,
+        "discord",
+        Arc::new(crate::tools::discord::DiscordCoreHandler::new()),
+        "💬",
+        vec!["DISCORD_BOT_TOKEN".to_string()],
+        crate::tools::discord::check_discord_requirements,
+    );
+    regc(
+        registry,
+        "discord_admin",
+        Arc::new(crate::tools::discord::DiscordAdminHandler::new()),
+        "🛡️",
+        vec!["DISCORD_BOT_TOKEN".to_string()],
+        crate::tools::discord::check_discord_requirements,
+    );
+    // -- Feishu Drive comment tools (env-gated: FEISHU_APP_ID + FEISHU_APP_SECRET) --
+    let feishu_env = vec!["FEISHU_APP_ID".to_string(), "FEISHU_APP_SECRET".to_string()];
+    regc(
+        registry,
+        "feishu_drive",
+        Arc::new(crate::tools::feishu_drive::FeishuDriveHandler::list_comments()),
+        "💬",
+        feishu_env.clone(),
+        crate::tools::feishu_drive::check_feishu_drive_requirements,
+    );
+    regc(
+        registry,
+        "feishu_drive",
+        Arc::new(crate::tools::feishu_drive::FeishuDriveHandler::list_comment_replies()),
+        "💬",
+        feishu_env.clone(),
+        crate::tools::feishu_drive::check_feishu_drive_requirements,
+    );
+    regc(
+        registry,
+        "feishu_drive",
+        Arc::new(crate::tools::feishu_drive::FeishuDriveHandler::reply_comment()),
+        "✉️",
+        feishu_env.clone(),
+        crate::tools::feishu_drive::check_feishu_drive_requirements,
+    );
+    regc(
+        registry,
+        "feishu_drive",
+        Arc::new(crate::tools::feishu_drive::FeishuDriveHandler::add_comment()),
+        "✉️",
+        feishu_env,
+        crate::tools::feishu_drive::check_feishu_drive_requirements,
+    );
+    // -- xAI Imagine video edit/extend (env-gated: XAI_API_KEY) ----------------
+    regc(
+        registry,
+        "video_gen",
+        Arc::new(crate::tools::xai_video::XaiVideoHandler::edit()),
+        "🎬",
+        vec!["XAI_API_KEY".to_string()],
+        crate::tools::xai_video::check_xai_video_requirements,
+    );
+    regc(
+        registry,
+        "video_gen",
+        Arc::new(crate::tools::xai_video::XaiVideoHandler::extend()),
+        "🎬",
+        vec!["XAI_API_KEY".to_string()],
+        crate::tools::xai_video::check_xai_video_requirements,
+    );
+    // NOTE: the 5 `yb_*` yuanbao tools from the original are deliberately NOT
+    // ported — they target Tencent's China-only Yuanbao service, which cannot
+    // be verified from this environment (no reachable API, no docs access).
     reg(
         registry,
         "onboarding",
