@@ -329,13 +329,57 @@ pub fn all_commands() -> Vec<CommandInfo> {
     ]
 }
 
+/// Priority order for the Telegram `setMyCommands` menu, mirroring the
+/// original's menu tiers. When the menu cap trims the list, these commands
+/// survive first, in this order; any remaining commands fill the menu
+/// alphabetically.
+pub const TELEGRAM_MENU_PRIORITY: &[&str] = &[
+    "help",
+    "new",
+    "stop",
+    "status",
+    "sessions",
+    "model",
+    "provider",
+    "retry",
+    "undo",
+    "verbose",
+    "usage",
+    "commands",
+    "approve",
+    "deny",
+    "yolo",
+    "personality",
+    "profile",
+    "compress",
+    "reasoning",
+    "tools",
+    "background",
+    "btw",
+    "fast",
+    "reset",
+    "branch",
+    "rollback",
+    "budget",
+    "sethome",
+    "insights",
+    "update",
+];
+
+/// Default cap for the Telegram command menu. The original caps at 60 to keep
+/// the `setMyCommands` payload under Telegram's undocumented ~4KB limit.
+pub const TELEGRAM_MENU_DEFAULT_MAX: usize = 60;
+
 /// Build the (command, description) list for Telegram's `setMyCommands` menu.
 ///
 /// Dynamic: combines builtin [`all_commands`] with any registered
 /// [`SlashCommandExtension`] entries. Names are stripped of the leading `/`
 /// and sanitized for Telegram (lowercase alphanumeric + underscore).
-/// Capped at 100 (Telegram Bot API limit).
-pub fn telegram_menu_commands() -> Vec<(String, String)> {
+///
+/// Ordering: commands in [`TELEGRAM_MENU_PRIORITY`] come first, in
+/// priority-list order (only those actually present); the remaining commands
+/// follow alphabetically. The result is truncated to `max_commands`.
+pub fn telegram_menu_commands(max_commands: usize) -> Vec<(String, String)> {
     fn sanitize(name: &str) -> Option<String> {
         let clean: String = name
             .trim_start_matches('/')
@@ -379,7 +423,25 @@ pub fn telegram_menu_commands() -> Vec<(String, String)> {
     }
 
     out.truncate(100);
-    out
+
+    // Priority tiers (M-C3): priority commands first, in priority-list
+    // order; the remaining commands fill the menu alphabetically. Then
+    // truncate to the caller's cap so the important commands always survive.
+    let (priority, mut rest): (Vec<_>, Vec<_>) = out
+        .into_iter()
+        .partition(|(name, _)| TELEGRAM_MENU_PRIORITY.contains(&name.as_str()));
+    let mut priority = priority;
+    priority.sort_by_key(|(name, _)| {
+        TELEGRAM_MENU_PRIORITY
+            .iter()
+            .position(|p| *p == name.as_str())
+    });
+    rest.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut menu = priority;
+    menu.extend(rest);
+    menu.truncate(max_commands);
+    menu
 }
 
 /// Parse and dispatch a gateway slash command.
@@ -830,7 +892,7 @@ mod tests {
 
     #[test]
     fn telegram_menu_commands_is_dynamic_and_sanitized() {
-        let menu = telegram_menu_commands();
+        let menu = telegram_menu_commands(100);
         assert!(
             menu.len() >= 20,
             "expected 20+ commands, got {}",
@@ -846,5 +908,78 @@ mod tests {
         assert_eq!(names.len(), menu.len(), "duplicate command names in menu");
         assert!(menu.len() <= 100);
         assert!(menu.iter().all(|(n, d)| n.len() <= 32 && !d.is_empty()));
+    }
+
+    #[test]
+    fn telegram_menu_commands_priority_ordering() {
+        let menu = telegram_menu_commands(100);
+        let present: Vec<&str> = TELEGRAM_MENU_PRIORITY
+            .iter()
+            .filter(|p| menu.iter().any(|(n, _)| n == **p))
+            .copied()
+            .collect();
+        assert!(
+            present.len() >= 20,
+            "expected 20+ priority commands present, got {}",
+            present.len()
+        );
+        let head: Vec<&str> = menu
+            .iter()
+            .take(present.len())
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            head, present,
+            "priority commands must lead the menu in priority-list order"
+        );
+    }
+
+    #[test]
+    fn telegram_menu_commands_cap_respected() {
+        // Cap below the number of priority commands: only the top-N
+        // priority entries survive, in priority order.
+        let menu = telegram_menu_commands(5);
+        assert_eq!(menu.len(), 5);
+        let names: Vec<&str> = menu.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["help", "new", "stop", "status", "sessions"]);
+
+        // Cap of zero yields an empty menu.
+        assert!(telegram_menu_commands(0).is_empty());
+    }
+
+    #[test]
+    fn telegram_menu_commands_alphabetical_fill() {
+        let menu = telegram_menu_commands(100);
+        let tail_start = TELEGRAM_MENU_PRIORITY
+            .iter()
+            .filter(|p| menu.iter().any(|(n, _)| n == **p))
+            .count();
+        let tail: Vec<&str> = menu
+            .iter()
+            .skip(tail_start)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        let mut sorted = tail.clone();
+        sorted.sort_unstable();
+        assert_eq!(tail, sorted, "non-priority commands must be alphabetical");
+        assert!(
+            tail.iter().all(|n| !TELEGRAM_MENU_PRIORITY.contains(n)),
+            "no priority command may appear in the alphabetical tail"
+        );
+    }
+
+    #[test]
+    fn telegram_menu_commands_default_cap_is_60() {
+        // The sending path reads TelegramConfig::command_menu_max with a
+        // fallback of TELEGRAM_MENU_DEFAULT_MAX (60, mirroring the original);
+        // assert the menu builder honors that cap.
+        assert_eq!(TELEGRAM_MENU_DEFAULT_MAX, 60);
+        let menu = telegram_menu_commands(TELEGRAM_MENU_DEFAULT_MAX);
+        assert!(menu.len() <= 60);
+        assert!(
+            menu.len() >= 20,
+            "expected 20+ commands under the default cap, got {}",
+            menu.len()
+        );
     }
 }

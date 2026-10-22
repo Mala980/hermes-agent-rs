@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use hermes_core::errors::GatewayError;
 
 use super::error::*;
+use super::sending::REACTION_PROCESSING;
 use super::types::*;
 use super::TelegramAdapter;
 
@@ -366,6 +367,21 @@ impl TelegramAdapter {
             }
         }
 
+        // M-T4: opt-in message reactions — set 👀 when the message is
+        // accepted for processing. Fire-and-forget: failures are logged at
+        // debug inside `set_message_reaction` and never break the inbound
+        // path. Skipped when there is no real message to react to (e.g. a
+        // callback query without an attached message carries id 0).
+        if parsed.message_id > 0 {
+            let _ = self
+                .set_message_reaction(
+                    &parsed.chat_id.to_string(),
+                    parsed.message_id,
+                    REACTION_PROCESSING,
+                )
+                .await;
+        }
+
         tx.send(Self::parsed_to_incoming(&parsed)).await.is_ok()
     }
 }
@@ -375,6 +391,8 @@ mod tests {
     use super::*;
     use crate::platforms::telegram::test_helpers::*;
     use crate::platforms::telegram::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
@@ -421,6 +439,72 @@ mod tests {
         set_test_var("TELEGRAM_ALLOWED_USERS", old_allowed.as_deref());
         set_test_var("GATEWAY_ALLOWED_USERS", old_fallback.as_deref());
         set_test_var("TELEGRAM_ALLOW_ALL_USERS", old_all.as_deref());
+    }
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_sends_eyes_reaction_when_enabled() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = set_open_allowlist_env();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter_with_reactions(&server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // make_dm_text_update builds message_id 100 in chat 900.
+        let update = make_dm_text_update(80, 999, "hi with reactions on");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        rx.try_recv().expect("message must still be forwarded");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(body["chat_id"], serde_json::json!("900"));
+        assert_eq!(body["message_id"], serde_json::json!(100));
+        assert_eq!(body["reaction"][0]["emoji"], serde_json::json!("👀"));
+
+        restore_open_allowlist_env(old);
+    }
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_sends_no_reaction_when_disabled() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = set_open_allowlist_env();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        // Default test adapter: message_reactions=false -> no HTTP traffic.
+        let adapter = mock_server_adapter(&server.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(81, 999, "hi with reactions off");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        rx.try_recv().expect("message must still be forwarded");
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty(), "disabled reactions must send nothing");
+
+        restore_open_allowlist_env(old);
     }
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
