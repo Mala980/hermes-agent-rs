@@ -129,15 +129,27 @@ impl TelegramAdapter {
 
         let is_voice = msg.voice.is_some();
         let voice_file_id = msg.voice.as_ref().map(|v| v.file_id.clone());
+        // C7: the media pipeline caches downloads on `file_unique_id`.
+        let voice_file_unique_id = msg.voice.as_ref().map(|v| v.file_unique_id.clone());
 
         let is_photo = msg.photo.is_some();
         let photo_file_id = msg
             .photo
             .as_ref()
             .and_then(|photos| photos.last().map(|p| p.file_id.clone()));
+        let photo_file_unique_id = msg
+            .photo
+            .as_ref()
+            .and_then(|photos| photos.last().map(|p| p.file_unique_id.clone()));
 
         let is_sticker = msg.sticker.is_some();
         let sticker_file_id = msg.sticker.as_ref().map(|s| s.file_id.clone());
+
+        // C7: inbound documents.
+        let is_document = msg.document.is_some();
+        let document_file_id = msg.document.as_ref().map(|d| d.file_id.clone());
+        let document_file_unique_id = msg.document.as_ref().map(|d| d.file_unique_id.clone());
+        let document_file_name = msg.document.as_ref().and_then(|d| d.file_name.clone());
 
         let reply_to_message_id = msg.reply_to_message.as_ref().map(|r| r.message_id);
 
@@ -168,6 +180,12 @@ impl TelegramAdapter {
             voice_file_id,
             photo_file_id,
             sticker_file_id,
+            voice_file_unique_id,
+            photo_file_unique_id,
+            is_document,
+            document_file_id,
+            document_file_unique_id,
+            document_file_name,
             reply_to_message_id,
             reply_to_text,
             message_thread_id: msg.message_thread_id,
@@ -200,6 +218,12 @@ impl TelegramAdapter {
             voice_file_id: None,
             photo_file_id: None,
             sticker_file_id: None,
+            voice_file_unique_id: None,
+            photo_file_unique_id: None,
+            is_document: false,
+            document_file_id: None,
+            document_file_unique_id: None,
+            document_file_name: None,
             reply_to_message_id: None,
             reply_to_text: None,
             message_thread_id: msg.and_then(|m| m.message_thread_id),
@@ -327,6 +351,7 @@ mod tests {
                 photo: None,
                 caption: None,
                 sticker: None,
+                document: None,
                 reply_to_message: None,
                 sender_chat: None,
                 entities: None,
@@ -367,6 +392,7 @@ mod tests {
                 ]),
                 caption: Some("my photo".into()),
                 sticker: None,
+                document: None,
                 reply_to_message: None,
                 sender_chat: None,
                 entities: None,
@@ -416,6 +442,7 @@ mod tests {
                     emoji: Some("😀".into()),
                     set_name: Some("TestPack".into()),
                 }),
+                document: None,
                 reply_to_message: None,
                 sender_chat: None,
                 entities: None,
@@ -430,6 +457,60 @@ mod tests {
         assert_eq!(incoming.sticker_file_id, Some("sticker_abc".into()));
         assert!(!incoming.is_voice);
         assert!(!incoming.is_photo);
+    }
+    #[test]
+    fn parse_update_document_message() {
+        // C7: documents parse from JSON with file ids, unique ids and the
+        // optional file name.
+        let json = serde_json::json!({
+            "update_id": 11,
+            "message": {
+                "message_id": 101,
+                "chat": {"id": 300, "type": "private"},
+                "from": {"id": 400, "first_name": "Doc"},
+                "document": {
+                    "file_id": "doc_1",
+                    "file_unique_id": "doc_u1",
+                    "file_name": "notes.txt",
+                    "mime_type": "text/plain",
+                    "file_size": 1234
+                },
+                "caption": "read this"
+            }
+        });
+        let update: Update = serde_json::from_value(json).unwrap();
+        let incoming = TelegramAdapter::parse_update(&update).unwrap();
+        assert!(incoming.is_document);
+        assert_eq!(incoming.document_file_id, Some("doc_1".into()));
+        assert_eq!(incoming.document_file_unique_id, Some("doc_u1".into()));
+        assert_eq!(incoming.document_file_name, Some("notes.txt".into()));
+        assert_eq!(incoming.text, Some("read this".into()));
+        assert!(!incoming.is_voice);
+        assert!(!incoming.is_photo);
+        assert!(!incoming.is_sticker);
+    }
+    #[test]
+    fn parse_update_voice_carries_file_unique_id() {
+        // C7: the media pipeline keys downloads on `file_unique_id`, so the
+        // parser must carry it alongside `file_id`.
+        let json = serde_json::json!({
+            "update_id": 12,
+            "message": {
+                "message_id": 102,
+                "chat": {"id": 300, "type": "private"},
+                "from": {"id": 400, "first_name": "Vox"},
+                "voice": {
+                    "file_id": "v_1",
+                    "file_unique_id": "v_u1",
+                    "duration": 7
+                }
+            }
+        });
+        let update: Update = serde_json::from_value(json).unwrap();
+        let incoming = TelegramAdapter::parse_update(&update).unwrap();
+        assert!(incoming.is_voice);
+        assert_eq!(incoming.voice_file_id, Some("v_1".into()));
+        assert_eq!(incoming.voice_file_unique_id, Some("v_u1".into()));
     }
     #[test]
     fn parse_update_callback_query() {
@@ -449,6 +530,7 @@ mod tests {
                     photo: None,
                     caption: None,
                     sticker: None,
+                    document: None,
                     reply_to_message: None,
                     sender_chat: None,
                     entities: None,
@@ -528,6 +610,7 @@ mod tests {
                     photo: None,
                     caption: None,
                     sticker: None,
+                    document: None,
                     reply_to_message: None,
                     sender_chat: None,
                     entities: None,
@@ -612,6 +695,7 @@ mod tests {
             photo: None,
             caption: None,
             sticker: None,
+            document: None,
             reply_to_message: None,
             sender_chat: None,
             entities: None,
@@ -631,6 +715,7 @@ mod tests {
                 photo: None,
                 caption: None,
                 sticker: None,
+                document: None,
                 reply_to_message: Some(Box::new(reply_msg)),
                 sender_chat: None,
                 entities: None,
@@ -819,6 +904,7 @@ mod tests {
             caption: Some("see this".into()),
             caption_entities: Some(vec![text_link(4, 4, "https://cap.example")]),
             sticker: None,
+            document: None,
             reply_to_message: None,
             sender_chat: None,
             entities: None,
@@ -844,6 +930,7 @@ mod tests {
             photo: None,
             caption: None,
             sticker: None,
+            document: None,
             reply_to_message: None,
             sender_chat: None,
             entities: None,
@@ -884,6 +971,7 @@ mod tests {
             photo: None,
             caption: None,
             sticker: None,
+            document: None,
             reply_to_message: None,
             sender_chat: None,
             entities: None,

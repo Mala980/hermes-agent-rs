@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use hermes_core::errors::GatewayError;
 
 use super::error::*;
+use super::media::enrich_media_message;
 use super::sending::REACTION_PROCESSING;
 use super::types::*;
 use super::TelegramAdapter;
@@ -353,6 +354,13 @@ impl TelegramAdapter {
                 );
                 return true;
             }
+        }
+
+        // Inbound media enrichment (C7): voice → transcription, photo →
+        // description, document → text extract, sticker → placeholder.
+        // Best-effort; never breaks the text flow.
+        if self.config.media_enabled {
+            enrich_media_message(self, &mut parsed, update).await;
         }
 
         if let Some(ref callback_query_id) = parsed.callback_query_id {

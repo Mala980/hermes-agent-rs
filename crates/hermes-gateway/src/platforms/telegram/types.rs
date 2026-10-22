@@ -1,5 +1,7 @@
 //! Telegram adapter — Bot API types, TelegramConfig, and shared constants.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use hermes_core::errors::GatewayError;
@@ -8,6 +10,10 @@ use crate::adapter::AdapterProxyConfig;
 
 /// Default long-polling timeout in seconds.
 pub(crate) const DEFAULT_POLL_TIMEOUT: u64 = 30;
+
+/// Default inbound media size cap in MB (M-M1). Mirrors the original's
+/// 20MB cap on the public Bot API (`_max_doc_bytes`).
+pub(crate) const DEFAULT_MEDIA_MAX_MB: usize = 20;
 
 // ---------------------------------------------------------------------------
 // TelegramConfig
@@ -86,10 +92,38 @@ pub struct TelegramConfig {
     /// fails (mirrors the original). Defaults to false (disabled).
     #[serde(default)]
     pub message_reactions: bool,
+
+    /// Override for the inbound media cache directory (M-M1). `None`
+    /// resolves to `{hermes_home}/media_cache` — see
+    /// [`super::media::resolve_cache_dir`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_cache_dir: Option<PathBuf>,
+
+    /// Maximum inbound media file size in megabytes (M-M1). Files larger
+    /// than this are rejected ("too large") before and during the
+    /// download. Defaults to 20 — the public Bot API cap the original
+    /// enforces (`_max_doc_bytes`) unless a local bot API is in use.
+    #[serde(default = "default_media_max_mb")]
+    pub media_max_mb: usize,
+
+    /// Master switch for inbound media processing (M-M1): download +
+    /// forward of photos, voice notes, documents and stickers to the
+    /// agent. Defaults to true.
+    #[serde(default = "default_true")]
+    pub media_enabled: bool,
+
+    /// Transcribe inbound voice notes (STT). Defaults to true, matching
+    /// the original's `stt_enabled=True`.
+    #[serde(default = "default_true")]
+    pub stt_enabled: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_media_max_mb() -> usize {
+    DEFAULT_MEDIA_MAX_MB
 }
 
 fn default_poll_timeout() -> u64 {
@@ -169,6 +203,9 @@ pub struct TelegramMessage {
     pub caption_entities: Option<Vec<MessageEntity>>,
     #[serde(default)]
     pub sticker: Option<Sticker>,
+    /// Inbound document (C7 media pipeline).
+    #[serde(default)]
+    pub document: Option<Document>,
     #[serde(default)]
     pub reply_to_message: Option<Box<TelegramMessage>>,
     #[serde(default)]
@@ -264,6 +301,22 @@ pub struct Sticker {
     pub set_name: Option<String>,
 }
 
+/// Telegram Document object (C7 inbound media pipeline).
+///
+/// `file_id`/`file_unique_id` are always present; `file_name` is optional
+/// (Telegram omits it for unnamed files).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    pub file_unique_id: String,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
 /// Telegram File object (from getFile).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramFile {
@@ -323,6 +376,15 @@ pub struct IncomingMessage {
     pub voice_file_id: Option<String>,
     pub photo_file_id: Option<String>,
     pub sticker_file_id: Option<String>,
+    /// `file_unique_id` companions for the media download pipeline (C7):
+    /// `MediaDownloader::download_file` keys the cache on these.
+    pub voice_file_unique_id: Option<String>,
+    pub photo_file_unique_id: Option<String>,
+    /// Inbound document (C7 media pipeline).
+    pub is_document: bool,
+    pub document_file_id: Option<String>,
+    pub document_file_unique_id: Option<String>,
+    pub document_file_name: Option<String>,
     pub reply_to_message_id: Option<i64>,
     /// First ~500 chars of the replied-to message's text/caption, used as
     /// quote context in the incoming text (M-G4).
@@ -478,6 +540,32 @@ mod tests {
         assert!(sticker.emoji.is_none());
     }
     #[test]
+    fn document_deserialization() {
+        // C7: documents carry file_id/file_unique_id (always) plus
+        // optional file_name/mime_type/file_size.
+        let json = r#"{
+            "file_id": "doc_1",
+            "file_unique_id": "doc_u1",
+            "file_name": "notes.txt",
+            "mime_type": "text/plain",
+            "file_size": 1234
+        }"#;
+        let doc: Document = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.file_id, "doc_1");
+        assert_eq!(doc.file_unique_id, "doc_u1");
+        assert_eq!(doc.file_name, Some("notes.txt".into()));
+        assert_eq!(doc.mime_type, Some("text/plain".into()));
+        assert_eq!(doc.file_size, Some(1234));
+    }
+    #[test]
+    fn document_deserialization_minimal() {
+        let json = r#"{"file_id": "d1", "file_unique_id": "du1"}"#;
+        let doc: Document = serde_json::from_str(json).unwrap();
+        assert_eq!(doc.file_id, "d1");
+        assert!(doc.file_name.is_none());
+        assert!(doc.mime_type.is_none());
+    }
+    #[test]
     fn callback_query_deserialization() {
         let json = r#"{
             "id": "cq_999",
@@ -592,6 +680,13 @@ mod tests {
         assert!(cfg.command_menu_max.is_none());
         // M-T4: reactions are opt-in — default off.
         assert!(!cfg.message_reactions);
+        // M-M1: inbound media defaults mirror the original (20MB public Bot
+        // API cap, media + STT enabled, no cache-dir override).
+        assert!(cfg.media_cache_dir.is_none());
+        assert_eq!(cfg.media_max_mb, DEFAULT_MEDIA_MAX_MB);
+        assert_eq!(cfg.media_max_mb, 20);
+        assert!(cfg.media_enabled);
+        assert!(cfg.stt_enabled);
     }
     #[test]
     fn config_message_reactions_opt_in() {
@@ -604,6 +699,29 @@ mod tests {
         let json = r#"{"token": "abc", "command_menu_max": 25}"#;
         let cfg: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.command_menu_max, Some(25));
+    }
+    #[test]
+    fn config_media_settings() {
+        let json = r#"{
+            "token": "abc",
+            "media_cache_dir": "/tmp/tg-media",
+            "media_max_mb": 50,
+            "media_enabled": false,
+            "stt_enabled": false
+        }"#;
+        let cfg: TelegramConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.media_cache_dir,
+            Some(std::path::PathBuf::from("/tmp/tg-media"))
+        );
+        assert_eq!(cfg.media_max_mb, 50);
+        assert!(!cfg.media_enabled);
+        assert!(!cfg.stt_enabled);
+        // Round-trips back through serialization.
+        let back: TelegramConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert_eq!(back.media_max_mb, 50);
+        assert!(!back.media_enabled);
     }
     #[test]
     fn config_with_bot_username() {
