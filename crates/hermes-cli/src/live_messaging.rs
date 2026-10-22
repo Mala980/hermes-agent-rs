@@ -111,6 +111,13 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     .get("message_reactions")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // M-C2: include skills in the Telegram / command menu.
+                // Defaults to true.
+                let command_menu_skills = platform_cfg
+                    .extra
+                    .get("command_menu_skills")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let telegram_cfg = TelegramConfig {
                     token,
                     webhook_url: platform_cfg.webhook_url.clone(),
@@ -133,6 +140,7 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     group_require_mention: false,
                     command_menu_max: None,
                     message_reactions,
+                    command_menu_skills,
                 };
                 match TelegramAdapter::new(telegram_cfg) {
                     Ok(adapter) => {
