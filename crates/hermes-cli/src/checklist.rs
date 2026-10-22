@@ -200,6 +200,17 @@ fn numbered_fallback(
     initial_selected: &HashSet<usize>,
     status_fn: Option<&dyn Fn(&HashSet<usize>) -> String>,
 ) -> ChecklistResult {
+    // Nothing to choose from: confirm immediately without touching stdin.
+    // (Mirrors the early return in `curses_checklist_inner`; without this,
+    // `read_line` below blocks forever when stdin is not interactive, e.g.
+    // in CI, hanging `cargo test`.)
+    if items.is_empty() {
+        return ChecklistResult {
+            selected: initial_selected.clone(),
+            confirmed: true,
+        };
+    }
+
     let mut chosen = initial_selected.clone();
 
     println!("\n  \x1b[33m{}\x1b[0m", title);
