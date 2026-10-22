@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
@@ -25,6 +25,7 @@ use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 use crate::markdown_split::split_markdown;
 use crate::platforms::helpers::send_with_rate_limit_retry;
 
@@ -449,6 +450,8 @@ pub struct IncomingDiscordMessage {
     pub username: Option<String>,
     pub content: String,
     pub is_bot: bool,
+    /// Guild the message was sent in, if any. `None` means a DM channel.
+    pub guild_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +726,10 @@ pub struct DiscordAdapter {
     /// In-memory set of seen inbound message IDs, used to skip duplicate
     /// MESSAGE_CREATE / MESSAGE_UPDATE events replayed after a reconnect.
     seen_messages: Arc<Mutex<MessageDedup>>,
+    /// Inbound channel to the gateway. Set via
+    /// [`DiscordAdapter::set_inbound_sender`] by the registry; `None` means
+    /// inbound events are parsed but dropped (send-only mode).
+    inbound_tx: Arc<Mutex<Option<mpsc::Sender<IncomingMessage>>>>,
 }
 
 impl DiscordAdapter {
@@ -740,12 +747,73 @@ impl DiscordAdapter {
             client,
             stop_signal: Arc::new(Notify::new()),
             seen_messages: Arc::new(Mutex::new(MessageDedup::new())),
+            inbound_tx: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Get a reference to the configuration.
     pub fn config(&self) -> &DiscordConfig {
         &self.config
+    }
+
+    /// Attach the gateway's inbound channel. Parsed MESSAGE_CREATE events
+    /// are forwarded on it by [`DiscordAdapter::run_supervised`].
+    pub async fn set_inbound_sender(&self, tx: mpsc::Sender<IncomingMessage>) {
+        *self.inbound_tx.lock().await = Some(tx);
+    }
+
+    /// Clone of the stop `Notify`, signaled by [`DiscordAdapter::stop`].
+    pub fn stop_notifier(&self) -> Arc<Notify> {
+        self.stop_signal.clone()
+    }
+
+    /// Convert a parsed MESSAGE_CREATE event into a gateway-level
+    /// [`IncomingMessage`]. Guild channels route on the channel ID; DMs
+    /// (no `guild_id`) are flagged via `is_dm`.
+    pub fn to_incoming(msg: &IncomingDiscordMessage) -> IncomingMessage {
+        IncomingMessage {
+            platform: "discord".into(),
+            chat_id: msg.channel_id.clone(),
+            user_id: msg.user_id.clone().unwrap_or_default(),
+            text: msg.content.clone(),
+            message_id: Some(msg.message_id.clone()),
+            is_dm: msg.guild_id.is_none(),
+        }
+    }
+
+    /// Whether the bot is @-mentioned in `content` (`<@id>` or `<@!id>`
+    /// forms), using the configured application ID.
+    fn mentioned_self(&self, content: &str) -> bool {
+        let Some(app_id) = self.config.application_id.as_deref() else {
+            return false;
+        };
+        content.contains(&format!("<@{app_id}>")) || content.contains(&format!("<@!{app_id}>"))
+    }
+
+    /// Forward a parsed MESSAGE_CREATE event to the inbound channel.
+    ///
+    /// Bot authors (including the bot itself) are always skipped. When
+    /// `require_mention` is set, guild-channel messages must @-mention the
+    /// bot; DMs always pass.
+    async fn forward_message_create(&self, msg: &IncomingDiscordMessage) {
+        if msg.is_bot {
+            return;
+        }
+        if self.config.require_mention
+            && msg.guild_id.is_some()
+            && !self.mentioned_self(&msg.content)
+        {
+            debug!(message_id = %msg.message_id, "Discord: dropping guild message without mention (require_mention)");
+            return;
+        }
+        let tx = self.inbound_tx.lock().await.clone();
+        if let Some(tx) = tx {
+            let incoming = Self::to_incoming(msg);
+            if tx.send(incoming).await.is_err() {
+                debug!("Discord inbound receiver dropped; stopping receive loop");
+                self.base.mark_stopped();
+            }
+        }
     }
 
     /// Return the authorization header value.
@@ -1437,10 +1505,17 @@ impl DiscordAdapter {
                                     GatewayAction::Dispatch(name, data) => {
                                         // Dedup applies to MESSAGE_CREATE /
                                         // MESSAGE_UPDATE; other events pass through.
-                                        if self.dispatch_event(&name, &data).await.is_none() {
-                                            debug!(event = %name, "duplicate dispatch event skipped");
-                                        } else {
-                                            debug!(event = %name, "dispatch event received");
+                                        let event = self.dispatch_event(&name, &data).await;
+                                        match event {
+                                            Some(DispatchEvent::MessageCreate(msg)) => {
+                                                self.forward_message_create(&msg).await;
+                                            }
+                                            Some(_) => {
+                                                debug!(event = %name, "dispatch event received");
+                                            }
+                                            None => {
+                                                debug!(event = %name, "duplicate dispatch event skipped");
+                                            }
                                         }
                                         Ok(())
                                     }
@@ -1551,6 +1626,10 @@ impl DiscordAdapter {
             .and_then(|a| a.get("bot"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let guild_id = data
+            .get("guild_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         Some(IncomingDiscordMessage {
             channel_id,
@@ -1559,6 +1638,7 @@ impl DiscordAdapter {
             username,
             content,
             is_bot,
+            guild_id,
         })
     }
 
@@ -1957,6 +2037,87 @@ mod tests {
 
         let msg = DiscordAdapter::parse_message_create(&data).unwrap();
         assert!(msg.is_bot);
+    }
+
+    #[test]
+    fn parse_message_create_extracts_guild_id() {
+        let data = serde_json::json!({
+            "id": "msg1",
+            "channel_id": "ch1",
+            "guild_id": "guild9",
+            "content": "hello",
+            "author": { "id": "u1", "username": "user", "bot": false }
+        });
+
+        let msg = DiscordAdapter::parse_message_create(&data).unwrap();
+        assert_eq!(msg.guild_id, Some("guild9".into()));
+
+        // DM channels have no guild_id.
+        let dm = serde_json::json!({
+            "id": "msg2",
+            "channel_id": "dm1",
+            "content": "hi",
+            "author": { "id": "u1", "username": "user", "bot": false }
+        });
+        let msg = DiscordAdapter::parse_message_create(&dm).unwrap();
+        assert_eq!(msg.guild_id, None);
+    }
+
+    #[test]
+    fn to_incoming_dm_vs_guild() {
+        let dm_msg = IncomingDiscordMessage {
+            channel_id: "dm1".into(),
+            message_id: "m1".into(),
+            user_id: Some("u1".into()),
+            username: None,
+            content: "hi".into(),
+            is_bot: false,
+            guild_id: None,
+        };
+        let incoming = DiscordAdapter::to_incoming(&dm_msg);
+        assert_eq!(incoming.platform, "discord");
+        assert_eq!(incoming.chat_id, "dm1");
+        assert_eq!(incoming.user_id, "u1");
+        assert!(incoming.is_dm);
+        assert_eq!(incoming.message_id, Some("m1".into()));
+
+        let guild_msg = IncomingDiscordMessage {
+            guild_id: Some("g1".into()),
+            ..dm_msg
+        };
+        let incoming = DiscordAdapter::to_incoming(&guild_msg);
+        assert!(!incoming.is_dm);
+    }
+
+    fn mention_test_adapter() -> DiscordAdapter {
+        let config = DiscordConfig {
+            token: "test-token".into(),
+            application_id: Some("123456".into()),
+            proxy: AdapterProxyConfig::default(),
+            require_mention: true,
+            intents: default_intents(),
+        };
+        DiscordAdapter::new(config).unwrap()
+    }
+
+    #[test]
+    fn mentioned_self_detects_mention_forms() {
+        let adapter = mention_test_adapter();
+        assert!(adapter.mentioned_self("hey <@123456> do this"));
+        assert!(adapter.mentioned_self("hey <@!123456> do this"));
+        assert!(!adapter.mentioned_self("hey <@999999> do this"));
+        assert!(!adapter.mentioned_self("no mention here"));
+
+        // Without an application_id nothing can be mentioned.
+        let config = DiscordConfig {
+            token: "test-token".into(),
+            application_id: None,
+            proxy: AdapterProxyConfig::default(),
+            require_mention: true,
+            intents: default_intents(),
+        };
+        let adapter = DiscordAdapter::new(config).unwrap();
+        assert!(!adapter.mentioned_self("<@123456> hi"));
     }
 
     // -- GatewaySession tests -----------------------------------------------
