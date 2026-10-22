@@ -500,34 +500,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// Render a completed tool call: `✓ <name> done [+a −r]: <preview>`.
-fn tool_done_line(
-    name: &str,
-    diff: Option<DiffStat>,
-    preview: &str,
-    styles: &crate::theme::ResolvedStyles,
-) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled(
-            "✓ ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{name} done"), styles.tool_result),
-    ];
-    if let Some(ds) = diff {
-        spans.push(Span::styled(
-            format!(" [+{} −{}]", ds.added, ds.removed),
-            styles.tool_result,
-        ));
-    }
-    if !preview.is_empty() {
-        spans.push(Span::styled(format!(": {preview}"), styles.system_message));
-    }
-    Line::from(spans)
-}
-
 // ---------------------------------------------------------------------------
 // Saved sessions (F3 switcher)
 // ---------------------------------------------------------------------------
@@ -845,6 +817,15 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         key("/goal clear", "clear goal"),
         key("/save [name]", "save session to disk"),
         key("/load <name>", "load a saved session"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Display",
+            Style::default()
+                .fg(colors.foreground)
+                .add_modifier(Modifier::BOLD),
+        )),
+        key("splash", "logo art on empty session (terminal ≥104 cols)"),
+        key("markdown", "assistant replies render headings, code, lists"),
         Line::from(""),
         Line::from(Span::styled(
             "Esc to close",
@@ -1419,7 +1400,8 @@ pub fn render(frame: &mut Frame, app: &App, state: &TuiState) {
 
     let size = frame.area();
 
-    // Layout: messages (top), completions (optional), goal bar, input, status bar (bottom)
+    // Layout: header, messages (top), completions (optional), goal bar, input, status bar (bottom)
+    let header_height = 1;
     let input_height = 3;
     let completion_height = if state.completions.is_empty() {
         0
@@ -1432,6 +1414,7 @@ pub fn render(frame: &mut Frame, app: &App, state: &TuiState) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(header_height),     // header (reasonix-style)
             Constraint::Min(5),                    // messages
             Constraint::Length(completion_height), // completions
             Constraint::Length(goal_height),       // goal bar
@@ -1440,11 +1423,23 @@ pub fn render(frame: &mut Frame, app: &App, state: &TuiState) {
         ])
         .split(size);
 
-    let messages_area = vertical[0];
-    let completions_area = vertical[1];
-    let goal_area = vertical[2];
-    let input_area = vertical[3];
-    let status_area = vertical[4];
+    let header_area = vertical[0];
+    let messages_area = vertical[1];
+    let completions_area = vertical[2];
+    let goal_area = vertical[3];
+    let input_area = vertical[4];
+    let status_area = vertical[5];
+
+    // --- Header: ◆ hermes <version> · <model> · <cwd> (reasonix-style) ---
+    frame.render_widget(
+        Paragraph::new(crate::tui_visual::header_line(
+            env!("CARGO_PKG_VERSION"),
+            &app.current_model,
+            &crate::tui_visual::short_cwd(),
+            &colors,
+        )),
+        header_area,
+    );
 
     // --- Render message history ---
     render_messages(frame, app, state, messages_area, &resolved, &colors);
@@ -1538,9 +1533,16 @@ fn render_messages(
     state: &TuiState,
     area: Rect,
     styles: &crate::theme::ResolvedStyles,
-    _colors: &crate::theme::RatatuiColors,
+    colors: &crate::theme::RatatuiColors,
 ) {
     let mut lines: Vec<Line> = Vec::new();
+
+    // Splash screen on empty session (reasonix-style): logo + caduceus art,
+    // only when the terminal is wide enough for the full banner.
+    if app.messages.is_empty() && area.width >= crate::tui_visual::WIDE_MIN {
+        lines.extend(crate::tui_visual::splash_lines(colors));
+        lines.push(Line::from(""));
+    }
 
     // Pair assistant tool calls with their Tool results so completed calls
     // render as one ✓ line; paired Tool messages are consumed into it.
@@ -1563,26 +1565,35 @@ fn render_messages(
             }
             hermes_core::MessageRole::Assistant => {
                 if let Some(ref content) = msg.content {
-                    for line in content.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("Assistant: {}", line),
-                            styles.assistant_response,
-                        )));
+                    // Assistant messages render as markdown (reasonix-style);
+                    // the "Assistant: " label prefixes the first rendered line.
+                    let label = Span::styled("Assistant: ", styles.assistant_response);
+                    let md_lines = crate::tui_visual::markdown_lines(content, colors);
+                    for (i, md_line) in md_lines.into_iter().enumerate() {
+                        if i == 0 {
+                            let mut spans = vec![label.clone()];
+                            spans.extend(md_line.spans);
+                            lines.push(Line::from(spans));
+                        } else {
+                            lines.push(md_line);
+                        }
                     }
                 }
                 // Completed tool calls: ✓ <name> done [+a −r]: <preview>
                 if let Some(paired_calls) = pairing.paired.get(&i) {
                     for p in paired_calls {
-                        lines.push(tool_done_line(&p.name, p.diff, &p.preview, styles));
+                        lines.push(crate::tui_visual::tool_done_line_full(
+                            &p.name,
+                            p.diff.as_ref().map(|ds| (ds.added, ds.removed)),
+                            &p.preview,
+                            colors,
+                        ));
                     }
                 }
-                // Calls still awaiting a result keep the legacy rendering.
+                // Calls still awaiting a result: ● name (reasonix-style running indicator).
                 if let Some(pending_calls) = pairing.pending.get(&i) {
                     for name in pending_calls {
-                        lines.push(Line::from(Span::styled(
-                            format!("  [Tool: {}]", name),
-                            styles.tool_call,
-                        )));
+                        lines.push(crate::tui_visual::tool_running_line(name, "", colors));
                     }
                 }
             }
@@ -1632,6 +1643,17 @@ fn render_messages(
                 styles.assistant_response,
             )));
         }
+    }
+
+    // Thinking indicator (reasonix-style braille spinner) while the agent works.
+    if state.processing && state.stream_buffer.is_empty() {
+        let spin = crate::tui_visual::spinner_frame(state.spinner_frame);
+        lines.push(Line::from(Span::styled(
+            format!("{spin} thinking…"),
+            Style::default()
+                .fg(colors.secondary)
+                .add_modifier(Modifier::ITALIC),
+        )));
     }
 
     let inner_width = area.width.max(1);
@@ -1743,7 +1765,13 @@ fn render_input(
     let paragraph = Paragraph::new(Text::from(vec![Line::from(vec![
         Span::styled(mode_indicator, mode_style),
         Span::styled(line_indicator, Style::default().fg(Color::DarkGray)),
-        Span::raw(" "),
+        // Reasonix-style input prompt.
+        Span::styled(
+            "› ",
+            Style::default()
+                .fg(colors.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(input_text),
     ])]))
     .block(Block::default().borders(Borders::BOTTOM))
@@ -2616,15 +2644,12 @@ mod tests {
         use ratatui::widgets::Paragraph;
         use ratatui::Terminal;
         let theme = Theme::default_theme();
-        let styles = theme.resolved_styles();
-        let line = tool_done_line(
+        let colors = theme.colors.to_ratatui_colors();
+        let line = crate::tui_visual::tool_done_line_full(
             "edit_file",
-            Some(DiffStat {
-                added: 2,
-                removed: 1,
-            }),
+            Some((2, 1)),
             "patched lib.rs",
-            &styles,
+            &colors,
         );
         let backend = TestBackend::new(60, 1);
         let mut terminal = Terminal::new(backend).unwrap();
