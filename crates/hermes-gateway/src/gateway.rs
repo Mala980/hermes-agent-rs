@@ -524,14 +524,32 @@ impl Gateway {
         // 4. Get all session messages for the agent loop
         let messages = self.session_manager.get_messages(&session_key).await;
 
+        // 4b. Keep-typing indicator: Telegram's bubble expires after ~5s, so
+        // refresh every 4s while the agent works. Aborted when processing ends.
+        // Fire-and-forget per tick; send_typing itself never fails loudly.
+        let typing_handle = self.get_adapter(&incoming.platform).await.map(|adapter| {
+            let chat_id = incoming.chat_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    let _ = adapter.send_typing(&chat_id).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                }
+            })
+        });
+
         // 5. Process through agent loop (streaming or non-streaming)
-        if self.config.streaming_enabled {
-            self.route_streaming(incoming, messages, &session_key)
-                .await?;
+        let route_result = if self.config.streaming_enabled {
+            self.route_streaming(incoming, messages, &session_key).await
         } else {
             self.route_non_streaming(incoming, messages, &session_key)
-                .await?;
+                .await
+        };
+
+        // Stop the typing indicator.
+        if let Some(handle) = typing_handle {
+            handle.abort();
         }
+        route_result?;
 
         Ok(())
     }
