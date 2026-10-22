@@ -107,9 +107,79 @@ pub(crate) async fn run_lumio(
     Ok(())
 }
 
+/// Parse a custom model string of the form `provider:model`.
+///
+/// Returns `Some((provider, model))` only when the trimmed input contains
+/// EXACTLY ONE ':' with a non-empty provider and model on either side.
+pub(crate) fn parse_custom_model(input: &str) -> Option<(String, String)> {
+    let mut parts = input.trim().split(':');
+    let provider = parts.next()?.trim();
+    let model = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None; // more than one ':'
+    }
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), model.to_string()))
+}
+
+/// Build the `config.yaml` content for the setup wizard.
+///
+/// Credentials are stored under `llm_providers.<effective_provider>`, where
+/// the effective provider is the prefix of the final model id (this is what
+/// the runtime resolves via `model.split_once(':')`), falling back to the
+/// step-1 provider choice when the model id has no prefix.
+pub(crate) fn build_setup_yaml(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+    personality: &str,
+) -> String {
+    let mut config_content = String::from("# Hermes Agent Configuration\n\n");
+    config_content.push_str(&format!("model: {}\n", model));
+    config_content.push_str(&format!("personality: {}\n", personality));
+    config_content.push_str("max_turns: 50\n\n");
+
+    let effective_provider = model.split_once(':').map(|(p, _)| p).unwrap_or(provider);
+    let has_key = !api_key.is_empty();
+    let has_base = !base_url.is_empty();
+    if has_key || has_base {
+        config_content.push_str("llm_providers:\n");
+        config_content.push_str(&format!("  {}:\n", effective_provider));
+        if has_key {
+            config_content.push_str(&format!("    api_key: {}\n", api_key));
+        }
+        if has_base {
+            config_content.push_str(&format!("    base_url: {}\n", base_url));
+        }
+    }
+
+    config_content
+}
+
+/// Display name for the step-1 provider choice (used in prompts).
+fn provider_display_name(provider: &str) -> &str {
+    match provider {
+        "anthropic" => "Anthropic",
+        _ => "OpenAI",
+    }
+}
+
+/// Prompt the user and return the trimmed input line.
+fn read_prompt_line(reader: &mut impl std::io::BufRead, prompt: &str) -> String {
+    use std::io::Write;
+    print!("{}", prompt);
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    reader.read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
 /// Handle `hermes setup`.
 pub(crate) async fn run_setup() -> Result<(), AgentError> {
-    use std::io::{self, BufRead, Write};
+    use std::io;
 
     println!("Hermes Agent — Setup Wizard");
     println!("===========================\n");
@@ -137,71 +207,105 @@ pub(crate) async fn run_setup() -> Result<(), AgentError> {
     let stdin = io::stdin();
     let mut reader = stdin.lock();
 
-    // 2. Prompt for API key
-    print!("\nOpenAI API key (leave blank to skip): ");
-    io::stdout().flush().ok();
-    let mut api_key = String::new();
-    reader.read_line(&mut api_key).ok();
-    let api_key = api_key.trim().to_string();
+    // 2. Prompt for provider
+    let provider_choice =
+        read_prompt_line(&mut reader, "\nLLM provider (openai/anthropic) [openai]: ");
+    let provider = match provider_choice.to_lowercase().as_str() {
+        "anthropic" => "anthropic",
+        _ => "openai", // blank or anything else
+    };
+    let provider_name = provider_display_name(provider);
 
-    // 3. Prompt for model
+    // 3. Prompt for API key
+    let api_key = read_prompt_line(
+        &mut reader,
+        &format!("\n{} API key (leave blank to skip): ", provider_name),
+    );
+
+    // 4. Prompt for custom base_url
+    let base_url = read_prompt_line(
+        &mut reader,
+        &format!(
+            "Custom base_url for {} (leave blank for default): ",
+            provider
+        ),
+    );
+
+    // 5. Prompt for model
     println!("\nAvailable models:");
-    println!("  1) openai:gpt-4o          (recommended)");
-    println!("  2) openai:gpt-4o-mini     (fast & cheap)");
+    println!("  1) openai:gpt-4o              (recommended)");
+    println!("  2) openai:gpt-4o-mini         (fast & cheap)");
     println!("  3) anthropic:claude-3-5-sonnet");
-    println!("  4) openrouter:auto        (multi-provider)");
-    print!("Choose model [1]: ");
-    io::stdout().flush().ok();
-    let mut model_choice = String::new();
-    reader.read_line(&mut model_choice).ok();
-    let model = match model_choice.trim() {
-        "2" => "openai:gpt-4o-mini",
-        "3" => "anthropic:claude-3-5-sonnet",
-        "4" => "openrouter:auto",
-        _ => "openai:gpt-4o",
+    println!("  4) openrouter:auto            (multi-provider)");
+    println!("  5) custom...                  (enter provider:model)");
+    let model_choice = read_prompt_line(&mut reader, "Choose model [1]: ");
+    let model = match model_choice.as_str() {
+        "2" => "openai:gpt-4o-mini".to_string(),
+        "3" => "anthropic:claude-3-5-sonnet".to_string(),
+        "4" => "openrouter:auto".to_string(),
+        "5" => {
+            let mut custom: Option<String> = None;
+            for _ in 0..3 {
+                let input = read_prompt_line(&mut reader, "Custom model (provider:model): ");
+                match parse_custom_model(&input) {
+                    Some((p, m)) => {
+                        custom = Some(format!("{}:{}", p, m));
+                        break;
+                    }
+                    None => {
+                        println!("Invalid model. Use the form 'provider:model', e.g. 'atmo:deepseek-v4.1-flash'.");
+                    }
+                }
+            }
+            custom.unwrap_or_else(|| {
+                println!("Falling back to the default model openai:gpt-4o.");
+                "openai:gpt-4o".to_string()
+            })
+        }
+        _ => "openai:gpt-4o".to_string(),
     };
 
-    // 4. Prompt for personality
-    print!("\nPersonality (default, concise, creative, technical) [default]: ");
-    io::stdout().flush().ok();
-    let mut personality = String::new();
-    reader.read_line(&mut personality).ok();
-    let personality = personality.trim();
+    // Effective provider comes from the final model id (this is what the
+    // runtime uses), so credentials are stored under the matching key.
+    let effective_provider = model.split_once(':').map(|(p, _)| p).unwrap_or(provider);
+    if effective_provider != provider && (!api_key.is_empty() || !base_url.is_empty()) {
+        println!(
+            "Note: credentials stored under provider '{}' (from your custom model)",
+            effective_provider
+        );
+    }
+
+    // 6. Prompt for personality
+    let personality = read_prompt_line(
+        &mut reader,
+        "\nPersonality (default, concise, creative, technical) [default]: ",
+    );
     let personality = if personality.is_empty() {
-        "default"
+        "default".to_string()
     } else {
         personality
     };
 
-    // 5. Write config.yaml
+    // 7. Write config.yaml
     if config_path.exists() {
-        print!("\nconfig.yaml already exists. Overwrite? [y/N]: ");
-        io::stdout().flush().ok();
-        let mut answer = String::new();
-        reader.read_line(&mut answer).ok();
-        if !answer.trim().eq_ignore_ascii_case("y") {
+        let answer = read_prompt_line(
+            &mut reader,
+            "\nconfig.yaml already exists. Overwrite? [y/N]: ",
+        );
+        if !answer.eq_ignore_ascii_case("y") {
             println!("Keeping existing config.yaml.");
             println!("\nSetup complete! Run `hermes` to start an interactive session.");
             return Ok(());
         }
     }
 
-    let mut config_content = String::from("# Hermes Agent Configuration\n\n");
-    config_content.push_str(&format!("model: {}\n", model));
-    config_content.push_str(&format!("personality: {}\n", personality));
-    config_content.push_str("max_turns: 50\n\n");
-
-    if !api_key.is_empty() {
-        config_content.push_str("llm_providers:\n");
-        config_content.push_str("  openai:\n");
-        config_content.push_str(&format!("    api_key: {}\n", api_key));
-    }
+    let config_content = build_setup_yaml(provider, &api_key, &base_url, &model, &personality);
 
     std::fs::write(&config_path, &config_content)
         .map_err(|e| AgentError::Io(format!("Failed to write config: {}", e)))?;
     println!("\n  ✓ Wrote config.yaml");
 
-    // 6. Write default profile
+    // 8. Write default profile
     let default_profile = config_dir.join("profiles").join("default.yaml");
     if !default_profile.exists() {
         let profile_content = format!(
@@ -771,4 +875,122 @@ pub(crate) async fn run_profile(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod setup_wizard_tests {
+    use super::*;
+
+    #[test]
+    fn parse_custom_model_accepts_valid() {
+        assert_eq!(
+            parse_custom_model("atmo:deepseek-v4.1-flash"),
+            Some(("atmo".to_string(), "deepseek-v4.1-flash".to_string()))
+        );
+        assert_eq!(
+            parse_custom_model("openrouter:meta-llama/llama-3-70b"),
+            Some((
+                "openrouter".to_string(),
+                "meta-llama/llama-3-70b".to_string()
+            ))
+        );
+        // surrounding whitespace is tolerated
+        assert_eq!(
+            parse_custom_model("  a:b  "),
+            Some(("a".to_string(), "b".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_custom_model_rejects_invalid() {
+        assert_eq!(parse_custom_model("no-colon-here"), None); // no colon
+        assert_eq!(parse_custom_model("a:b:c"), None); // two colons
+        assert_eq!(parse_custom_model(":model-only"), None); // empty provider
+        assert_eq!(parse_custom_model("provider-only:"), None); // empty model
+        assert_eq!(parse_custom_model(""), None); // blank
+        assert_eq!(parse_custom_model("   "), None); // whitespace only
+        assert_eq!(parse_custom_model(":"), None); // both empty
+        assert_eq!(parse_custom_model("a::"), None); // empty model + extra colon
+    }
+
+    /// Write the YAML through the real config loader and check where the
+    /// credentials land.
+    fn loaded_config(yaml: &str) -> hermes_config::GatewayConfig {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).expect("write yaml");
+        hermes_config::loader::load_from_yaml(&path).expect("load yaml")
+    }
+
+    #[test]
+    fn build_setup_yaml_stores_credentials_under_model_provider() {
+        let yaml = build_setup_yaml(
+            "openai",
+            "sk-test-key",
+            "https://api.example.com/v1",
+            "openai:gpt-4o",
+            "default",
+        );
+        let cfg = loaded_config(&yaml);
+        assert_eq!(cfg.model.as_deref(), Some("openai:gpt-4o"));
+        assert_eq!(cfg.personality.as_deref(), Some("default"));
+        assert_eq!(cfg.max_turns, 50);
+        let entry = cfg
+            .llm_providers
+            .get("openai")
+            .expect("openai entry present");
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn build_setup_yaml_override_stores_under_custom_model_provider() {
+        // step-1 choice was openai, but the custom model resolves to 'atmo'
+        let yaml = build_setup_yaml(
+            "openai",
+            "sk-test-key",
+            "https://atmo.example.com/v1",
+            "atmo:deepseek-v4.1-flash",
+            "concise",
+        );
+        let cfg = loaded_config(&yaml);
+        assert_eq!(cfg.model.as_deref(), Some("atmo:deepseek-v4.1-flash"));
+        assert!(
+            !cfg.llm_providers.contains_key("openai"),
+            "no stale openai entry"
+        );
+        let entry = cfg.llm_providers.get("atmo").expect("atmo entry present");
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://atmo.example.com/v1")
+        );
+    }
+
+    #[test]
+    fn build_setup_yaml_omits_empty_fields_and_whole_section() {
+        // api_key skipped, base_url given
+        let yaml = build_setup_yaml(
+            "anthropic",
+            "",
+            "https://proxy.local",
+            "openai:gpt-4o-mini",
+            "default",
+        );
+        let cfg = loaded_config(&yaml);
+        let entry = cfg
+            .llm_providers
+            .get("openai")
+            .expect("openai entry present");
+        assert_eq!(entry.api_key, None);
+        assert_eq!(entry.base_url.as_deref(), Some("https://proxy.local"));
+
+        // both blank: no llm_providers section at all
+        let yaml = build_setup_yaml("openai", "", "", "openai:gpt-4o", "default");
+        let cfg = loaded_config(&yaml);
+        assert!(cfg.llm_providers.is_empty());
+    }
 }

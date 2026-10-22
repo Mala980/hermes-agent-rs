@@ -110,6 +110,16 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     parse_html,
                     poll_timeout,
                     bot_username: None,
+                    // Config-file allowlist: union of the first-class
+                    // `allowed_users` field and `extra["allowed_users"]`.
+                    allowed_users: {
+                        let ids = platform_cfg.allowed_users_union();
+                        if ids.is_empty() {
+                            None
+                        } else {
+                            Some(ids)
+                        }
+                    },
                 };
                 match TelegramAdapter::new(telegram_cfg) {
                     Ok(adapter) => {
@@ -254,8 +264,11 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     phone_number_id: extra_string(platform_cfg, "phone_number_id"),
                     business_account_id: extra_string(platform_cfg, "business_account_id"),
                     verify_token: extra_string(platform_cfg, "verify_token"),
-                    // Falls back to WHATSAPP_APP_SECRET env inside the adapter.
-                    app_secret: extra_string(platform_cfg, "app_secret"),
+                    app_secret: extra_string(platform_cfg, "app_secret").or_else(|| {
+                        std::env::var("WHATSAPP_APP_SECRET")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    }),
                     proxy: Default::default(),
                 };
                 match WhatsAppAdapter::new(wa_cfg) {
