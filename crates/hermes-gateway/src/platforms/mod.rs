@@ -60,4 +60,16 @@ pub mod api_server;
 #[cfg(feature = "webhook")]
 pub mod webhook;
 
+#[cfg(feature = "irc")]
+pub mod irc;
+
+#[cfg(feature = "line")]
+pub mod line;
+
+#[cfg(feature = "a2a")]
+pub mod a2a;
+
+#[cfg(feature = "ntfy")]
+pub mod ntfy;
+
 pub mod helpers;

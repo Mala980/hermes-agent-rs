@@ -202,6 +202,131 @@ pub fn platform_token_or_extra(cfg: &PlatformConfig) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// LineConfig
+// ---------------------------------------------------------------------------
+
+/// LINE Messaging API adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`; an empty `channel_secret` or
+/// `channel_access_token` fails adapter construction (fail-closed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LineConfig {
+    /// LINE channel secret used for webhook HMAC-SHA256 signature verification.
+    pub channel_secret: String,
+    /// LINE channel access token (bearer token for the Reply/Push APIs).
+    pub channel_access_token: String,
+    /// Local bind address for the webhook listener.
+    pub bind_addr: String,
+    /// Local port for the webhook listener.
+    pub port: u16,
+    /// Webhook path the LINE platform posts events to.
+    pub path: String,
+}
+
+impl Default for LineConfig {
+    fn default() -> Self {
+        Self {
+            channel_secret: String::new(),
+            channel_access_token: String::new(),
+            bind_addr: "0.0.0.0".to_string(),
+            port: 8646,
+            path: "/line/webhook".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NtfyConfig
+// ---------------------------------------------------------------------------
+
+/// ntfy push-notification adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`; an empty `topic` fails adapter
+/// construction (fail-closed). Auth is optional — ntfy topics are public
+/// unless the server protects them (Bearer token or Basic `user:pass`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NtfyConfig {
+    /// ntfy server base URL, e.g. `https://ntfy.sh`.
+    pub server: String,
+    /// Topic to subscribe to; also the default publish target. Required.
+    pub topic: String,
+    /// Publish target topic; defaults to `topic` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_topic: Option<String>,
+    /// Bearer access token (or `user:pass`, which becomes Basic auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    /// Basic-auth username (alternative to `user:pass` in `access_token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Basic-auth password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Notification title, sent as the `X-Title` header on publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Publish with `Markdown: yes` so the server renders the body as Markdown.
+    pub markdown: bool,
+    /// Tag stamped on outgoing messages; inbound messages carrying it are
+    /// dropped for echo-loop prevention (ntfy has no sender identity).
+    pub echo_tag: String,
+}
+
+impl Default for NtfyConfig {
+    fn default() -> Self {
+        Self {
+            server: "https://ntfy.sh".to_string(),
+            topic: String::new(),
+            publish_topic: None,
+            access_token: None,
+            username: None,
+            password: None,
+            title: None,
+            markdown: false,
+            echo_tag: "hermes-agent".to_string(),
+        }
+    }
+}
+
+impl NtfyConfig {
+    /// Build from a generic [`PlatformConfig`].
+    ///
+    /// `extra["access_token"]` wins; the first-class `token` (or
+    /// `extra["token"]`) is the fallback. Everything else comes from `extra`.
+    pub fn from_platform_config(p: &PlatformConfig) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = extra_string(p, "server") {
+            cfg.server = v.trim_end_matches('/').to_string();
+        }
+        if let Some(v) = extra_string(p, "topic") {
+            cfg.topic = v;
+        }
+        cfg.publish_topic = extra_string(p, "publish_topic");
+        cfg.access_token = extra_string(p, "access_token").or_else(|| platform_token_or_extra(p));
+        cfg.username = extra_string(p, "username");
+        cfg.password = extra_string(p, "password");
+        cfg.title = extra_string(p, "title");
+        if let Some(v) = p.extra.get("markdown").and_then(|v| v.as_bool()) {
+            cfg.markdown = v;
+        }
+        if let Some(v) = extra_string(p, "echo_tag") {
+            cfg.echo_tag = v;
+        }
+        cfg
+    }
+
+    /// Effective publish topic: explicit `publish_topic`, else `topic`.
+    pub fn effective_publish_topic(&self) -> &str {
+        self.publish_topic
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.topic)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -228,58 +353,6 @@ mod tests {
     }
 
     #[test]
-    fn extra_string_list_reads_json_array() {
-        let mut pc = PlatformConfig::default();
-        pc.extra
-            .insert("k".to_string(), json!([" 123 ", "", "456", 7]));
-        assert_eq!(
-            extra_string_list(&pc, "k"),
-            Some(vec!["123".to_string(), "456".to_string()])
-        );
-    }
-
-    #[test]
-    fn extra_string_list_accepts_comma_separated_string() {
-        let mut pc = PlatformConfig::default();
-        pc.extra.insert("k".to_string(), json!(" 123 , , 456 "));
-        assert_eq!(
-            extra_string_list(&pc, "k"),
-            Some(vec!["123".to_string(), "456".to_string()])
-        );
-    }
-
-    #[test]
-    fn extra_string_list_empty_inputs_are_none() {
-        let mut pc = PlatformConfig::default();
-        assert!(extra_string_list(&pc, "missing").is_none());
-        pc.extra.insert("empty_arr".to_string(), json!([]));
-        assert!(extra_string_list(&pc, "empty_arr").is_none());
-        pc.extra.insert("empty_csv".to_string(), json!(" , "));
-        assert!(extra_string_list(&pc, "empty_csv").is_none());
-        pc.extra.insert("wrong_type".to_string(), json!(42));
-        assert!(extra_string_list(&pc, "wrong_type").is_none());
-    }
-
-    #[test]
-    fn allowed_users_union_merges_field_and_extra() {
-        let mut pc = PlatformConfig::default();
-        pc.allowed_users = vec![" 123 ".to_string(), String::new(), "123".to_string()];
-        pc.extra
-            .insert("allowed_users".to_string(), json!(["456", " 789 "]));
-        // Field is trimmed, empties dropped, both sources merged, deduped.
-        assert_eq!(
-            pc.allowed_users_union(),
-            vec!["123".to_string(), "456".to_string(), "789".to_string()]
-        );
-    }
-
-    #[test]
-    fn allowed_users_union_empty_when_nothing_set() {
-        let pc = PlatformConfig::default();
-        assert!(pc.allowed_users_union().is_empty());
-    }
-
-    #[test]
     fn platform_token_or_extra_falls_back_to_extra() {
         let mut pc = PlatformConfig::default();
         pc.extra.insert("token".to_string(), json!("  from_extra "));
@@ -292,6 +365,80 @@ mod tests {
         assert!(!pc.enabled);
         assert!(pc.token.is_none());
         assert_eq!(pc.unauthorized_dm_behavior, UnauthorizedDmBehavior::Ignore);
+    }
+
+    #[test]
+    fn line_config_defaults() {
+        let cfg = LineConfig::default();
+        assert_eq!(cfg.port, 8646);
+        assert_eq!(cfg.path, "/line/webhook");
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert!(cfg.channel_secret.is_empty());
+        assert!(cfg.channel_access_token.is_empty());
+    }
+
+    #[test]
+    fn ntfy_config_defaults() {
+        let cfg = NtfyConfig::default();
+        assert_eq!(cfg.server, "https://ntfy.sh");
+        assert!(cfg.topic.is_empty());
+        assert!(cfg.publish_topic.is_none());
+        assert!(cfg.access_token.is_none());
+        assert!(!cfg.markdown);
+        assert_eq!(cfg.echo_tag, "hermes-agent");
+        assert_eq!(cfg.effective_publish_topic(), "");
+    }
+
+    #[test]
+    fn ntfy_config_serde_default() {
+        let cfg: NtfyConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.server, "https://ntfy.sh");
+        assert_eq!(cfg.echo_tag, "hermes-agent");
+    }
+
+    #[test]
+    fn ntfy_config_from_platform_config() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        for (k, v) in [
+            ("server", "https://ntfy.example.com/"),
+            ("topic", "alerts"),
+            ("publish_topic", "replies"),
+            ("username", "user"),
+            ("title", "Hermes"),
+        ] {
+            pc.extra.insert(k.to_string(), json!(v));
+        }
+        pc.extra.insert("markdown".to_string(), json!(true));
+        let cfg = NtfyConfig::from_platform_config(&pc);
+        assert_eq!(cfg.server, "https://ntfy.example.com");
+        assert_eq!(cfg.topic, "alerts");
+        assert_eq!(cfg.publish_topic.as_deref(), Some("replies"));
+        // first-class token falls back to access_token
+        assert_eq!(cfg.access_token.as_deref(), Some("top-level-token"));
+        assert_eq!(cfg.username.as_deref(), Some("user"));
+        assert_eq!(cfg.title.as_deref(), Some("Hermes"));
+        assert!(cfg.markdown);
+        assert_eq!(cfg.effective_publish_topic(), "replies");
+    }
+
+    #[test]
+    fn ntfy_config_access_token_prefers_extra() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        pc.extra
+            .insert("access_token".to_string(), json!("extra-token"));
+        let cfg = NtfyConfig::from_platform_config(&pc);
+        assert_eq!(cfg.access_token.as_deref(), Some("extra-token"));
+        assert_eq!(cfg.effective_publish_topic(), "");
+    }
+
+    #[test]
+    fn line_config_serde_default() {
+        let cfg: LineConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.port, 8646);
+        let cfg: LineConfig = serde_json::from_value(serde_json::json!({"port": 9001})).unwrap();
+        assert_eq!(cfg.port, 9001);
     }
 
     #[test]

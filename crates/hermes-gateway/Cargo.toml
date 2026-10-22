@@ -27,6 +27,10 @@ sms = []
 homeassistant = []
 api-server = []
 webhook = []
+a2a = []
+line = []
+irc = []
+ntfy = []
 
 [dependencies]
 hermes-core = { workspace = true }
@@ -50,8 +54,8 @@ md5 = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "0.26"
 hmac = "0.12"
-sha2 = { workspace = true }
 sha1 = "0.10"
+sha2 = { workspace = true }
 base64 = { workspace = true }
 aes = { version = "0.8", optional = true }
 rand = { version = "0.8", optional = true }

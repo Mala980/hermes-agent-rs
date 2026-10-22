@@ -22,7 +22,11 @@
     feature = "sms",
     feature = "homeassistant",
     feature = "webhook",
-    feature = "api-server"
+    feature = "api-server",
+    feature = "irc",
+    feature = "line",
+    feature = "ntfy",
+    feature = "a2a"
 ))]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,7 +54,11 @@ use crate::gateway::Gateway;
     feature = "sms",
     feature = "homeassistant",
     feature = "webhook",
-    feature = "api-server"
+    feature = "api-server",
+    feature = "irc",
+    feature = "line",
+    feature = "ntfy",
+    feature = "a2a"
 ))]
 use crate::platform_requirements::{
     evaluate_gateway_requirements, RequirementScope, RequirementSeverity,
@@ -93,7 +101,11 @@ pub async fn register_platforms(
         feature = "sms",
         feature = "homeassistant",
         feature = "webhook",
-        feature = "api-server"
+        feature = "api-server",
+        feature = "irc",
+        feature = "line",
+        feature = "ntfy",
+        feature = "a2a"
     )))]
     {
         let _ = (gateway, config, sidecar_tasks);
@@ -122,7 +134,11 @@ pub async fn register_platforms(
         feature = "sms",
         feature = "homeassistant",
         feature = "webhook",
-        feature = "api-server"
+        feature = "api-server",
+        feature = "irc",
+        feature = "line",
+        feature = "ntfy",
+        feature = "a2a"
     ))]
     {
         let mut registered = Vec::new();
@@ -720,6 +736,47 @@ pub async fn register_platforms(
             }
         }
 
+        // LINE
+        #[cfg(feature = "line")]
+        if let Some(platform_cfg) = config.platforms.get("line") {
+            if platform_cfg.enabled {
+                use crate::platforms::line::{LineAdapter, LineConfig};
+
+                if let Some(msg) = fatal_by_platform.remove("line") {
+                    errors.push(("line".to_string(), msg));
+                } else {
+                    let line_cfg = LineConfig {
+                        channel_secret: hermes_config::extra_string(platform_cfg, "channel_secret")
+                            .unwrap_or_default(),
+                        channel_access_token: hermes_config::platform_token_or_extra(platform_cfg)
+                            .or_else(|| {
+                                hermes_config::extra_string(platform_cfg, "channel_access_token")
+                            })
+                            .unwrap_or_default(),
+                        bind_addr: hermes_config::extra_string(platform_cfg, "bind_addr")
+                            .unwrap_or_else(|| "0.0.0.0".to_string()),
+                        port: extra_u16(platform_cfg, "port", 8646),
+                        path: hermes_config::extra_string(platform_cfg, "path")
+                            .unwrap_or_else(|| "/line/webhook".to_string()),
+                    };
+                    match LineAdapter::new(line_cfg) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("line", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("line".to_string());
+                        }
+                        Err(e) => errors.push(("line".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
         // ApiServer
         #[cfg(feature = "api-server")]
         if let Some(platform_cfg) = config.platforms.get("api_server") {
@@ -737,6 +794,86 @@ pub async fn register_platforms(
                     .register_adapter("api_server", Arc::new(adapter))
                     .await;
                 registered.push("api_server".to_string());
+            }
+        }
+
+        // IRC
+        #[cfg(feature = "irc")]
+        if let Some(platform_cfg) = config.platforms.get("irc") {
+            if platform_cfg.enabled {
+                use crate::platforms::irc::{IrcAdapter, IrcConfig};
+
+                if let Some(msg) = fatal_by_platform.remove("irc") {
+                    errors.push(("irc".to_string(), msg));
+                } else {
+                    let irc_cfg = IrcConfig::from_platform_config(platform_cfg);
+                    match IrcAdapter::new(irc_cfg) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("irc", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("irc".to_string());
+                        }
+                        Err(e) => errors.push(("irc".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // A2A
+        #[cfg(feature = "a2a")]
+        if let Some(platform_cfg) = config.platforms.get("a2a") {
+            if platform_cfg.enabled {
+                use crate::platforms::a2a::{A2aAdapter, A2aConfig};
+
+                if let Some(msg) = fatal_by_platform.remove("a2a") {
+                    errors.push(("a2a".to_string(), msg));
+                } else {
+                    let a2a_cfg = A2aConfig::from_platform_config(platform_cfg);
+                    let adapter = Arc::new(A2aAdapter::new(a2a_cfg));
+                    let (inbound_tx, inbound_rx) =
+                        tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                    adapter.set_inbound_sender(inbound_tx).await;
+                    let inbound_task = gateway
+                        .register_adapter_with_inbound("a2a", adapter.clone(), inbound_rx)
+                        .await;
+                    sidecar_tasks.push(inbound_task);
+                    registered.push("a2a".to_string());
+                }
+            }
+        }
+
+        // ntfy
+        #[cfg(feature = "ntfy")]
+        if let Some(platform_cfg) = config.platforms.get("ntfy") {
+            if platform_cfg.enabled {
+                use crate::platforms::ntfy::NtfyAdapter;
+                use hermes_config::NtfyConfig;
+
+                if let Some(msg) = fatal_by_platform.remove("ntfy") {
+                    errors.push(("ntfy".to_string(), msg));
+                } else {
+                    let ntfy_cfg = NtfyConfig::from_platform_config(platform_cfg);
+                    match NtfyAdapter::new(ntfy_cfg, Default::default()) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("ntfy", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("ntfy".to_string());
+                        }
+                        Err(e) => errors.push(("ntfy".to_string(), e.to_string())),
+                    }
+                }
             }
         }
 

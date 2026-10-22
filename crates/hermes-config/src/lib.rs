@@ -21,14 +21,14 @@ pub mod streaming;
 
 // Re-export key types for convenience
 pub use config::{
-    AgentLoopBehaviorConfig, ApprovalConfig, CheapModelRouteConfig, DisplayConfig,
-    FallbackProviderEntry, GatewayConfig, LlmProviderConfig, McpServerEntry, MoaConfig,
-    MoaModelSlot, MoaPreset, ProfileConfig, ProxyConfig, SkillsSettings, SmartModelRoutingConfig,
-    TerminalBackendType, TerminalConfig, ToolCapabilityConfig, ToolsSettings, TuiConfig,
+    AgentLoopBehaviorConfig, ApprovalConfig, CheapModelRouteConfig, GatewayConfig,
+    LlmProviderConfig, McpServerEntry, ProfileConfig, ProxyConfig, SkillsSettings,
+    SmartModelRoutingConfig, TerminalBackendType, TerminalConfig, ToolCapabilityConfig,
+    ToolsSettings,
 };
 pub use loader::{
-    apply_user_config_patch, load_config, load_user_config_file, reset_user_config_field,
-    save_config_yaml, user_config_field_display, validate_config, ConfigError,
+    apply_user_config_patch, load_config, load_user_config_file, save_config_yaml,
+    user_config_field_display, validate_config, ConfigError,
 };
 pub use managed_gateway::{
     build_vendor_gateway_url, coerce_modal_mode, env_var_enabled, get_tool_gateway_scheme,
@@ -44,8 +44,7 @@ pub use paths::{
     gateway_pid_path_in, hermes_home, memory_path, sessions_dir, skills_dir, state_dir, user_path,
 };
 pub use platform::{
-    extra_string, extra_string_list, platform_token_or_extra, PlatformConfig,
-    UnauthorizedDmBehavior,
+    extra_string, platform_token_or_extra, NtfyConfig, PlatformConfig, UnauthorizedDmBehavior,
 };
 pub use session::{DailyReset, IdleReset, SessionConfig, SessionResetPolicy, SessionType};
 pub use streaming::StreamingConfig;
