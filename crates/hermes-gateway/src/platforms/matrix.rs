@@ -13,13 +13,14 @@ use async_trait::async_trait;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 use crate::platforms::helpers::send_with_rate_limit_retry;
 use crate::platforms::helpers::{media_category, mime_from_extension};
 
@@ -1026,6 +1027,56 @@ impl MatrixAdapter {
         Ok(())
     }
 
+    /// Clone of the stop `Notify`, signaled by [`MatrixAdapter::stop`].
+    pub fn stop_notifier(&self) -> Arc<Notify> {
+        self.stop_signal.clone()
+    }
+
+    /// Convert a parsed [`IncomingMatrixMessage`] into a gateway-level
+    /// [`IncomingMessage`]. Matrix has no first-class DM flag on sync
+    /// events, so `is_dm` is left false; the DM manager still applies its
+    /// own pairing rules.
+    fn to_incoming(msg: &IncomingMatrixMessage) -> IncomingMessage {
+        IncomingMessage {
+            platform: "matrix".into(),
+            chat_id: msg.room_id.clone(),
+            user_id: msg.sender.clone(),
+            text: msg.body.clone(),
+            message_id: Some(msg.event_id.clone()),
+            is_dm: false,
+        }
+    }
+
+    /// Run the `/sync` loop and forward each synced batch as
+    /// platform-agnostic [`IncomingMessage`]s on `tx`.
+    ///
+    /// This is the production driver for [`MatrixAdapter::sync_loop`]:
+    /// the callback converts every message and pushes it into the
+    /// channel. The since-token is persisted across restarts by
+    /// `sync_loop` itself, so a reconnect replays nothing already seen.
+    /// The loop ends when [`MatrixAdapter::stop`] signals, or when the
+    /// `tx` receiver is dropped (the gateway pump task going away).
+    pub async fn run_sync_loop(
+        self: &Arc<Self>,
+        tx: mpsc::Sender<IncomingMessage>,
+    ) -> Result<(), GatewayError> {
+        info!("Matrix sync loop started");
+        let result = self
+            .sync_loop(|batch| {
+                for msg in &batch {
+                    // blocking_send is safe here: we are on a tokio
+                    // runtime thread, and a dropped receiver ends the loop.
+                    if tx.blocking_send(Self::to_incoming(msg)).is_err() {
+                        self.base.mark_stopped();
+                        break;
+                    }
+                }
+            })
+            .await;
+        info!("Matrix sync loop stopped");
+        result
+    }
+
     // -----------------------------------------------------------------------
     // Sync event parsing
     // -----------------------------------------------------------------------
@@ -1553,5 +1604,24 @@ mod tests {
         // Valid JSON but no token field → None.
         std::fs::write(MatrixAdapter::since_token_path(), r#"{"foo":"bar"}"#).unwrap();
         assert_eq!(MatrixAdapter::load_since_token(), None);
+    }
+
+    #[test]
+    fn to_incoming_routes_on_room_and_sender() {
+        let msg = IncomingMatrixMessage {
+            room_id: "!room1:example.org".to_string(),
+            event_id: "$evt1".to_string(),
+            sender: "@alice:example.org".to_string(),
+            body: "hello matrix".to_string(),
+            event_type: "m.room.message".to_string(),
+            is_edit: false,
+            relates_to: None,
+        };
+        let incoming = MatrixAdapter::to_incoming(&msg);
+        assert_eq!(incoming.platform, "matrix");
+        assert_eq!(incoming.chat_id, "!room1:example.org");
+        assert_eq!(incoming.user_id, "@alice:example.org");
+        assert_eq!(incoming.text, "hello matrix");
+        assert_eq!(incoming.message_id, Some("$evt1".to_string()));
     }
 }

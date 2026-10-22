@@ -5,19 +5,25 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 use crate::markdown_split::split_markdown;
 use crate::platforms::helpers::send_with_rate_limit_retry;
 
 /// Maximum message length for Signal sends (8000 chars); longer texts are
 /// split into sequential messages, never truncated.
 const MAX_MESSAGE_LENGTH: usize = 8000;
+
+/// Delay between signal-cli receive polls. The `/v1/receive` endpoint
+/// long-polls briefly itself, so a short sleep keeps CPU use low without
+/// adding latency.
+const RECEIVE_POLL_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Incoming message types
@@ -193,6 +199,67 @@ impl SignalAdapter {
             .await
             .map_err(|e| GatewayError::ConnectionFailed(format!("Signal parse failed: {}", e)))?;
         Ok(messages)
+    }
+
+    /// Clone of the stop `Notify`, signaled by [`SignalAdapter::stop`].
+    pub fn stop_notifier(&self) -> Arc<Notify> {
+        self.stop_signal.clone()
+    }
+
+    /// Convert a parsed [`IncomingSignalMessage`] into a gateway-level
+    /// [`IncomingMessage`]. DMs route on the sender's number; group messages
+    /// route on the group ID.
+    fn to_incoming(msg: &IncomingSignalMessage) -> IncomingMessage {
+        let is_dm = msg.group_id.is_none();
+        IncomingMessage {
+            platform: "signal".into(),
+            chat_id: msg.group_id.clone().unwrap_or_else(|| msg.source.clone()),
+            user_id: msg.source.clone(),
+            text: msg.text.clone(),
+            message_id: None,
+            is_dm,
+        }
+    }
+
+    /// Run the signal-cli receive poll loop, forwarding parsed messages as
+    /// platform-agnostic [`IncomingMessage`]s on `tx`.
+    ///
+    /// Each batch from [`SignalAdapter::receive_messages`] is parsed via
+    /// [`SignalAdapter::parse_received_message`] and gated by
+    /// [`SignalAdapter::is_incoming_allowed`] (fail-closed group gate) before
+    /// forwarding. The loop ends when [`SignalAdapter::stop`] signals, or
+    /// when the `tx` receiver is dropped.
+    pub async fn run_poll_loop(self: &Arc<Self>, tx: mpsc::Sender<IncomingMessage>) {
+        info!("Signal receive poll loop started");
+        loop {
+            match self.receive_messages().await {
+                Ok(raw) => {
+                    for value in &raw {
+                        let Some(parsed) = Self::parse_received_message(value) else {
+                            continue;
+                        };
+                        if !Self::is_incoming_allowed(&parsed) {
+                            continue;
+                        }
+                        if tx.send(Self::to_incoming(&parsed)).await.is_err() {
+                            info!("Signal poll loop stopping (inbound receiver dropped)");
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Signal receive poll failed: {e}");
+                }
+            }
+            tokio::select! {
+                _ = self.stop_signal.notified() => {
+                    info!("Signal poll loop stopping (stop signaled)");
+                    break;
+                }
+                _ = tokio::time::sleep(RECEIVE_POLL_DELAY) => {}
+            }
+        }
+        info!("Signal receive poll loop stopped");
     }
 }
 
@@ -430,5 +497,43 @@ mod tests {
         assert!(SignalAdapter::is_incoming_allowed(&signal_msg(Some(
             "any-group"
         ))));
+    }
+
+    #[test]
+    fn to_incoming_dm_routes_on_sender() {
+        let incoming = SignalAdapter::to_incoming(&signal_msg(None));
+        assert_eq!(incoming.platform, "signal");
+        assert_eq!(incoming.chat_id, "+15551234567");
+        assert_eq!(incoming.user_id, "+15551234567");
+        assert_eq!(incoming.text, "hi");
+        assert!(incoming.is_dm);
+    }
+
+    #[test]
+    fn to_incoming_group_routes_on_group_id() {
+        let incoming = SignalAdapter::to_incoming(&signal_msg(Some("group.abc==")));
+        assert_eq!(incoming.chat_id, "group.abc==");
+        assert_eq!(incoming.user_id, "+15551234567");
+        assert!(!incoming.is_dm);
+    }
+
+    #[test]
+    fn parse_received_message_envelope() {
+        let msg = serde_json::json!({
+            "envelope": {
+                "source": "+15559876543",
+                "timestamp": 1760000001000u64,
+                "dataMessage": {
+                    "message": "hello there",
+                    "groupInfo": { "groupId": "group.xyz==" },
+                    "attachments": [{ "id": "att-1" }]
+                }
+            }
+        });
+        let parsed = SignalAdapter::parse_received_message(&msg).unwrap();
+        assert_eq!(parsed.source, "+15559876543");
+        assert_eq!(parsed.text, "hello there");
+        assert_eq!(parsed.group_id, Some("group.xyz==".to_string()));
+        assert_eq!(parsed.attachments, vec!["att-1".to_string()]);
     }
 }
