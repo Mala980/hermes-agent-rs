@@ -73,6 +73,13 @@ pub struct TelegramConfig {
     /// Bot username (without @), used for mention filtering in groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_username: Option<String>,
+
+    /// Config-file allowlist of Telegram user IDs (numeric, as strings)
+    /// admitted in addition to the env-driven allowlist (see
+    /// [`crate::allowlist`]). `None` (or an empty list) leaves the env
+    /// allowlist as the sole gate — behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_users: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -822,11 +829,19 @@ impl TelegramAdapter {
         };
 
         let user_id = parsed.user_id.map(|u| u.to_string()).unwrap_or_default();
-        if !crate::allowlist::is_platform_user_allowed("telegram", &user_id) {
+        // Union gate: env allowlist (fail-closed) OR the config-file
+        // `allowed_users` list. A missing/empty `allowed_users` leaves the
+        // env gate as the sole authority — behavior identical to before.
+        let in_config_list = self
+            .config
+            .allowed_users
+            .as_deref()
+            .is_some_and(|list| list.iter().any(|id| id == &user_id));
+        if !crate::allowlist::is_platform_user_allowed("telegram", &user_id) && !in_config_list {
             warn!(
                 user_id = %user_id,
                 update_id = update.update_id,
-                "Telegram: dropping update from non-allowlisted user (fail-closed)"
+                "Telegram: dropping update from user not in env allowlist nor config allowed_users (fail-closed)"
             );
             return true;
         }
@@ -1523,8 +1538,8 @@ mod tests {
     // update_to_incoming: Update -> gateway-level IncomingMessage conversion
     // -----------------------------------------------------------------------
 
-    fn test_adapter() -> TelegramAdapter {
-        TelegramAdapter::new(TelegramConfig {
+    fn test_adapter_config() -> TelegramConfig {
+        TelegramConfig {
             token: "test-token".into(),
             webhook_url: None,
             polling: true,
@@ -1533,8 +1548,19 @@ mod tests {
             parse_html: false,
             poll_timeout: 30,
             bot_username: None,
-        })
-        .unwrap()
+            allowed_users: None,
+        }
+    }
+
+    fn test_adapter() -> TelegramAdapter {
+        TelegramAdapter::new(test_adapter_config()).unwrap()
+    }
+
+    /// Test adapter with a config-file `allowed_users` list.
+    fn make_adapter_with_allowed_users(allowed: Option<Vec<String>>) -> TelegramAdapter {
+        let mut config = test_adapter_config();
+        config.allowed_users = allowed;
+        TelegramAdapter::new(config).unwrap()
     }
 
     #[test]
@@ -1740,6 +1766,119 @@ mod tests {
         set_test_var("TELEGRAM_ALLOWED_USERS", old_allowed.as_deref());
         set_test_var("GATEWAY_ALLOWED_USERS", old_fallback.as_deref());
         set_test_var("TELEGRAM_ALLOW_ALL_USERS", old_all.as_deref());
+    }
+
+    /// Clear all env allowlist vars for the config-file gate tests below.
+    fn clear_allowlist_env() -> [Option<String>; 3] {
+        [
+            set_test_var("TELEGRAM_ALLOWED_USERS", None),
+            set_test_var("GATEWAY_ALLOWED_USERS", None),
+            set_test_var("TELEGRAM_ALLOW_ALL_USERS", None),
+        ]
+    }
+
+    fn restore_allowlist_env(old: [Option<String>; 3]) {
+        let [allowed, fallback, all] = old;
+        set_test_var("TELEGRAM_ALLOWED_USERS", allowed.as_deref());
+        set_test_var("GATEWAY_ALLOWED_USERS", fallback.as_deref());
+        set_test_var("TELEGRAM_ALLOW_ALL_USERS", all.as_deref());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_config_allowlist_admits_user() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = clear_allowlist_env();
+
+        // Env allowlist empty -> user passes purely via config `allowed_users`.
+        let adapter = make_adapter_with_allowed_users(Some(vec!["123".into()]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(60, 123, "config allow");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        let gw = rx.try_recv().expect("config-allowlisted user must pass");
+        assert_eq!(gw.user_id, "123");
+
+        restore_allowlist_env(old);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_config_allowlist_denies_user() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = clear_allowlist_env();
+
+        // Env allowlist empty and user not in config list -> fail-closed drop.
+        let adapter = make_adapter_with_allowed_users(Some(vec!["123".into()]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(61, 456, "config deny");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        assert!(rx.try_recv().is_err());
+
+        restore_allowlist_env(old);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_env_fallback_unchanged_without_config_list() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = clear_allowlist_env();
+        set_test_var("TELEGRAM_ALLOWED_USERS", Some("123"));
+
+        // allowed_users = None -> env decides alone (allow then deny).
+        let adapter = make_adapter_with_allowed_users(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let update = make_dm_text_update(62, 123, "env allow");
+        assert!(adapter.process_update(&update, &tx).await);
+        assert_eq!(rx.try_recv().unwrap().user_id, "123");
+
+        let update = make_dm_text_update(63, 456, "env deny");
+        assert!(adapter.process_update(&update, &tx).await);
+        assert!(rx.try_recv().is_err());
+
+        restore_allowlist_env(old);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_env_and_config_union() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = clear_allowlist_env();
+        set_test_var("TELEGRAM_ALLOWED_USERS", Some("789"));
+
+        // In env but NOT in config list -> still allowed (union).
+        let adapter = make_adapter_with_allowed_users(Some(vec!["123".into()]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(64, 789, "env union");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        let gw = rx.try_recv().expect("env-allowlisted user must pass");
+        assert_eq!(gw.user_id, "789");
+
+        restore_allowlist_env(old);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock
+    async fn process_update_empty_config_list_is_env_only() {
+        let _lock = crate::allowlist::ENV_LOCK.lock().unwrap();
+        let old = clear_allowlist_env();
+
+        // Empty config list behaves like None: env decides alone, fail-closed.
+        let adapter = make_adapter_with_allowed_users(Some(vec![]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let update = make_dm_text_update(65, 123, "empty list deny");
+
+        let keep_going = adapter.process_update(&update, &tx).await;
+        assert!(keep_going);
+        assert!(rx.try_recv().is_err());
+
+        restore_allowlist_env(old);
     }
 
     #[test]
@@ -2131,6 +2270,7 @@ mod tests {
             parse_html: false,
             poll_timeout: 30,
             bot_username: username.map(|s| s.to_string()),
+            allowed_users: None,
         };
         TelegramAdapter::new(config).unwrap()
     }
