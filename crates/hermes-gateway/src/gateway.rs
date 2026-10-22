@@ -9,11 +9,12 @@
 //!
 //! Also integrates `StreamManager` for progressive message editing.
 
+use crate::streaming::StreamEditState;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
@@ -1139,33 +1140,47 @@ impl Gateway {
             .await;
         let stream_id = stream_handle.id.clone();
 
-        // Send an initial placeholder message
-        self.send_message(&incoming.platform, &incoming.chat_id, "...", None)
-            .await?;
+        // Send an initial placeholder message, capturing its platform id so
+        // streaming flushes edit it in place instead of posting a new
+        // message per flush.
+        let stream_adapter = self.get_adapter(&incoming.platform).await.ok_or_else(|| {
+            GatewayError::Platform(format!(
+                "No adapter registered for platform: {}",
+                incoming.platform
+            ))
+        })?;
+        let placeholder_id: Option<i64> = stream_adapter
+            .send_message_raw(&incoming.chat_id, "...", None)
+            .await?
+            .into_iter()
+            .next();
+        let edit_state = StreamEditState {
+            adapter: stream_adapter,
+            chat_id: incoming.chat_id.clone(),
+            placeholder_id,
+            last_sent_text: Arc::new(StdMutex::new("...".to_string())),
+            finalized: Arc::new(AtomicBool::new(false)),
+            edit_guard: Arc::new(AsyncMutex::new(())),
+        };
 
         // Set up the chunk callback that updates the stream and edits the message
         let stream_manager = self.stream_manager.clone();
-        let platform = incoming.platform.clone();
-        let chat_id = incoming.chat_id.clone();
-        let gateway_adapters = self.adapters.read().await.clone();
         let sid = stream_id.clone();
+        let chunk_state = edit_state.clone();
 
         let on_chunk: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |chunk: String| {
             let sm = stream_manager.clone();
             let sid = sid.clone();
-            let platform = platform.clone();
-            let chat_id = chat_id.clone();
-            let adapters = gateway_adapters.clone();
+            let state = chunk_state.clone();
 
             tokio::spawn(async move {
+                if state.finalized.load(Ordering::SeqCst) {
+                    return;
+                }
                 if let Some(should_flush) = sm.update_stream(&sid, &chunk).await {
                     if should_flush {
                         if let Some(content) = sm.get_stream_content(&sid).await {
-                            if let Some(adapter) = adapters.get(&platform) {
-                                // For streaming, we'd need the message_id from the initial send.
-                                // This is a simplified version.
-                                let _ = adapter.send_message(&chat_id, &content, None).await;
-                            }
+                            state.flush_edit(&content).await;
                         }
                     }
                 }
@@ -1185,6 +1200,11 @@ impl Gateway {
         let response = match response_result {
             Ok(text) => text,
             Err(e) => {
+                // Best-effort cleanup: stop late flush edits and remove the
+                // "..." placeholder so it doesn't linger after a failed
+                // stream. Also finish the stream so its handle doesn't leak.
+                edit_state.abort().await;
+                self.stream_manager.finish_stream(&stream_id).await;
                 self.flush_post_delivery_messages(
                     &incoming.platform,
                     &incoming.chat_id,
@@ -1203,6 +1223,12 @@ impl Gateway {
 
         // Finish the stream
         self.stream_manager.finish_stream(&stream_id).await;
+
+        // Final flush: make sure the placeholder shows the complete response.
+        // (Mid-stream flushes stop at the buffer threshold, so trailing text
+        // may not have been edited in yet, and short responses may never
+        // have triggered a flush at all.)
+        edit_state.finalize(&response).await?;
 
         // Add assistant response to session
         self.session_manager
@@ -2554,9 +2580,16 @@ mod tests {
 
         let msgs = sent.lock().unwrap();
         let ordered: Vec<String> = msgs.iter().map(|(_, t)| t.clone()).collect();
+        // C6: the finalized stream response is delivered ("stream-final");
+        // the test adapter reports no message ids, so it arrives as a new
+        // message. Deferred messages still flush after the stream finishes.
         assert_eq!(
             ordered,
-            vec!["...".to_string(), "💾 stream-bg-review".to_string()]
+            vec![
+                "...".to_string(),
+                "stream-final".to_string(),
+                "💾 stream-bg-review".to_string()
+            ]
         );
     }
 
@@ -2896,5 +2929,257 @@ mod tests {
         restore("GATEWAY_ALLOWED_USERS", old_g);
         restore("DISCORD_ALLOW_ALL_USERS", old_a);
         restore("GATEWAY_ALLOW_ALL_USERS", old_ga);
+    }
+
+    // -----------------------------------------------------------------------
+    // StreamEditState tests (C6 streaming fix)
+    // -----------------------------------------------------------------------
+
+    /// Adapter that records edits / sends / deletes for streaming tests.
+    struct StreamTestAdapter {
+        edits: Arc<Mutex<Vec<(String, String)>>>,
+        sends: Arc<Mutex<Vec<String>>>,
+        deletes: Arc<Mutex<Vec<i64>>>,
+        edit_error: Option<String>,
+        max_chars: usize,
+    }
+
+    impl StreamTestAdapter {
+        fn new() -> Self {
+            Self {
+                edits: Arc::new(Mutex::new(Vec::new())),
+                sends: Arc::new(Mutex::new(Vec::new())),
+                deletes: Arc::new(Mutex::new(Vec::new())),
+                edit_error: None,
+                max_chars: usize::MAX,
+            }
+        }
+
+        fn edit_state(&self, placeholder_id: Option<i64>) -> StreamEditState {
+            StreamEditState {
+                adapter: Arc::new(self.clone_inner()),
+                chat_id: "chat1".to_string(),
+                placeholder_id,
+                last_sent_text: Arc::new(StdMutex::new("...".to_string())),
+                finalized: Arc::new(AtomicBool::new(false)),
+                edit_guard: Arc::new(AsyncMutex::new(())),
+            }
+        }
+
+        fn clone_inner(&self) -> StreamTestAdapter {
+            StreamTestAdapter {
+                edits: self.edits.clone(),
+                sends: self.sends.clone(),
+                deletes: self.deletes.clone(),
+                edit_error: self.edit_error.clone(),
+                max_chars: self.max_chars,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for StreamTestAdapter {
+        async fn start(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn send_message(
+            &self,
+            _chat_id: &str,
+            text: &str,
+            _parse_mode: Option<ParseMode>,
+        ) -> Result<(), GatewayError> {
+            self.sends.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            message_id: &str,
+            text: &str,
+        ) -> Result<(), GatewayError> {
+            self.edits
+                .lock()
+                .unwrap()
+                .push((message_id.to_string(), text.to_string()));
+            match &self.edit_error {
+                Some(msg) => Err(GatewayError::SendFailed(msg.clone())),
+                None => Ok(()),
+            }
+        }
+
+        async fn delete_message(
+            &self,
+            _chat_id: &str,
+            message_id: i64,
+        ) -> Result<(), GatewayError> {
+            self.deletes.lock().unwrap().push(message_id);
+            Ok(())
+        }
+
+        fn max_edit_chars(&self) -> usize {
+            self.max_chars
+        }
+
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _file_path: &str,
+            _caption: Option<&str>,
+        ) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn platform_name(&self) -> &str {
+            "stream-test"
+        }
+    }
+
+    #[test]
+    fn stream_not_modified_detection() {
+        let err = GatewayError::SendFailed(
+            "Telegram API returned HTTP 400: {\"ok\":false,\"description\":\"Bad Request: message is not modified\"}".into(),
+        );
+        assert!(is_not_modified_error(&err));
+        assert!(!is_not_modified_error(&GatewayError::SendFailed(
+            "boom".into()
+        )));
+        assert!(!is_not_modified_error(&GatewayError::Platform(
+            "nope".into()
+        )));
+    }
+
+    #[tokio::test]
+    async fn stream_flush_edit_skips_identical_content() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(Some(7));
+
+        state.flush_edit("hello").await;
+        state.flush_edit("hello").await;
+        assert_eq!(adapter.edits.lock().unwrap().len(), 1);
+
+        state.flush_edit("hello world").await;
+        let edits = adapter.edits.lock().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0], ("7".to_string(), "hello".to_string()));
+        assert_eq!(edits[1], ("7".to_string(), "hello world".to_string()));
+        assert!(adapter.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_flush_edit_treats_not_modified_as_success() {
+        let mut adapter = StreamTestAdapter::new();
+        adapter.edit_error = Some(
+            "Telegram API returned HTTP 400: {\"description\":\"Bad Request: message is not modified\"}".to_string(),
+        );
+        let state = adapter.edit_state(Some(7));
+
+        // Treated as success: last-sent text is updated, so the identical
+        // follow-up flush is skipped rather than retried.
+        state.flush_edit("hi").await;
+        state.flush_edit("hi").await;
+        assert_eq!(adapter.edits.lock().unwrap().len(), 1);
+        assert_eq!(*state.last_sent_text.lock().unwrap(), "hi");
+    }
+
+    #[tokio::test]
+    async fn stream_flush_edit_swallows_other_errors() {
+        let mut adapter = StreamTestAdapter::new();
+        adapter.edit_error = Some("flood".to_string());
+        let state = adapter.edit_state(Some(7));
+
+        state.flush_edit("hi").await;
+        // Failed edit: last-sent text is NOT updated, so a later flush with
+        // new content still goes out.
+        assert_eq!(*state.last_sent_text.lock().unwrap(), "...");
+        state.flush_edit("hi!").await;
+        assert_eq!(adapter.edits.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_flush_edit_falls_back_to_send_without_message_id() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(None);
+
+        state.flush_edit("abc").await;
+        assert!(adapter.edits.lock().unwrap().is_empty());
+        assert_eq!(*adapter.sends.lock().unwrap(), vec!["abc".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stream_finalize_edits_placeholder_in_place() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(Some(9));
+        state.flush_edit("hel").await;
+
+        state.finalize("hello").await.expect("finalize ok");
+        let edits = adapter.edits.lock().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[1], ("9".to_string(), "hello".to_string()));
+        assert!(adapter.sends.lock().unwrap().is_empty());
+        assert!(adapter.deletes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_finalize_skips_when_already_current() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(Some(9));
+        state.flush_edit("hello").await;
+
+        state.finalize("hello").await.expect("finalize ok");
+        assert_eq!(adapter.edits.lock().unwrap().len(), 1);
+        assert!(adapter.sends.lock().unwrap().is_empty());
+        assert!(adapter.deletes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_finalize_deletes_and_sends_when_too_long() {
+        let mut adapter = StreamTestAdapter::new();
+        adapter.max_chars = 10;
+        let state = adapter.edit_state(Some(9));
+
+        state
+            .finalize("this response is way too long")
+            .await
+            .expect("finalize ok");
+        assert!(adapter.edits.lock().unwrap().is_empty());
+        assert_eq!(*adapter.deletes.lock().unwrap(), vec![9]);
+        assert_eq!(
+            *adapter.sends.lock().unwrap(),
+            vec!["this response is way too long".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_finalize_empty_response_deletes_placeholder() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(Some(9));
+
+        state.finalize("").await.expect("finalize ok");
+        assert_eq!(*adapter.deletes.lock().unwrap(), vec![9]);
+        assert!(adapter.edits.lock().unwrap().is_empty());
+        assert!(adapter.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_abort_deletes_placeholder_and_stops_edits() {
+        let adapter = StreamTestAdapter::new();
+        let state = adapter.edit_state(Some(9));
+
+        state.abort().await;
+        assert_eq!(*adapter.deletes.lock().unwrap(), vec![9]);
+
+        // Late flush after abort: skipped, no edit issued.
+        state.flush_edit("late content").await;
+        assert!(adapter.edits.lock().unwrap().is_empty());
     }
 }
