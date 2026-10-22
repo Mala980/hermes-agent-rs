@@ -104,6 +104,13 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     .get("poll_timeout")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30);
+                // M-T4: opt-in message reactions (👀 while processing,
+                // 👍/👎 after). Defaults to false.
+                let message_reactions = platform_cfg
+                    .extra
+                    .get("message_reactions")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let telegram_cfg = TelegramConfig {
                     token,
                     webhook_url: platform_cfg.webhook_url.clone(),
@@ -123,6 +130,9 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                             Some(ids)
                         }
                     },
+                    group_require_mention: false,
+                    command_menu_max: None,
+                    message_reactions,
                 };
                 match TelegramAdapter::new(telegram_cfg) {
                     Ok(adapter) => {
@@ -272,10 +282,6 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                             .ok()
                             .filter(|s| !s.is_empty())
                     }),
-                    webhook_host: extra_string(platform_cfg, "webhook_host"),
-                    webhook_port: extra_string(platform_cfg, "webhook_port")
-                        .and_then(|s| s.parse::<u16>().ok()),
-                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match WhatsAppAdapter::new(wa_cfg) {
@@ -316,10 +322,6 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     app_secret,
                     verification_token: extra_string(platform_cfg, "verification_token"),
                     encrypt_key: extra_string(platform_cfg, "encrypt_key"),
-                    webhook_host: extra_string(platform_cfg, "webhook_host"),
-                    webhook_port: extra_string(platform_cfg, "webhook_port")
-                        .and_then(|s| s.parse::<u16>().ok()),
-                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match FeishuAdapter::new(feishu_cfg) {
@@ -390,10 +392,6 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                 let bb_cfg = BlueBubblesConfig {
                     server_url,
                     password,
-                    webhook_host: extra_string(platform_cfg, "webhook_host"),
-                    webhook_port: extra_string(platform_cfg, "webhook_port")
-                        .and_then(|s| s.parse::<u16>().ok()),
-                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                     proxy: Default::default(),
                 };
                 match BlueBubblesAdapter::new(bb_cfg) {
@@ -457,11 +455,6 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     account_sid,
                     auth_token,
                     from_number,
-                    webhook_host: extra_string(platform_cfg, "webhook_host"),
-                    webhook_port: extra_string(platform_cfg, "webhook_port")
-                        .and_then(|s| s.parse::<u16>().ok()),
-                    webhook_path: extra_string(platform_cfg, "webhook_path"),
-                    webhook_url: extra_string(platform_cfg, "webhook_url"),
                     proxy: Default::default(),
                 };
                 match SmsAdapter::new(sms_cfg) {
