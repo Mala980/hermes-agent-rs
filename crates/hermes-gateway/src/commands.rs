@@ -329,6 +329,59 @@ pub fn all_commands() -> Vec<CommandInfo> {
     ]
 }
 
+/// Build the (command, description) list for Telegram's `setMyCommands` menu.
+///
+/// Dynamic: combines builtin [`all_commands`] with any registered
+/// [`SlashCommandExtension`] entries. Names are stripped of the leading `/`
+/// and sanitized for Telegram (lowercase alphanumeric + underscore).
+/// Capped at 100 (Telegram Bot API limit).
+pub fn telegram_menu_commands() -> Vec<(String, String)> {
+    fn sanitize(name: &str) -> Option<String> {
+        let clean: String = name
+            .trim_start_matches('/')
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let clean = clean.trim_matches('_').to_string();
+        if clean.is_empty() || clean.len() > 32 {
+            None
+        } else {
+            Some(clean)
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    // Builtins first (canonical names only, no aliases).
+    for info in all_commands() {
+        if let Some(name) = sanitize(info.name) {
+            if seen.insert(name.clone()) {
+                out.push((name, info.description.to_string()));
+            }
+        }
+    }
+
+    // Then extension-registered commands.
+    if let Some(lock) = SLASH_EXTENSIONS.get() {
+        for ext in lock.read().expect("slash extensions poisoned").iter() {
+            for entry in ext.extension_help_entries() {
+                // usage is like "/cmd args" — take the first token as the name.
+                let raw_name = entry.usage.split_whitespace().next().unwrap_or("");
+                if let Some(name) = sanitize(raw_name) {
+                    if seen.insert(name.clone()) {
+                        out.push((name, entry.description.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    out.truncate(100);
+    out
+}
+
 /// Parse and dispatch a gateway slash command.
 pub fn handle_command(input: &str) -> GatewayCommandResult {
     let trimmed = input.trim();
@@ -773,5 +826,29 @@ mod tests {
             GatewayCommandResult::ShowInsights(s) => assert!(!s.is_empty()),
             other => panic!("Expected ShowInsights, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn telegram_menu_commands_is_dynamic_and_sanitized() {
+        let menu = telegram_menu_commands();
+        // Should include all builtins (no leading slash, no aliases as separate entries).
+        assert!(
+            menu.len() >= 20,
+            "expected 20+ commands, got {}",
+            menu.len()
+        );
+        assert!(menu.iter().any(|(n, _)| n == "status"));
+        assert!(menu.iter().any(|(n, _)| n == "new"));
+        assert!(menu.iter().any(|(n, _)| n == "help"));
+        // No leading slashes.
+        assert!(menu.iter().all(|(n, _)| !n.starts_with('/')));
+        // No duplicates.
+        let mut names: Vec<&str> = menu.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), menu.len(), "duplicate command names in menu");
+        // Within Telegram limits.
+        assert!(menu.len() <= 100);
+        assert!(menu.iter().all(|(n, d)| n.len() <= 32 && !d.is_empty()));
     }
 }

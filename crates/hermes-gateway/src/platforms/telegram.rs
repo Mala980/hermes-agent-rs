@@ -382,48 +382,19 @@ impl TelegramAdapter {
     /// Register the bot's / command menu via `setMyCommands`.
     ///
     /// Mirrors the original's `_register_command_menu`: exposes the gateway's
-    /// slash commands in Telegram's UI. Best-effort — failures are returned
-    /// so the caller can log them, but must not fail startup.
+    /// slash commands in Telegram's UI. Dynamic — built from
+    /// [`crate::commands::telegram_menu_commands`] (builtins + extensions).
+    /// Best-effort — failures are returned so the caller can log them, but
+    /// must not fail startup.
     pub async fn register_command_menu(&self) -> Result<(), GatewayError> {
-        // Keep in sync with `crate::commands::dispatch_builtin_command`.
-        // (command, description) pairs shown in Telegram's / menu.
-        // Canonical names only (no aliases like /bg, /cancel, /clear).
-        const COMMANDS: &[(&str, &str)] = &[
-            ("help", "Show available commands"),
-            ("new", "Start a new conversation"),
-            ("reset", "Reset the current session"),
-            ("retry", "Retry the last message"),
-            ("undo", "Undo the last turn"),
-            ("stop", "Stop the agent"),
-            ("status", "Show session status"),
-            ("model", "Show or switch model"),
-            ("provider", "Show or switch provider"),
-            ("personality", "Show or switch personality"),
-            ("profile", "Show or switch profile"),
-            ("sessions", "List sessions"),
-            ("branch", "Branch the conversation"),
-            ("rollback", "Rollback to a checkpoint"),
-            ("compress", "Compress context"),
-            ("reasoning", "Toggle reasoning display"),
-            ("verbose", "Toggle verbose mode"),
-            ("usage", "Show token usage"),
-            ("budget", "Show budget status"),
-            ("tools", "List available tools"),
-            ("commands", "List slash commands"),
-            ("background", "Run in background"),
-            ("btw", "Side message to agent"),
-            ("fast", "Switch to fast model"),
-            ("yolo", "Toggle auto-approve mode"),
-            ("approve", "Approve a user (admin)"),
-            ("deny", "Deny a user (admin)"),
-            ("sethome", "Set home directory"),
-            ("insights", "Show session insights"),
-            ("update", "Check for updates"),
-        ];
+        let menu = crate::commands::telegram_menu_commands();
 
-        let commands: Vec<serde_json::Value> = COMMANDS
+        let commands: Vec<serde_json::Value> = menu
             .iter()
-            .map(|(cmd, desc)| serde_json::json!({ "command": cmd, "description": desc }))
+            .map(|(cmd, desc)| {
+                let desc = desc.chars().take(256).collect::<String>();
+                serde_json::json!({ "command": cmd, "description": desc })
+            })
             .collect();
 
         let url = format!("{}/setMyCommands", self.api_base);
@@ -431,7 +402,7 @@ impl TelegramAdapter {
         let resp: TelegramResponse<serde_json::Value> = self.post_json(&url, &body).await?;
 
         if resp.ok {
-            tracing::info!("Telegram setMyCommands OK ({} commands)", COMMANDS.len());
+            tracing::info!("Telegram setMyCommands OK ({} commands)", menu.len());
         } else {
             tracing::warn!(
                 "Telegram setMyCommands returned ok=false: {:?}",
