@@ -12,15 +12,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
-use tracing::{debug, info};
+use tokio::sync::{mpsc, Notify};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 use crate::markdown_split::split_markdown;
 use crate::platforms::helpers::send_with_rate_limit_retry;
 
@@ -29,6 +33,18 @@ const SLACK_API_BASE: &str = "https://slack.com/api";
 
 /// Maximum message length for Slack (4000 characters for text blocks).
 const MAX_MESSAGE_LENGTH: usize = 4000;
+
+/// Base delay between Socket Mode reconnect attempts; doubles per attempt,
+/// capped by [`SOCKET_RECONNECT_MAX_DELAY`].
+const SOCKET_RECONNECT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const SOCKET_RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Exponential backoff for Socket Mode reconnect attempts.
+fn reconnect_delay(attempt: u32) -> std::time::Duration {
+    let shift = attempt.min(5);
+    let secs = SOCKET_RECONNECT_BASE_DELAY.as_secs() << shift;
+    std::time::Duration::from_secs(secs.min(SOCKET_RECONNECT_MAX_DELAY.as_secs()))
+}
 
 // ---------------------------------------------------------------------------
 // SlackConfig
@@ -913,6 +929,175 @@ impl SlackAdapter {
     }
 
     // -----------------------------------------------------------------------
+    // Socket Mode: supervised receive loop
+    // -----------------------------------------------------------------------
+
+    /// Clone of the stop `Notify`, signaled by [`SlackAdapter::stop`].
+    pub fn stop_notifier(&self) -> Arc<Notify> {
+        self.stop_signal.clone()
+    }
+
+    /// Convert a parsed [`IncomingSlackMessage`] into a gateway-level
+    /// [`IncomingMessage`]. Slack DM channels start with `D`; everything
+    /// else is a channel/group.
+    pub fn to_incoming(msg: &IncomingSlackMessage) -> IncomingMessage {
+        IncomingMessage {
+            platform: "slack".into(),
+            chat_id: msg.channel.clone(),
+            user_id: msg.user_id.clone().unwrap_or_default(),
+            text: msg.text.clone(),
+            message_id: Some(msg.ts.clone()),
+            is_dm: msg.channel.starts_with('D'),
+        }
+    }
+
+    /// Run the Socket Mode receive loop, forwarding parsed message events
+    /// as platform-agnostic [`IncomingMessage`]s on `tx`.
+    ///
+    /// Requires `socket_mode = true` and an app-level token (`xapp-...`);
+    /// without them this returns immediately. Connects via
+    /// [`SlackAdapter::get_socket_mode_url`], acks every envelope that
+    /// carries an `envelope_id` (Slack re-delivers un-acked envelopes),
+    /// and reconnects with exponential backoff on disconnect. The loop
+    /// ends when [`SlackAdapter::stop`] signals, or when the `tx` receiver
+    /// is dropped.
+    pub async fn run_socket_loop(self: &Arc<Self>, tx: mpsc::Sender<IncomingMessage>) {
+        if !self.config.socket_mode {
+            debug!("Slack Socket Mode disabled; skipping socket loop");
+            return;
+        }
+        info!("Slack Socket Mode loop started");
+        let mut attempt: u32 = 0;
+        while self.base.is_running() {
+            let url = match self.get_socket_mode_url().await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!("Slack Socket Mode connect URL failed: {e}");
+                    attempt = attempt.saturating_add(1);
+                    let delay = reconnect_delay(attempt);
+                    info!("Slack Socket Mode retrying in {delay:?} (attempt {attempt})");
+                    tokio::select! {
+                        _ = self.stop_signal.notified() => break,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
+            match connect_async(&url).await {
+                Ok((ws_stream, _)) => {
+                    attempt = 0;
+                    if !self.serve_socket_connection(ws_stream, &tx).await {
+                        // Receiver dropped: end the loop.
+                        return;
+                    }
+                }
+                Err(e) => {
+                    warn!("Slack Socket Mode connect failed: {e}");
+                }
+            }
+            if !self.base.is_running() {
+                break;
+            }
+            attempt = attempt.saturating_add(1);
+            let delay = reconnect_delay(attempt);
+            info!("Slack Socket Mode reconnecting in {delay:?} (attempt {attempt})");
+            tokio::select! {
+                _ = self.stop_signal.notified() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        info!("Slack Socket Mode loop stopped");
+    }
+
+    /// Serve one Socket Mode WebSocket connection.
+    ///
+    /// Returns `true` to reconnect, `false` when the inbound receiver was
+    /// dropped and the loop must end.
+    async fn serve_socket_connection(
+        &self,
+        ws_stream: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tx: &mpsc::Sender<IncomingMessage>,
+    ) -> bool {
+        let (mut sink, mut stream) = ws_stream.split();
+        let mut session = SocketModeSession::new();
+        session.mark_connecting();
+
+        loop {
+            tokio::select! {
+                _ = self.stop_signal.notified() => {
+                    let _ = sink.close().await;
+                    return true;
+                }
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(WsMessage::Text(text))) => {
+                            let envelope: SocketModeEnvelope = match serde_json::from_str(&text) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    debug!("ignoring malformed Socket Mode payload: {e}");
+                                    continue;
+                                }
+                            };
+                            match session.handle_envelope(&envelope) {
+                                SocketModeAction::MessageEvent(msg) => {
+                                    if let Some(id) = envelope.envelope_id.as_deref() {
+                                        let ack = SocketModeSession::build_ack_payload(id);
+                                        if sink.send(WsMessage::Text(ack)).await.is_err() {
+                                            return true;
+                                        }
+                                    }
+                                    if tx.send(Self::to_incoming(&msg)).await.is_err() {
+                                        info!("Slack socket loop stopping (inbound receiver dropped)");
+                                        return false;
+                                    }
+                                }
+                                SocketModeAction::Ack => {
+                                    if let Some(id) = envelope.envelope_id.as_deref() {
+                                        let ack = SocketModeSession::build_ack_payload(id);
+                                        if sink.send(WsMessage::Text(ack)).await.is_err() {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                SocketModeAction::InteractiveEvent(_)
+                                | SocketModeAction::SlashCommand(_) => {
+                                    if let Some(id) = envelope.envelope_id.as_deref() {
+                                        let ack = SocketModeSession::build_ack_payload(id);
+                                        if sink.send(WsMessage::Text(ack)).await.is_err() {
+                                            return true;
+                                        }
+                                    }
+                                    debug!(envelope_type = %envelope.envelope_type, "Socket Mode event acked (not routed)");
+                                }
+                                SocketModeAction::Ignore => {
+                                    if session.state() == SocketModeConnectionState::Closing {
+                                        debug!("Slack requested Socket Mode disconnect; reconnecting");
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        Some(Ok(WsMessage::Ping(p))) => {
+                            let _ = sink.send(WsMessage::Pong(p)).await;
+                        }
+                        Some(Ok(WsMessage::Close(_))) | None => {
+                            debug!("Slack Socket Mode connection closed by peer");
+                            return true;
+                        }
+                        Some(Err(e)) => {
+                            warn!("Slack Socket Mode WebSocket error: {e}");
+                            return true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Web API: App Home tab
     // -----------------------------------------------------------------------
 
@@ -1586,5 +1771,41 @@ mod tests {
     fn split_markdown_at_newline_boundary() {
         let text = format!("{}\n{}", "a".repeat(3999), "b".repeat(100));
         assert_eq!(split_markdown(&text, 4000).len(), 2);
+    }
+
+    #[test]
+    fn to_incoming_dm_vs_channel() {
+        let dm = IncomingSlackMessage {
+            channel: "D012345".to_string(),
+            user_id: Some("U111".to_string()),
+            text: "hi".to_string(),
+            ts: "1729600000.0001".to_string(),
+            thread_ts: None,
+            is_bot: false,
+        };
+        let incoming = SlackAdapter::to_incoming(&dm);
+        assert_eq!(incoming.platform, "slack");
+        assert_eq!(incoming.chat_id, "D012345");
+        assert_eq!(incoming.user_id, "U111");
+        assert_eq!(incoming.message_id, Some("1729600000.0001".to_string()));
+        assert!(incoming.is_dm);
+
+        let chan = IncomingSlackMessage {
+            channel: "C012345".to_string(),
+            ..dm
+        };
+        let incoming = SlackAdapter::to_incoming(&chan);
+        assert!(!incoming.is_dm);
+    }
+
+    #[test]
+    fn socket_reconnect_delay_backoff() {
+        use std::time::Duration;
+        assert_eq!(reconnect_delay(0), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(4));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(8));
+        // Capped at 60s.
+        assert_eq!(reconnect_delay(10), Duration::from_secs(60));
+        assert_eq!(reconnect_delay(100), Duration::from_secs(60));
     }
 }
