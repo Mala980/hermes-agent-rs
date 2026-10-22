@@ -242,6 +242,60 @@ async fn main() {
         CliCommand::Webhook { port } => cmd::webhook::cmd_webhook(&cli, port).await,
         CliCommand::Run { prompt } => cmd::run::cmd_run(cli, &prompt).await,
         CliCommand::Tui => cmd::tui_cmd::cmd_tui(cli).await,
+        // ── Quick-wins port (NousResearch/hermes-agent) ──────────────
+        CliCommand::Claw { action } => hermes_cli::commands::handle_cli_claw(action).await,
+        CliCommand::Pairing { action, device_id } => {
+            hermes_cli::commands::handle_cli_pairing(action, device_id).await
+        }
+        CliCommand::Skin {
+            action,
+            key,
+            value,
+            skin,
+        } => cmd::skin::cmd_skin(cli, action, key, value, skin).await,
+        CliCommand::Pause { reason } => cmd::estop::cmd_pause(reason).await,
+        CliCommand::Resume => cmd::estop::cmd_resume().await,
+        CliCommand::Browser { action, browser } => {
+            cmd::browser::cmd_browser(cli, action, browser).await
+        }
+        CliCommand::Fallback {
+            action,
+            provider,
+            model,
+            base_url,
+            target,
+        } => cmd::fallback::cmd_fallback(cli, action, provider, model, base_url, target).await,
+        CliCommand::Moa {
+            action,
+            name,
+            reference,
+            aggregator,
+        } => cmd::moa::cmd_moa(cli, action, name, reference, aggregator).await,
+        CliCommand::Slack {
+            action,
+            name,
+            description,
+            long_description,
+            long_description_file,
+            slashes_only,
+            agent_view,
+            no_assistant,
+            write,
+        } => {
+            cmd::slack::cmd_slack(
+                cli,
+                action,
+                name,
+                description,
+                long_description,
+                long_description_file,
+                slashes_only,
+                agent_view,
+                no_assistant,
+                write,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {

@@ -171,7 +171,7 @@ pub fn load_user_config_file(path: &Path) -> Result<GatewayConfig, ConfigError> 
     }
 }
 
-const CONFIG_PATCH_HELP: &str = "model, personality, max_turns, system_prompt, budget.max_result_size_chars, budget.max_aggregate_chars, proxy.http, proxy.socks, tui.theme, llm.<provider>.api_key|base_url|model|command|args|oauth_token_url|oauth_client_id, smart_model_routing.enabled|max_simple_chars|max_simple_words|cheap_model.model|cheap_model.provider";
+const CONFIG_PATCH_HELP: &str = "model, personality, max_turns, system_prompt, display.skin, budget.max_result_size_chars, budget.max_aggregate_chars, proxy.http, proxy.socks, tui.theme, llm.<provider>.api_key|base_url|model|command|args|oauth_token_url|oauth_client_id, smart_model_routing.enabled|max_simple_chars|max_simple_words|cheap_model.model|cheap_model.provider";
 
 fn mask_secret(s: &str) -> String {
     if s.is_empty() {
@@ -340,6 +340,9 @@ fn apply_user_config_patch_dotted(
         ["tui", "theme"] => {
             config.tui.theme = Some(value.trim().to_string());
         }
+        ["display", "skin"] => {
+            config.display.skin = Some(value.trim().to_string());
+        }
         _ => {
             return Err(ConfigError::NotFound(format!(
                 "unknown config key: {} (supported: {})",
@@ -456,6 +459,13 @@ pub fn user_config_field_display(config: &GatewayConfig, key: &str) -> Result<St
         ["tui", "theme"] => Ok(config
             .tui
             .theme
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(not set)".to_string())),
+        ["display", "skin"] => Ok(config
+            .display
+            .skin
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())

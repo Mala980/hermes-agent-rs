@@ -26,6 +26,77 @@ pub struct TuiConfig {
 }
 
 // ---------------------------------------------------------------------------
+// DisplayConfig (ported from the original `hermes skin`)
+// ---------------------------------------------------------------------------
+
+/// Display settings (CLI/TUI skin selection).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DisplayConfig {
+    /// Active skin name (e.g. `"default"`); `None` = default skin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skin: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// FallbackProviderEntry (ported from the original `hermes fallback`)
+// ---------------------------------------------------------------------------
+
+/// One entry in the fallback provider chain, tried in order when the primary
+/// route fails (rate-limit, 5xx, connection errors).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FallbackProviderEntry {
+    /// Provider id (e.g. `"openai"`, `"anthropic"`).
+    #[serde(default)]
+    pub provider: String,
+    /// Model name on that provider.
+    #[serde(default)]
+    pub model: String,
+    /// Optional base URL override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// MoaConfig (ported from the original `hermes moa`)
+// ---------------------------------------------------------------------------
+
+/// One Mixture-of-Agents model slot: a provider + model pair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MoaModelSlot {
+    /// Provider id (e.g. `"openai"`).
+    #[serde(default)]
+    pub provider: String,
+    /// Model name.
+    #[serde(default)]
+    pub model: String,
+}
+
+/// One named MoA preset: reference models + the acting aggregator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MoaPreset {
+    /// Reference models polled for proposals.
+    #[serde(default)]
+    pub reference_models: Vec<MoaModelSlot>,
+    /// The aggregator model (runs every tool-loop step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregator: Option<MoaModelSlot>,
+}
+
+/// Mixture-of-Agents preset configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MoaConfig {
+    /// Named presets.
+    #[serde(default)]
+    pub presets: HashMap<String, MoaPreset>,
+    /// Name of the default preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_preset: Option<String>,
+    /// Name of the currently active preset ("" = none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_preset: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // GatewayConfig
 // ---------------------------------------------------------------------------
 
@@ -128,6 +199,18 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub tui: TuiConfig,
 
+    /// Display settings (CLI skin selection via `hermes skin`).
+    #[serde(default)]
+    pub display: DisplayConfig,
+
+    /// Fallback provider chain (tried in order when the primary fails).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_providers: Vec<FallbackProviderEntry>,
+
+    /// Mixture-of-Agents presets.
+    #[serde(default, skip_serializing_if = "is_moa_config_empty")]
+    pub moa: MoaConfig,
+
     /// Override for the hermes home directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_dir: Option<String>,
@@ -160,9 +243,16 @@ impl Default for GatewayConfig {
             profile: ProfileConfig::default(),
             agent: AgentLoopBehaviorConfig::default(),
             tui: TuiConfig::default(),
+            display: DisplayConfig::default(),
+            fallback_providers: Vec::new(),
+            moa: MoaConfig::default(),
             home_dir: None,
         }
     }
+}
+
+fn is_moa_config_empty(cfg: &MoaConfig) -> bool {
+    cfg.presets.is_empty() && cfg.default_preset.is_none() && cfg.active_preset.is_none()
 }
 
 // ---------------------------------------------------------------------------
