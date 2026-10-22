@@ -15,12 +15,15 @@ use hermes_core::traits::{ParseMode, PlatformAdapter};
 use crate::adapter::BasePlatformAdapter;
 
 pub mod error;
+pub mod media;
 pub mod parsing;
 pub mod polling;
 pub mod sending;
 pub mod types;
+pub mod voice;
 
 use error::*;
+use media::MediaDownloader;
 use sending::MAX_MESSAGE_LENGTH;
 
 // Re-export the full types surface so `telegram::X` paths keep working.
@@ -48,6 +51,8 @@ pub struct TelegramAdapter {
     /// The bot's own Telegram user ID, resolved via `getMe` in `start()`.
     /// `0` means unknown — the own-message filter is fail-open until then.
     bot_id: AtomicI64,
+    /// Inbound media download pipeline (`getFile` + local cache, M-M1).
+    media_downloader: MediaDownloader,
     /// Chat IDs known to be forum supergroups with topics (M-G5). Learned
     /// from inbound `message_thread_id`s and from threaded outbound sends.
     /// Used to (a) target the typing bubble at the right topic and (b) avoid
@@ -64,6 +69,10 @@ impl TelegramAdapter {
 
         let client = base.build_client()?;
         let api_base = format!("https://api.telegram.org/bot{}", config.token);
+
+        // Inbound media pipeline (M-M1): getFile downloads cached by
+        // file_unique_id under the configured media cache dir.
+        let media_downloader = MediaDownloader::new(&config, &client, &config.token);
 
         // Register the config-file allowlist so the gateway-level fail-closed
         // gate (`route_message`) honors it as a union with the env allowlist.
@@ -83,11 +92,16 @@ impl TelegramAdapter {
             typing_cooldown_until: std::sync::Mutex::new(HashMap::new()),
             bot_id: AtomicI64::new(0),
             forum_chats: std::sync::Mutex::new(HashSet::new()),
+            media_downloader,
         })
     }
     /// Get a reference to the configuration.
     pub fn config(&self) -> &TelegramConfig {
         &self.config
+    }
+    /// Inbound media download pipeline (`getFile` + cache, M-M1).
+    pub(crate) fn media_downloader(&self) -> &MediaDownloader {
+        &self.media_downloader
     }
     /// Re-arm typing after an outbound message lands (M-T2).
     ///
@@ -397,6 +411,7 @@ pub(crate) mod test_helpers {
             photo: None,
             caption: None,
             sticker: None,
+            document: None,
             reply_to_message: None,
             sender_chat: None,
             entities: None,
@@ -419,6 +434,10 @@ pub(crate) mod test_helpers {
             command_menu_max: None,
             message_reactions: false,
             command_menu_skills: true,
+            media_cache_dir: None,
+            media_max_mb: 20,
+            media_enabled: true,
+            stt_enabled: true,
         }
     }
     pub(crate) fn test_adapter() -> TelegramAdapter {
@@ -488,6 +507,10 @@ pub(crate) mod test_helpers {
             command_menu_max: None,
             message_reactions: false,
             command_menu_skills: true,
+            media_cache_dir: None,
+            media_max_mb: 20,
+            media_enabled: true,
+            stt_enabled: true,
         };
         TelegramAdapter::new(config).unwrap()
     }
@@ -640,5 +663,24 @@ mod tests {
 
         // The other chat's cooldown survives.
         assert!(typing_on_cooldown(&adapter.typing_cooldown_until, other));
+    }
+
+    /// M-M1: the adapter wires a `MediaDownloader` from its config —
+    /// enabled by default with the 20MB public-API cap and a cache dir
+    /// under the test `media_cache_dir` override.
+    #[test]
+    fn media_downloader_wired_from_config() {
+        let adapter = test_adapter();
+        let dl = adapter.media_downloader();
+        assert!(dl.enabled());
+        assert_eq!(dl.max_bytes(), 20 * 1024 * 1024);
+
+        let mut config = test_adapter_config();
+        config.media_enabled = false;
+        config.media_max_mb = 50;
+        let adapter = TelegramAdapter::new(config).unwrap();
+        let dl = adapter.media_downloader();
+        assert!(!dl.enabled());
+        assert_eq!(dl.max_bytes(), 50 * 1024 * 1024);
     }
 }
