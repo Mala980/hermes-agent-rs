@@ -356,6 +356,12 @@ impl TelegramAdapter {
         let client = base.build_client()?;
         let api_base = format!("https://api.telegram.org/bot{}", config.token);
 
+        // Register the config-file allowlist so the gateway-level fail-closed
+        // gate (`route_message`) honors it as a union with the env allowlist.
+        if let Some(ref allowed) = config.allowed_users {
+            crate::allowlist::register_config_allowlist("telegram", allowed.clone());
+        }
+
         Ok(Self {
             base,
             config,
@@ -1561,6 +1567,29 @@ mod tests {
         let mut config = test_adapter_config();
         config.allowed_users = allowed;
         TelegramAdapter::new(config).unwrap()
+    }
+
+    #[test]
+    fn config_allowlist_registered_on_adapter_new() {
+        // Serialize with other allowlist tests: the registry is global.
+        let _guard = crate::allowlist::ENV_LOCK.lock().unwrap();
+        // Creating the adapter registers its config-file allowlist, so the
+        // gateway-level fail-closed gate admits the user without env vars.
+        let _adapter = make_adapter_with_allowed_users(Some(vec!["565903951".to_string()]));
+        assert!(crate::allowlist::is_platform_user_allowed(
+            "telegram",
+            "565903951"
+        ));
+        assert!(!crate::allowlist::is_platform_user_allowed(
+            "telegram",
+            "999999999"
+        ));
+        crate::allowlist::clear_config_allowlist("telegram");
+        // After clearing, fail-closed again (no env vars in test env).
+        assert!(!crate::allowlist::is_platform_user_allowed(
+            "telegram",
+            "565903951"
+        ));
     }
 
     #[test]
