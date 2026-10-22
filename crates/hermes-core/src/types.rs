@@ -251,6 +251,12 @@ pub struct UsageStats {
     pub total_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_cost: Option<f64>,
+    /// Anthropic prompt-cache counters: input tokens served from cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    /// Anthropic prompt-cache counters: input tokens written to cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// Record of a tool error during execution.

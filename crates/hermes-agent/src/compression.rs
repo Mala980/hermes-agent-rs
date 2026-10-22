@@ -1111,6 +1111,8 @@ mod tests {
                     completion_tokens: 1,
                     total_tokens: 2,
                     estimated_cost: None,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
             })
         }

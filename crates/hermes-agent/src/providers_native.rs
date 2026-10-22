@@ -848,6 +848,8 @@ impl LlmProvider for GeminiProvider {
                             completion_tokens: completion,
                             total_tokens: prompt + completion,
                             estimated_cost: None,
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
                         });
                     }
                     let parts = v
@@ -1831,6 +1833,8 @@ fn bedrock_usage(prompt_tokens: u64, completion_tokens: u64) -> UsageStats {
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
         estimated_cost: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
     }
 }
 

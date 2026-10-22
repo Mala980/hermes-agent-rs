@@ -48,6 +48,8 @@ impl LlmProvider for AlwaysToolCallLlm {
                 completion_tokens: 5,
                 total_tokens: 15,
                 estimated_cost: None,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
             }),
             model: "mock".to_string(),
             finish_reason: Some("tool_calls".to_string()),

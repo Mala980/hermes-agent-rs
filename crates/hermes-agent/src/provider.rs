@@ -981,12 +981,8 @@ fn anthropic_env_keys() -> Vec<String> {
 struct AnthropicStreamUsage {
     input_tokens: u64,
     output_tokens: u64,
-    // Parsed and accumulated, but not yet surfaced: hermes-core's UsageStats
-    // has no cache fields (they arrive with the wave 1-3 types.rs change).
-    // Wire into to_stats() once the fields exist.
-    #[allow(dead_code)]
+    // Surfaced into UsageStats by to_stats() below.
     cache_read_input_tokens: Option<u64>,
-    #[allow(dead_code)]
     cache_creation_input_tokens: Option<u64>,
 }
 
@@ -1014,9 +1010,8 @@ impl AnthropicStreamUsage {
             completion_tokens: self.output_tokens,
             total_tokens: self.input_tokens + self.output_tokens,
             estimated_cost: None,
-            // NOTE: cache_read/cache_creation counters are parsed into the
-            // accumulator above but dropped here until hermes-core's
-            // UsageStats gains the corresponding fields.
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
         }
     }
 }
@@ -1581,6 +1576,10 @@ impl AnthropicProvider {
                 completion_tokens: output,
                 total_tokens: input + output,
                 estimated_cost: None,
+                cache_read_input_tokens: u.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+                cache_creation_input_tokens: u
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64()),
             }
         });
 
@@ -2240,6 +2239,8 @@ pub(crate) fn parse_sse_chunk(json: &Value) -> Option<StreamChunk> {
             .unwrap_or(0),
         total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
         estimated_cost: None,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
     });
 
     Some(StreamChunk {
@@ -2306,6 +2307,8 @@ pub(crate) fn parse_openai_response(json: &Value) -> Result<LlmResponse, AgentEr
             completion_tokens: u.get("completion_tokens")?.as_u64()?,
             total_tokens: u.get("total_tokens")?.as_u64()?,
             estimated_cost: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         })
     });
 
@@ -2907,10 +2910,12 @@ mod tests {
                 let u = c.usage.as_ref().expect("usage chunk");
                 assert_eq!(u.prompt_tokens, 10);
                 assert_eq!(u.completion_tokens, 0);
-                // Cache counters are parsed into the accumulator (surfaced
-                // into UsageStats once hermes-core gains the fields).
+                // Cache counters are parsed into the accumulator and surfaced
+                // into the chunk's UsageStats.
                 assert_eq!(usage.cache_creation_input_tokens, Some(4));
                 assert_eq!(usage.cache_read_input_tokens, Some(2));
+                assert_eq!(u.cache_creation_input_tokens, Some(4));
+                assert_eq!(u.cache_read_input_tokens, Some(2));
             }
             other => panic!("expected Chunk, got {other:?}"),
         }
@@ -3053,9 +3058,9 @@ mod tests {
         assert_eq!(u.prompt_tokens, 12);
         assert_eq!(u.completion_tokens, 3);
         assert_eq!(u.total_tokens, 15);
-        // NOTE: cache_creation/cache_read counters are parsed by the stream
-        // accumulator but not surfaced in UsageStats until hermes-core gains
-        // the fields (see AnthropicStreamUsage).
+        // Cache counters are surfaced into UsageStats.
+        assert_eq!(u.cache_creation_input_tokens, Some(6));
+        assert_eq!(u.cache_read_input_tokens, Some(1));
     }
 
     // ------------------------------------------------------------------

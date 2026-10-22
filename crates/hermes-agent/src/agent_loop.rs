@@ -5642,7 +5642,8 @@ fn estimate_usage_cost_usd(usage: &UsageStats, model: &str, config: &AgentConfig
     Some(prompt_cost + completion_cost)
 }
 
-/// Merge two UsageStats, summing token counts and keeping the latest cost estimate.
+/// Merge two UsageStats, summing token counts (including Anthropic cache
+/// counters) and keeping the latest cost estimate.
 fn merge_usage(existing: Option<UsageStats>, new: &UsageStats) -> UsageStats {
     match existing {
         Some(prev) => UsageStats {
@@ -5655,8 +5656,26 @@ fn merge_usage(existing: Option<UsageStats>, new: &UsageStats) -> UsageStats {
                 (None, Some(b)) => Some(b),
                 (None, None) => None,
             },
+            cache_read_input_tokens: add_opt_u64(
+                prev.cache_read_input_tokens,
+                new.cache_read_input_tokens,
+            ),
+            cache_creation_input_tokens: add_opt_u64(
+                prev.cache_creation_input_tokens,
+                new.cache_creation_input_tokens,
+            ),
         },
         None => new.clone(),
+    }
+}
+
+/// Sum two optional counters; `None` only when both sides are absent.
+fn add_opt_u64(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
     }
 }
 
@@ -6458,6 +6477,8 @@ mod tests {
                         completion_tokens: 5,
                         total_tokens: 15,
                         estimated_cost: Some(cost),
+                        cache_read_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     model: "test-model".into(),
                     finish_reason: Some("stop".into()),
@@ -7743,12 +7764,16 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
             estimated_cost: Some(0.01),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let b = UsageStats {
             prompt_tokens: 200,
             completion_tokens: 100,
             total_tokens: 300,
             estimated_cost: Some(0.02),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let merged = merge_usage(Some(a), &b);
         assert_eq!(merged.prompt_tokens, 300);
@@ -7764,9 +7789,47 @@ mod tests {
             completion_tokens: 100,
             total_tokens: 300,
             estimated_cost: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let merged = merge_usage(None, &b);
         assert_eq!(merged.prompt_tokens, 200);
+    }
+
+    #[test]
+    fn test_merge_usage_sums_cache_counters() {
+        let a = UsageStats {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            estimated_cost: None,
+            cache_read_input_tokens: Some(10),
+            cache_creation_input_tokens: Some(4),
+        };
+        let b = UsageStats {
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            total_tokens: 300,
+            estimated_cost: None,
+            cache_read_input_tokens: Some(5),
+            cache_creation_input_tokens: None,
+        };
+        let merged = merge_usage(Some(a), &b);
+        assert_eq!(merged.cache_read_input_tokens, Some(15));
+        // One-sided presence is preserved, not dropped.
+        assert_eq!(merged.cache_creation_input_tokens, Some(4));
+
+        let c = UsageStats {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            estimated_cost: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        };
+        let merged_none = merge_usage(Some(c), &b);
+        assert_eq!(merged_none.cache_read_input_tokens, Some(5));
+        assert_eq!(merged_none.cache_creation_input_tokens, None);
     }
 
     #[test]
@@ -7777,6 +7840,8 @@ mod tests {
             completion_tokens: 1000,
             total_tokens: 2000,
             estimated_cost: Some(0.42),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let cost = estimate_usage_cost_usd(&u, "openai:gpt-4o", &cfg).unwrap();
         assert!((cost - 0.42).abs() < 1e-9);
@@ -7790,6 +7855,8 @@ mod tests {
             completion_tokens: 1_000_000,
             total_tokens: 2_000_000,
             estimated_cost: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         };
         let cost = estimate_usage_cost_usd(&u, "openai:gpt-4o-mini", &cfg).unwrap();
         assert!((cost - 0.75).abs() < 1e-9);

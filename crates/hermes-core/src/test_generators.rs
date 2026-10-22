@@ -117,13 +117,23 @@ pub fn arb_usage_stats() -> impl Strategy<Value = UsageStats> {
         0u64..100_000,
         0u64..100_000,
         proptest::option::of(0.0f64..100.0),
+        proptest::option::of(0u64..100_000),
+        proptest::option::of(0u64..100_000),
     )
         .prop_map(
-            |(prompt_tokens, completion_tokens, estimated_cost)| UsageStats {
+            |(
+                prompt_tokens,
+                completion_tokens,
+                estimated_cost,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            )| UsageStats {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
                 estimated_cost,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
             },
         )
 }
