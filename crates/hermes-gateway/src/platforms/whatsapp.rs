@@ -4,20 +4,25 @@
 //! Sends messages via `POST /v1/messages` and receives via webhook.
 
 use std::collections::{HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tokio::sync::{mpsc, Notify, RwLock};
+use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 use crate::markdown_split::split_markdown;
-use crate::platforms::helpers::{send_with_rate_limit_retry, verify_hmac_sha256_signature};
+use crate::platforms::helpers::{
+    constant_time_eq, parse_http_query, read_http_request, send_with_rate_limit_retry,
+    verify_hmac_sha256_signature, write_http_response,
+};
 
 const WHATSAPP_API_BASE: &str = "https://graph.facebook.com/v18.0";
 
@@ -27,6 +32,18 @@ const MAX_MESSAGE_LENGTH: usize = 4096;
 
 /// Maximum number of inbound wamids kept for duplicate suppression.
 pub const MAX_DEDUP_WAMIDS: usize = 5000;
+
+/// Default bind host for the inbound webhook server.
+const DEFAULT_WEBHOOK_HOST: &str = "0.0.0.0";
+
+/// Default port for the inbound webhook server (mirrors the original).
+const DEFAULT_WEBHOOK_PORT: u16 = 8090;
+
+/// Default path for the inbound webhook server (mirrors the original).
+const DEFAULT_WEBHOOK_PATH: &str = "/whatsapp/webhook";
+
+/// Maximum webhook POST body accepted (Meta caps at 3MB).
+const WEBHOOK_MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Incoming message types
@@ -71,6 +88,18 @@ pub struct WhatsAppConfig {
     /// unset. Webhook POSTs are rejected (503) when neither is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_secret: Option<String>,
+
+    /// Bind host for the inbound webhook server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_host: Option<String>,
+
+    /// Port for the inbound webhook server (default 8090).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_port: Option<u16>,
+
+    /// Path for the inbound webhook server (default `/whatsapp/webhook`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_path: Option<String>,
 
     /// Proxy configuration for outbound requests.
     #[serde(default)]
@@ -133,6 +162,11 @@ pub struct WhatsAppAdapter {
     client: Client,
     stop_signal: Arc<Notify>,
     dedup: std::sync::Mutex<WamidDedup>,
+    /// Inbound channel to the gateway, set by the registry via
+    /// [`WhatsAppAdapter::set_inbound_sender`].
+    inbound_tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
+    /// Shutdown signal for the webhook server task spawned by `start()`.
+    shutdown_tx: RwLock<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl WhatsAppAdapter {
@@ -148,11 +182,46 @@ impl WhatsAppAdapter {
             client,
             stop_signal: Arc::new(Notify::new()),
             dedup: std::sync::Mutex::new(WamidDedup::default()),
+            inbound_tx: Arc::new(RwLock::new(None)),
+            shutdown_tx: RwLock::new(None),
         })
     }
 
     pub fn config(&self) -> &WhatsAppConfig {
         &self.config
+    }
+
+    /// Attach the gateway's inbound channel. Parsed webhook messages are
+    /// forwarded on it by the server spawned in [`Self::start`].
+    pub async fn set_inbound_sender(&self, tx: mpsc::Sender<IncomingMessage>) {
+        *self.inbound_tx.write().await = Some(tx);
+    }
+
+    /// Convert a parsed webhook [`IncomingWhatsAppMessage`] into a
+    /// gateway-level [`IncomingMessage`], applying wamid dedup.
+    ///
+    /// Returns `None` when the message is a redelivery (already seen).
+    fn wamid_dedup_convert(
+        dedup: &std::sync::Mutex<WamidDedup>,
+        msg: &IncomingWhatsAppMessage,
+    ) -> Option<IncomingMessage> {
+        if dedup
+            .lock()
+            .map(|mut d| d.check_and_insert(&msg.message_id))
+            .unwrap_or(false)
+        {
+            debug!(wamid = %msg.message_id, "WhatsApp: dropping redelivered message");
+            return None;
+        }
+        Some(IncomingMessage {
+            platform: "whatsapp".into(),
+            chat_id: msg.from.clone(),
+            user_id: msg.from.clone(),
+            text: msg.text.clone(),
+            message_id: Some(msg.message_id.clone()),
+            // WhatsApp has no groups in this adapter: every message is a DM.
+            is_dm: true,
+        })
     }
 
     /// Send a text message via WhatsApp Cloud API.
@@ -501,16 +570,240 @@ impl WhatsAppAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Inbound webhook server
+// ---------------------------------------------------------------------------
+
+// HTTP request/response plumbing lives in `crate::platforms::helpers`
+// (`read_http_request`, `write_http_response`, `parse_http_query`,
+// `constant_time_eq`) and is shared with the Feishu/BlueBubbles/SMS
+// webhook receivers.
+
+/// Handle one inbound webhook connection.
+///
+/// - `GET <path>?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...`:
+///   Meta subscription handshake; echoes the challenge on success
+///   (fail-closed 503/400/403 without a configured/matching verify token).
+/// - `POST <path>`: Meta event notification; the raw body is HMAC-SHA256
+///   verified against the app secret (fail-closed 503/401), then parsed
+///   via [`WhatsAppAdapter::parse_webhook_event`] and forwarded to the
+///   gateway inbound channel. Always 200 once verified — Meta retries
+///   non-200 deliveries for up to 7 days, which would multiply agent work.
+async fn handle_webhook_request(
+    mut stream: tokio::net::TcpStream,
+    expected_path: &str,
+    verify_token: Option<&str>,
+    app_secret: Option<&str>,
+    inbound_tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
+    dedup: Arc<std::sync::Mutex<WamidDedup>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (request_line, headers, body) =
+        read_http_request(&mut stream, WEBHOOK_MAX_BODY_BYTES).await?;
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    let method = parts.first().copied().unwrap_or("GET");
+    let target = parts.get(1).copied().unwrap_or("/");
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (target, ""),
+    };
+    if path != expected_path {
+        write_http_response(&mut stream, 404, "text/plain", "not found").await?;
+        return Ok(());
+    }
+
+    match method {
+        "GET" => {
+            let Some(token) = verify_token.filter(|t| !t.is_empty()) else {
+                // Refuse rather than accept any token, which would let an
+                // attacker subscribe.
+                write_http_response(
+                    &mut stream,
+                    503,
+                    "text/plain",
+                    "verify_token not configured",
+                )
+                .await?;
+                return Ok(());
+            };
+            let q = parse_http_query(query);
+            let get = |k: &str| q.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+            let mode = get("hub.mode").unwrap_or("");
+            let challenge = get("hub.challenge").unwrap_or("");
+            let provided = get("hub.verify_token").unwrap_or("");
+            if mode != "subscribe" {
+                write_http_response(&mut stream, 400, "text/plain", "bad mode").await?;
+                return Ok(());
+            }
+            // Constant-time comparison.
+            let matched = constant_time_eq(provided, token);
+            if !matched {
+                warn!("WhatsApp webhook GET: verify_token mismatch");
+                write_http_response(&mut stream, 403, "text/plain", "verify_token mismatch")
+                    .await?;
+                return Ok(());
+            }
+            if challenge.is_empty() {
+                write_http_response(&mut stream, 400, "text/plain", "missing challenge").await?;
+                return Ok(());
+            }
+            write_http_response(&mut stream, 200, "text/plain", challenge).await?;
+        }
+        "POST" => {
+            // Without the app secret the sender can't be authenticated.
+            let Some(secret) = app_secret.filter(|s| !s.is_empty()) else {
+                warn!("WhatsApp webhook POST refused: app_secret unset");
+                write_http_response(&mut stream, 503, "text/plain", "app_secret not configured")
+                    .await?;
+                return Ok(());
+            };
+            if body.len() >= WEBHOOK_MAX_BODY_BYTES {
+                write_http_response(&mut stream, 413, "text/plain", "body too large").await?;
+                return Ok(());
+            }
+            let signature = headers
+                .iter()
+                .find(|(k, _)| k == "x-hub-signature-256")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("");
+            if !verify_hmac_sha256_signature(secret, &body, signature) {
+                warn!("WhatsApp webhook POST: invalid X-Hub-Signature-256");
+                write_http_response(&mut stream, 401, "text/plain", "invalid signature").await?;
+                return Ok(());
+            }
+            match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(payload) => {
+                    let messages = WhatsAppAdapter::parse_webhook_event(&payload);
+                    let tx = inbound_tx.read().await.clone();
+                    if let Some(tx) = tx {
+                        for msg in &messages {
+                            let Some(incoming) = WhatsAppAdapter::wamid_dedup_convert(&dedup, msg)
+                            else {
+                                continue;
+                            };
+                            if tx.send(incoming).await.is_err() {
+                                debug!("WhatsApp inbound receiver dropped");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("WhatsApp webhook body is not valid JSON: {e}");
+                }
+            }
+            write_http_response(&mut stream, 200, "text/plain", "ok").await?;
+        }
+        _ => {
+            write_http_response(&mut stream, 404, "text/plain", "not found").await?;
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl PlatformAdapter for WhatsAppAdapter {
     async fn start(&self) -> Result<(), GatewayError> {
         info!("WhatsApp adapter starting");
+        let host = self
+            .config
+            .webhook_host
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_HOST.to_string());
+        let port = self.config.webhook_port.unwrap_or(DEFAULT_WEBHOOK_PORT);
+        let path = self
+            .config
+            .webhook_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_WEBHOOK_PATH.to_string());
+        let verify_token = self.config.verify_token.clone();
+        // Resolve the app secret once; the request handler re-checks it
+        // per request so the fail-closed 503 behavior of
+        // `verify_webhook_post` is preserved.
+        let app_secret = self
+            .config
+            .app_secret
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("WHATSAPP_APP_SECRET")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+        if app_secret.is_none() {
+            warn!(
+                "WHATSAPP_APP_SECRET is not set — incoming webhook POSTs will be refused with 503. \
+                 Set the app secret to enable inbound message delivery."
+            );
+        }
+        if verify_token.as_deref().map(str::is_empty).unwrap_or(true) {
+            warn!(
+                "WhatsApp verify_token is not set — the GET subscription handshake will fail until it is."
+            );
+        }
+
+        let addr: SocketAddr = format!("{host}:{port}").parse().map_err(|e| {
+            GatewayError::ConnectionFailed(format!("WhatsApp webhook invalid address: {e}"))
+        })?;
+        let inbound_tx = self.inbound_tx.clone();
+        let dedup = Arc::new(std::sync::Mutex::new(WamidDedup::default()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        *self.shutdown_tx.write().await = Some(shutdown_tx);
+
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("WhatsApp webhook server failed to bind {addr}: {e}");
+                    return;
+                }
+            };
+            info!("WhatsApp webhook listening on {addr}{path}");
+            let mut shutdown_rx = shutdown_rx;
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        match accept {
+                            Ok((stream, peer)) => {
+                                let verify_token = verify_token.clone();
+                                let app_secret = app_secret.clone();
+                                let path = path.clone();
+                                let inbound_tx = inbound_tx.clone();
+                                let dedup = dedup.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_webhook_request(
+                                        stream,
+                                        &path,
+                                        verify_token.as_deref(),
+                                        app_secret.as_deref(),
+                                        inbound_tx,
+                                        dedup,
+                                    )
+                                    .await
+                                    {
+                                        debug!("WhatsApp webhook request error from {peer}: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => warn!("WhatsApp webhook accept error: {e}"),
+                        }
+                    }
+                    _ = &mut shutdown_rx => {
+                        info!("WhatsApp webhook server shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
         self.base.mark_running();
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), GatewayError> {
         info!("WhatsApp adapter stopping");
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
+            let _ = tx.send(());
+        }
         self.base.mark_stopped();
         self.stop_signal.notify_one();
         Ok(())
@@ -680,6 +973,9 @@ mod tests {
             business_account_id: None,
             verify_token: None,
             app_secret: None,
+            webhook_host: None,
+            webhook_port: None,
+            webhook_path: None,
             proxy: Default::default(),
         })
         .expect("adapter")
@@ -854,6 +1150,9 @@ mod tests {
             business_account_id: None,
             verify_token: None,
             app_secret: Some("cfg-secret".into()),
+            webhook_host: None,
+            webhook_port: None,
+            webhook_path: None,
             proxy: Default::default(),
         };
         let adapter = WhatsAppAdapter::new(cfg).expect("adapter");
@@ -876,6 +1175,9 @@ mod tests {
             business_account_id: None,
             verify_token: None,
             app_secret: None,
+            webhook_host: None,
+            webhook_port: None,
+            webhook_path: None,
             proxy: Default::default(),
         };
         let adapter = WhatsAppAdapter::new(cfg).expect("adapter");
@@ -888,5 +1190,50 @@ mod tests {
             adapter.verify_webhook_post(body, Some(&header)),
             Err((503, "whatsapp webhook not configured"))
         );
+    }
+
+    #[test]
+    fn whatsapp_verify_webhook_challenge() {
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook("subscribe", "tok123", "chal", "tok123"),
+            Some("chal".to_string())
+        );
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook("subscribe", "wrong", "chal", "tok123"),
+            None
+        );
+        assert_eq!(
+            WhatsAppAdapter::verify_webhook("unsubscribe", "tok123", "chal", "tok123"),
+            None
+        );
+    }
+
+    #[test]
+    fn whatsapp_wamid_dedup_convert_drops_redelivery() {
+        let dedup = std::sync::Mutex::new(WamidDedup::default());
+        let msg = IncomingWhatsAppMessage {
+            from: "15551234567".to_string(),
+            message_id: "wamid.1".to_string(),
+            text: "hi".to_string(),
+            message_type: "text".to_string(),
+            timestamp: "1760000000".to_string(),
+        };
+        let incoming = WhatsAppAdapter::wamid_dedup_convert(&dedup, &msg).expect("first delivery");
+        assert_eq!(incoming.platform, "whatsapp");
+        assert_eq!(incoming.chat_id, "15551234567");
+        assert!(incoming.is_dm);
+        assert_eq!(incoming.message_id, Some("wamid.1".to_string()));
+        // Redelivery of the same wamid is dropped.
+        assert!(WhatsAppAdapter::wamid_dedup_convert(&dedup, &msg).is_none());
+    }
+
+    #[test]
+    fn whatsapp_parse_webhook_event_text() {
+        let payload = webhook_body(&["wamid.abc"]);
+        let messages = WhatsAppAdapter::parse_webhook_event(&payload);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from, "15551234567");
+        assert_eq!(messages[0].message_id, "wamid.abc");
+        assert_eq!(messages[0].text, "hi");
     }
 }

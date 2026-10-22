@@ -51,6 +51,18 @@ pub struct WeComCallbackConfig {
     pub proxy: AdapterProxyConfig,
 }
 
+impl Default for WeComCallbackConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            path: default_path(),
+            apps: Vec::new(),
+            proxy: AdapterProxyConfig::default(),
+        }
+    }
+}
+
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
