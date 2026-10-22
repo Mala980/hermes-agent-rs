@@ -189,6 +189,10 @@ pub async fn register_platforms(
                         command_menu_max: None,
                         message_reactions: false,
                         command_menu_skills: true,
+                        media_cache_dir: None,
+                        media_max_mb: 20,
+                        media_enabled: true,
+                        stt_enabled: true,
                     };
                     match TelegramAdapter::new(telegram_config) {
                         Ok(adapter) => {

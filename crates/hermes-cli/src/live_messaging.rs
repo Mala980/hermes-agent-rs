@@ -118,6 +118,30 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     .get("command_menu_skills")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
+                // M-M1: inbound media pipeline settings. Defaults mirror
+                // the original (20MB public Bot API cap, media + STT
+                // enabled, no cache-dir override).
+                let media_cache_dir = platform_cfg
+                    .extra
+                    .get("media_cache_dir")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from);
+                let media_max_mb = platform_cfg
+                    .extra
+                    .get("media_max_mb")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(20);
+                let media_enabled = platform_cfg
+                    .extra
+                    .get("media_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let stt_enabled = platform_cfg
+                    .extra
+                    .get("stt_enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
                 let telegram_cfg = TelegramConfig {
                     token,
                     webhook_url: platform_cfg.webhook_url.clone(),
@@ -141,6 +165,10 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     command_menu_max: None,
                     message_reactions,
                     command_menu_skills,
+                    media_cache_dir,
+                    media_max_mb,
+                    media_enabled,
+                    stt_enabled,
                 };
                 match TelegramAdapter::new(telegram_cfg) {
                     Ok(adapter) => {
