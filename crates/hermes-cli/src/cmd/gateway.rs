@@ -160,9 +160,12 @@ pub(crate) async fn run_gateway(
             }
 
             // Build the gateway runtime (session manager, DM policy, hooks).
+            // DmManager is built from platform configs: per-platform
+            // unauthorized_dm_behavior, admin_users, and allowed_users
+            // (pre-authorized, since the operator explicitly vetted them).
             let session_manager =
                 Arc::new(hermes_gateway::SessionManager::new(config.session.clone()));
-            let dm_manager = hermes_gateway::DmManager::with_pair_behavior();
+            let dm_manager = hermes_gateway::DmManager::from_platform_configs(&config.platforms);
             let gateway = Arc::new(Gateway::new(
                 session_manager,
                 dm_manager,

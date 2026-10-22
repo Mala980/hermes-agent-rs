@@ -42,8 +42,12 @@ pub struct DmManager {
     /// Set of user IDs that have admin privileges.
     admin_users: HashSet<String>,
 
-    /// How to handle DMs from unauthorized users.
+    /// How to handle DMs from unauthorized users (global default).
     unauthorized_dm_behavior: UnauthorizedDmBehavior,
+
+    /// Per-platform override of `unauthorized_dm_behavior`, keyed by platform
+    /// name (e.g. "telegram"). Falls back to the global default when absent.
+    platform_behaviors: std::collections::HashMap<String, UnauthorizedDmBehavior>,
 }
 
 impl DmManager {
@@ -57,6 +61,7 @@ impl DmManager {
             authorized_users,
             admin_users,
             unauthorized_dm_behavior,
+            platform_behaviors: std::collections::HashMap::new(),
         }
     }
 
@@ -66,6 +71,7 @@ impl DmManager {
             authorized_users: HashSet::new(),
             admin_users: HashSet::new(),
             unauthorized_dm_behavior: UnauthorizedDmBehavior::Pair,
+            platform_behaviors: std::collections::HashMap::new(),
         }
     }
 
@@ -75,7 +81,35 @@ impl DmManager {
             authorized_users: HashSet::new(),
             admin_users: HashSet::new(),
             unauthorized_dm_behavior: UnauthorizedDmBehavior::Ignore,
+            platform_behaviors: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build a `DmManager` from platform configs.
+    ///
+    /// For each enabled platform:
+    /// - `unauthorized_dm_behavior` is registered as a per-platform override.
+    /// - `admin_users` are added as admins.
+    /// - `allowed_users` (union of the first-class field and
+    ///   `extra["allowed_users"]`) are pre-authorized (the operator explicitly
+    ///   vetted them, so DM pairing approval is redundant).
+    pub fn from_platform_configs(
+        platforms: &std::collections::HashMap<String, hermes_config::PlatformConfig>,
+    ) -> Self {
+        let mut mgr = Self::with_pair_behavior();
+        for (name, pc) in platforms {
+            if !pc.enabled {
+                continue;
+            }
+            mgr.set_platform_behavior(name, pc.unauthorized_dm_behavior);
+            for admin in &pc.admin_users {
+                mgr.add_admin(admin.clone());
+            }
+            for user in pc.allowed_users_union() {
+                mgr.authorize_user(user);
+            }
+        }
+        mgr
     }
 
     /// Handle an incoming DM from a user on a platform.
@@ -84,7 +118,7 @@ impl DmManager {
     /// - `Allow` if the user is authorized or is an admin
     /// - `Pair` if unauthorized and behavior is Pair
     /// - `Deny` if unauthorized and behavior is Ignore
-    pub async fn handle_dm(&self, user_id: &str, _platform: &str) -> DmDecision {
+    pub async fn handle_dm(&self, user_id: &str, platform: &str) -> DmDecision {
         // Admins are always allowed
         if self.admin_users.contains(user_id) {
             return DmDecision::Allow;
@@ -95,8 +129,14 @@ impl DmManager {
             return DmDecision::Allow;
         }
 
-        // Unauthorized user: apply the configured behavior
-        match self.unauthorized_dm_behavior {
+        // Unauthorized user: apply the platform-specific behavior, falling
+        // back to the global default.
+        let behavior = self
+            .platform_behaviors
+            .get(platform)
+            .copied()
+            .unwrap_or(self.unauthorized_dm_behavior);
+        match behavior {
             UnauthorizedDmBehavior::Pair => DmDecision::Pair {
                 message: Some(
                     "Your request has been submitted for approval. You will be notified once an admin reviews it.".to_string(),
@@ -104,6 +144,15 @@ impl DmManager {
             },
             UnauthorizedDmBehavior::Ignore => DmDecision::Deny,
         }
+    }
+
+    /// Set a per-platform override for the unauthorized-DM behavior.
+    pub fn set_platform_behavior(
+        &mut self,
+        platform: impl Into<String>,
+        behavior: UnauthorizedDmBehavior,
+    ) {
+        self.platform_behaviors.insert(platform.into(), behavior);
     }
 
     /// Add a user to the authorized users set.
@@ -158,6 +207,46 @@ mod tests {
 
         let decision = dm.handle_dm("user1", "telegram").await;
         assert_eq!(decision, DmDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn dm_manager_per_platform_behavior_override() {
+        let mut dm = DmManager::with_pair_behavior();
+        dm.set_platform_behavior("telegram", UnauthorizedDmBehavior::Ignore);
+
+        // telegram: Ignore → Deny (no pairing message)
+        let decision = dm.handle_dm("stranger", "telegram").await;
+        assert_eq!(decision, DmDecision::Deny);
+
+        // other platform: falls back to global Pair
+        let decision = dm.handle_dm("stranger", "discord").await;
+        assert!(matches!(decision, DmDecision::Pair { .. }));
+    }
+
+    #[tokio::test]
+    async fn dm_manager_from_platform_configs() {
+        use std::collections::HashMap;
+        let mut platforms = HashMap::new();
+        let mut pc = hermes_config::PlatformConfig::default();
+        pc.enabled = true;
+        pc.unauthorized_dm_behavior = UnauthorizedDmBehavior::Ignore;
+        pc.admin_users = vec!["admin1".to_string()];
+        pc.allowed_users = vec!["565903951".to_string()];
+        platforms.insert("telegram".to_string(), pc);
+
+        let dm = DmManager::from_platform_configs(&platforms);
+
+        // allowed_users pre-authorized → Allow (no pairing)
+        let decision = dm.handle_dm("565903951", "telegram").await;
+        assert_eq!(decision, DmDecision::Allow);
+
+        // admin → Allow
+        let decision = dm.handle_dm("admin1", "telegram").await;
+        assert_eq!(decision, DmDecision::Allow);
+
+        // stranger on telegram → per-platform Ignore → Deny
+        let decision = dm.handle_dm("stranger", "telegram").await;
+        assert_eq!(decision, DmDecision::Deny);
     }
 
     #[tokio::test]
