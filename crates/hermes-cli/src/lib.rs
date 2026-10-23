@@ -32,6 +32,7 @@ pub mod banner;
 pub mod checklist;
 pub mod claw_migrate;
 pub mod cli;
+pub mod cmd;
 pub mod commands;
 pub mod copilot_auth;
 pub mod doctor;

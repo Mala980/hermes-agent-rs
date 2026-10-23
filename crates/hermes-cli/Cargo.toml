@@ -15,6 +15,7 @@ name = "hermes"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
 hermes-core = { workspace = true }
 hermes-agent = { workspace = true }
 hermes-tools = { workspace = true }
@@ -40,18 +41,20 @@ hermes-gateway = { workspace = true, features = [
     "homeassistant",
     "api-server",
     "webhook",
+    "irc",
 ] }
 hermes-cron = { workspace = true }
 hermes-environments = { workspace = true }
+hermes-intelligence = { workspace = true }
 hermes-mcp = { workspace = true }
 hermes-acp = { workspace = true }
 hermes-skills = { workspace = true }
-hermes-eval = { workspace = true }
 hermes-telemetry = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
@@ -59,7 +62,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
-pulldown-cmark = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
