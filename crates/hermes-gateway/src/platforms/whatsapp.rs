@@ -219,6 +219,7 @@ impl WhatsAppAdapter {
             user_id: msg.from.clone(),
             text: msg.text.clone(),
             message_id: Some(msg.message_id.clone()),
+            thread_id: None,
             // WhatsApp has no groups in this adapter: every message is a DM.
             is_dm: true,
         })
