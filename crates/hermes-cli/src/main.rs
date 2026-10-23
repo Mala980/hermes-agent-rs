@@ -206,6 +206,71 @@ async fn main() {
         CliCommand::Console(args) => cmd::advanced::run_console(&args)
             .await
             .map_err(|e| e.to_string()),
+        // ── Restored fixed modules ──
+        CliCommand::Auth { action, provider } => cmd::auth::run_auth(cli, action, provider, false)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Batch { input, out } => cmd::batch::cmd_batch(&cli, &input, out.as_deref())
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Cloud { action } => cmd::cloud::run_cloud(
+            action, None, None, None, None, None, None, None, false, false, 30, 10, false,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+        CliCommand::Config { action, key } => cmd::config::run_config(cli, action, key, None)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Cron { action } => {
+            cmd::cron::run_cron(cli, action, None, None, None, None, None)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        CliCommand::Eval(cmd) => cmd::eval::cmd_eval(&cli, &cmd)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Fallback { action } => {
+            cmd::fallback::cmd_fallback(cli, action, None, None, None, None)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        CliCommand::Gateway { action } => cmd::gateway::run_gateway(cli, action, false, false)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Interactive => cmd::interactive::run_interactive(cli)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Misc { action } => {
+            eprintln!("misc: action {:?} not yet wired", action);
+            Ok(())
+        }
+        CliCommand::Moa { action } => cmd::moa::cmd_moa(cli, action, None, vec![], None)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Serve { action } => {
+            let opts = cmd::serve::ServeOptions {
+                action,
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+                no_gateway: false,
+                no_cron: false,
+                readonly: false,
+                yes: false,
+            };
+            cmd::serve::run_serve(cli, opts)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        CliCommand::Skin { action } => cmd::skin::cmd_skin(cli, action, None, None, None)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Tools { action } => cmd::tools::run_tools(cli, action, None)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Tui => cmd::tui_cmd::cmd_tui(cli).await.map_err(|e| e.to_string()),
+        CliCommand::Run { prompt } => cmd::run::cmd_run(cli, &prompt)
+            .await
+            .map_err(|e| e.to_string()),
     };
 
     if let Err(e) = result {

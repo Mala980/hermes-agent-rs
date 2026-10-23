@@ -26,3 +26,22 @@ pub mod estop;
 pub mod slack;
 pub mod voice;
 pub mod webhook;
+
+// ── Fixed broken modules (2026-10-23) ──
+pub mod auth;
+pub mod batch;
+pub mod cloud;
+pub mod common;
+pub mod config;
+pub mod cron;
+pub mod eval;
+pub mod fallback;
+pub mod gateway;
+pub mod interactive;
+pub mod misc;
+pub mod moa;
+pub mod run;
+pub mod serve;
+pub mod skin;
+pub mod tools;
+pub mod tui_cmd;

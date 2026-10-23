@@ -42,6 +42,7 @@ pub mod live_messaging;
 pub mod lumio;
 pub mod mcp_config;
 pub mod model_switch;
+pub mod oauth_store;
 pub mod pairing_store;
 pub mod profiles;
 pub mod providers;

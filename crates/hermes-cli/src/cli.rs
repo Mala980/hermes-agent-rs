@@ -440,6 +440,87 @@ pub enum CliCommand {
     Verify(crate::cmd::advanced::VerifyArgs),
     /// Interactive console.
     Console(crate::cmd::advanced::ConsoleArgs),
+
+    // ── Restored fixed modules ──
+    /// Authentication and OAuth management.
+    Auth {
+        /// Action: login, logout, status.
+        action: Option<String>,
+        /// Provider name.
+        provider: Option<String>,
+    },
+    /// Batch JSONL processing.
+    Batch {
+        /// Input JSONL file.
+        input: String,
+        /// Output file (optional).
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+    /// Cloud agent management.
+    Cloud {
+        /// Action to perform.
+        action: Option<String>,
+    },
+    /// Configuration management.
+    Config {
+        /// Action: get, set, list, reset.
+        action: Option<String>,
+        /// Config key.
+        key: Option<String>,
+    },
+    /// Cron job management.
+    Cron {
+        /// Action: list, add, remove.
+        action: Option<String>,
+    },
+    /// Run evaluation suites.
+    #[command(subcommand)]
+    Eval(crate::cli::EvalCmd),
+    /// Fallback provider chain management.
+    Fallback {
+        /// Action: list, add, remove, clear.
+        action: Option<String>,
+    },
+    /// Gateway management.
+    Gateway {
+        /// Action to perform.
+        action: Option<String>,
+    },
+    /// Interactive session (explicit).
+    Interactive,
+    /// Miscellaneous utilities.
+    Misc {
+        /// Action to perform.
+        action: Option<String>,
+    },
+    /// Mixture-of-Agents configuration.
+    Moa {
+        /// Action: list, configure, delete.
+        action: Option<String>,
+    },
+    /// HTTP server mode.
+    Serve {
+        /// Action to perform.
+        action: Option<String>,
+    },
+    /// Skin/theme management.
+    Skin {
+        /// Action: list, use, set.
+        action: Option<String>,
+    },
+    /// Tool configuration.
+    Tools {
+        /// Action: list, enable, disable.
+        action: Option<String>,
+    },
+    /// Launch the TUI.
+    Tui,
+    /// Run a one-shot prompt.
+    Run {
+        /// The prompt to run.
+        prompt: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -655,9 +736,6 @@ mod tests {
     fn removed_commands_are_rejected() {
         assert!(Cli::try_parse_from(vec!["hermes", "login"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "logout"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "dashboard"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "dump"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "insights"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "clipboard"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "whatsapp"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "lumio"]).is_err());
