@@ -862,6 +862,10 @@ async fn run_gateway_setup(cli: &Cli) -> Result<(), AgentError> {
                     .entry("telegram".to_string())
                     .or_insert_with(PlatformConfig::default);
                 tg.enabled = true;
+                let token = prompt_line("Telegram bot token (from @BotFather): ").await?;
+                if !token.trim().is_empty() {
+                    tg.token = Some(token.trim().to_string());
+                }
                 let polling = prompt_yes_no("Telegram use polling mode?", true).await?;
                 tg.extra
                     .insert("polling".to_string(), serde_json::Value::Bool(polling));
