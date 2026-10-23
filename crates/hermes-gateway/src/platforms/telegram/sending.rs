@@ -1,5 +1,7 @@
 //! Telegram adapter — outbound messaging.
 
+use std::path::{Path, PathBuf};
+
 use serde_json;
 use tracing::{debug, warn};
 
@@ -45,6 +47,325 @@ fn truncate_caption(caption: &str) -> String {
         "Telegram: caption exceeds {} chars, truncating", MAX_CAPTION_LENGTH
     );
     caption.chars().take(MAX_CAPTION_LENGTH).collect()
+}
+
+// ── Outbound media polish (M-M1…M-M4) ──────────────────────────────────
+//
+// Pure decision helpers (`photo_strategy`, `voice_route`,
+// `parse_media_duration_secs`, `parse_video_meta`) are unit-tested.
+// The ffmpeg/ffprobe wrappers are blocking — always call them inside
+// `tokio::task::spawn_blocking` — and degrade gracefully to `None` when
+// the binary is missing or the command fails, so the plain send path is
+// always available as a fallback.
+
+/// Photos larger than this are pre-compressed to JPEG before `sendPhoto`
+/// (M-M1; mirrors the original's `_IMG_COMPRESS_THRESHOLD_BYTES`).
+pub(crate) const PHOTO_COMPRESS_THRESHOLD_BYTES: u64 = 1_048_576;
+/// JPEG quality for pre-compressed photos (original `_IMG_JPEG_QUALITY`).
+/// ffmpeg's mjpeg `-q:v` scale runs 2 (best) → 31; 4 ≈ quality 85.
+pub(crate) const PHOTO_FFMPEG_QV: &str = "4";
+/// Longest side (px) for pre-compressed photos (original `_IMG_MAX_DIMENSION`).
+pub(crate) const PHOTO_MAX_DIMENSION: u32 = 1600;
+/// Practical `sendPhoto` ceiling (~10MB); larger photos go through
+/// `sendDocument` instead (M-M1). Telegram bot documents allow up to 50MB.
+pub(crate) const PHOTO_DOCUMENT_FALLBACK_BYTES: u64 = 10_485_760;
+/// Bitrate for Ogg/Opus voice transcodes (original `transcode_to_ogg_opus`).
+const VOICE_OPUS_BITRATE: &str = "32k";
+
+/// How a photo file should be sent (M-M1). Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PhotoStrategy {
+    /// Send as-is via `sendPhoto`.
+    Direct,
+    /// Try JPEG pre-compression first, then `sendPhoto`.
+    Compress,
+    /// Too large for `sendPhoto`; use `sendDocument` instead.
+    AsDocument,
+}
+
+/// Decide how a photo file should be sent (M-M1). Pure — unit-tested.
+pub(crate) fn photo_strategy(file_size: u64, extension: &str) -> PhotoStrategy {
+    if file_size > PHOTO_DOCUMENT_FALLBACK_BYTES {
+        return PhotoStrategy::AsDocument;
+    }
+    match extension
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        // Already JPEG — recompressing gains nothing.
+        "jpg" | "jpeg" => PhotoStrategy::Direct,
+        _ if file_size > PHOTO_COMPRESS_THRESHOLD_BYTES => PhotoStrategy::Compress,
+        _ => PhotoStrategy::Direct,
+    }
+}
+
+/// How an audio file should be sent (M-M3). Pure — unit-tested.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VoiceRoute {
+    /// Native voice bubble (`sendVoice`; requires Ogg/Opus).
+    VoiceBubble,
+    /// Regular audio file (`sendAudio`; MP3/M4A per Bot API).
+    Audio,
+    /// Anything else Telegram can't play natively → `sendDocument`.
+    Document,
+}
+
+/// Route an audio file by extension (M-M3). Pure — unit-tested.
+pub(crate) fn voice_route(extension: &str) -> VoiceRoute {
+    match extension
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ogg" | "opus" => VoiceRoute::VoiceBubble,
+        "mp3" | "m4a" => VoiceRoute::Audio,
+        _ => VoiceRoute::Document,
+    }
+}
+
+/// Video metadata probed via ffprobe (M-M4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VideoMeta {
+    pub duration_secs: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Minimal `which(1)`: find `name` on PATH. Used for ffmpeg/ffprobe
+/// detection (M-M1/M-M3/M-M4) without adding a dependency.
+pub(crate) fn find_binary(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Unique temp path for transcoded media. The caller deletes it after use.
+fn temp_media_path(prefix: &str, suffix: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{prefix}{nanos}{suffix}"))
+}
+
+/// Pre-compress a large photo to JPEG via ffmpeg (M-M1).
+///
+/// The original does this with Pillow (`_compress_image_to_jpeg`); the
+/// `image` crate is not a dependency of hermes-gateway (it could not be
+/// added and build-verified from this sandbox, so the limitation is
+/// documented here rather than papered over), so compression goes through
+/// ffmpeg when available: longest side capped at [`PHOTO_MAX_DIMENSION`]
+/// px, JPEG quality ≈85 (`-q:v 4`).
+///
+/// Returns the temp `.jpg` path (caller deletes it), or `None` when ffmpeg
+/// is missing, the source is unreadable, or the encode fails — in which
+/// case the caller uploads the original. Blocking — run in `spawn_blocking`.
+fn compress_photo_to_jpeg(src: &Path) -> Option<PathBuf> {
+    let ffmpeg = find_binary("ffmpeg")?;
+    let tmp = temp_media_path("tg_compress_", ".jpg");
+    // Cap the longest side, keep aspect ratio.
+    let scale = format!(
+        "scale='if(gt(iw,ih),{m},-2)':'if(gt(iw,ih),-2,{m})'",
+        m = PHOTO_MAX_DIMENSION
+    );
+    let out = std::process::Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            src.to_str()?,
+            "-vf",
+            &scale,
+            "-q:v",
+            PHOTO_FFMPEG_QV,
+            tmp.to_str()?,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && tmp.is_file() && tmp.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        debug!(
+            "Telegram: pre-compressed photo {} for upload",
+            tmp.display()
+        );
+        Some(tmp)
+    } else {
+        debug!("Telegram: photo compression failed, uploading original");
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
+}
+
+/// Transcode `src` to Ogg/Opus (voip-tuned, 32k) via ffmpeg, mirroring the
+/// original's `transcode_to_ogg_opus` in `gateway/platforms/base.py`.
+///
+/// Returns the temp `.ogg` path (caller deletes it), or `None` when ffmpeg
+/// is missing or the transcode fails. Blocking — run in `spawn_blocking`.
+fn transcode_to_ogg_opus(src: &Path) -> Option<PathBuf> {
+    transcode_with_ffmpeg(&find_binary("ffmpeg")?, src)
+}
+
+/// Core of [`transcode_to_ogg_opus`] with an explicit ffmpeg binary, so the
+/// graceful-degradation path is unit-testable without touching PATH.
+fn transcode_with_ffmpeg(ffmpeg: &Path, src: &Path) -> Option<PathBuf> {
+    let tmp = temp_media_path("tg_voice_", ".ogg");
+    let out = std::process::Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            src.to_str()?,
+            "-acodec",
+            "libopus",
+            "-ac",
+            "1",
+            "-b:a",
+            VOICE_OPUS_BITRATE,
+            "-vbr",
+            "on",
+            "-application",
+            "voip",
+            "-compression_level",
+            "10",
+            "-f",
+            "ogg",
+            tmp.to_str()?,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && tmp.is_file() && tmp.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        debug!(
+            "Telegram: transcoded voice note to Ogg/Opus ({})",
+            tmp.display()
+        );
+        Some(tmp)
+    } else {
+        debug!("Telegram: ffmpeg Ogg/Opus transcode failed; sending original format");
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
+}
+
+/// Parse an ffprobe `format=duration` plain-text value into whole seconds.
+/// Pure — unit-tested.
+pub(crate) fn parse_media_duration_secs(stdout: &str) -> Option<u64> {
+    stdout.trim().parse::<f64>().ok().map(|d| d.max(0.0) as u64)
+}
+
+/// Probe media duration in seconds via ffprobe. Returns `None` when ffprobe
+/// is missing or probing fails. Blocking — run in `spawn_blocking`.
+fn probe_media_duration_secs(path: &Path) -> Option<u64> {
+    let ffprobe = find_binary("ffprobe")?;
+    let out = std::process::Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "csv=p=0",
+            path.to_str()?,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        parse_media_duration_secs(&String::from_utf8_lossy(&out.stdout))
+    } else {
+        None
+    }
+}
+
+/// Parse `ffprobe -show_entries stream=width,height -show_entries
+/// format=duration -of default=noprint_wrappers=1` output.
+/// Pure — unit-tested.
+pub(crate) fn parse_video_meta(output: &str) -> Option<VideoMeta> {
+    let mut width = None;
+    let mut height = None;
+    let mut duration = None;
+    for line in output.lines() {
+        let (k, v) = line.trim().split_once('=')?;
+        match k {
+            "width" => width = v.parse().ok(),
+            "height" => height = v.parse().ok(),
+            "duration" => duration = parse_media_duration_secs(v),
+            _ => {}
+        }
+    }
+    Some(VideoMeta {
+        duration_secs: duration?,
+        width: width?,
+        height: height?,
+    })
+}
+
+/// Probe video duration/geometry via ffprobe (M-M4). Blocking — run in
+/// `spawn_blocking`. `None` when ffprobe is missing or probing fails.
+fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
+    let ffprobe = find_binary("ffprobe")?;
+    let out = std::process::Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1",
+            path.to_str()?,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        parse_video_meta(&String::from_utf8_lossy(&out.stdout))
+    } else {
+        None
+    }
+}
+
+/// Extract a JPEG thumbnail (frame ~1s in) via ffmpeg (M-M4).
+/// Returns the temp path (caller deletes it), or `None` on any failure.
+/// Blocking — run in `spawn_blocking`.
+fn extract_video_thumbnail(src: &Path) -> Option<PathBuf> {
+    let ffmpeg = find_binary("ffmpeg")?;
+    let tmp = temp_media_path("tg_thumb_", ".jpg");
+    let out = std::process::Command::new(&ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-ss",
+            "1",
+            "-i",
+            src.to_str()?,
+            "-vframes",
+            "1",
+            "-q:v",
+            PHOTO_FFMPEG_QV,
+            tmp.to_str()?,
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() && tmp.is_file() {
+        Some(tmp)
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
 }
 
 impl TelegramAdapter {
@@ -408,15 +729,92 @@ impl TelegramAdapter {
         self.send_multipart(chat_id, file_path, caption, "sendDocument", "document")
             .await
     }
-    /// Send a photo file.
+    /// Send a photo file, with M-M1 polish:
+    /// - files above [`PHOTO_DOCUMENT_FALLBACK_BYTES`] (~10MB, the practical
+    ///   `sendPhoto` ceiling) are routed through `sendDocument` instead;
+    /// - non-JPEG files above [`PHOTO_COMPRESS_THRESHOLD_BYTES`] (1MB) are
+    ///   pre-compressed to JPEG (quality ~85, longest side capped at
+    ///   [`PHOTO_MAX_DIMENSION`] px) when ffmpeg is available.
+    ///
+    /// Compression failures always fall back to uploading the original —
+    /// sending the photo must never fail because of the polish path.
     pub async fn send_photo(
         &self,
         chat_id: &str,
         file_path: &str,
         caption: Option<&str>,
     ) -> Result<i64, GatewayError> {
+        let ext = Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let size = tokio::fs::metadata(file_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        match photo_strategy(size, ext) {
+            PhotoStrategy::AsDocument => {
+                debug!(
+                    size_bytes = size,
+                    "Telegram: photo exceeds 10MB sendPhoto ceiling, sending as document"
+                );
+                return self.send_document(chat_id, file_path, caption).await;
+            }
+            PhotoStrategy::Compress => {
+                let src = PathBuf::from(file_path);
+                let compressed = tokio::task::spawn_blocking(move || compress_photo_to_jpeg(&src))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(tmp) = compressed {
+                    let tmp_str = tmp.to_string_lossy().into_owned();
+                    let result = self
+                        .send_multipart(chat_id, &tmp_str, caption, "sendPhoto", "photo")
+                        .await;
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return result;
+                }
+                debug!("Telegram: photo compression unavailable, uploading original");
+            }
+            PhotoStrategy::Direct => {}
+        }
         self.send_multipart(chat_id, file_path, caption, "sendPhoto", "photo")
             .await
+    }
+    /// Send a photo from a remote URL (M-M2). Telegram fetches the URL
+    /// itself, so no download is needed on our side.
+    ///
+    /// The URL must pass [`crate::ssrf::is_safe_url`] (public http/https
+    /// only — mirrors the original's `is_safe_url` gate). Unsafe URLs are
+    /// rejected with `SendFailed` and never requested.
+    pub async fn send_photo_url(
+        &self,
+        chat_id: &str,
+        url: &str,
+        caption: Option<&str>,
+    ) -> Result<i64, GatewayError> {
+        if !crate::ssrf::is_safe_url(url) {
+            warn!("Telegram: blocked unsafe photo URL (SSRF protection)");
+            return Err(GatewayError::SendFailed(
+                "Unsafe photo URL: must be a public http(s) URL".into(),
+            ));
+        }
+        let api_url = format!("{}/sendPhoto", self.api_base);
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "photo": url,
+        });
+        if let Some(cap) = caption {
+            body["caption"] = serde_json::json!(truncate_caption(cap));
+        }
+        let resp: TelegramResponse<SentMessage> = self.post_json(&api_url, &body).await?;
+        resp.result.map(|m| m.message_id).ok_or_else(|| {
+            GatewayError::SendFailed(
+                resp.description
+                    .unwrap_or_else(|| "sendPhoto (URL) failed".into()),
+            )
+        })
     }
     /// Send an audio file.
     pub async fn send_audio(
@@ -438,6 +836,68 @@ impl TelegramAdapter {
         self.send_multipart(chat_id, file_path, caption, "sendVideo", "video")
             .await
     }
+    /// Send a video with thumbnail and duration metadata (M-M4), mirroring
+    /// the original's `send_video`: geometry/duration are probed via ffprobe
+    /// and a JPEG thumbnail (first frame) is extracted via ffmpeg, then both
+    /// ride along as `duration`/`width`/`height` fields and a `thumbnail`
+    /// part. Without ffprobe/ffmpeg — or on any extraction failure — this
+    /// degrades gracefully to a plain [`Self::send_video`].
+    pub async fn send_video_smart(
+        &self,
+        chat_id: &str,
+        video_path: &str,
+        caption: Option<&str>,
+    ) -> Result<i64, GatewayError> {
+        if tokio::fs::metadata(video_path).await.is_err() {
+            return Err(GatewayError::SendFailed(format!(
+                "Video file not found: {}",
+                video_path
+            )));
+        }
+        let src = PathBuf::from(video_path);
+        let probe_src = src.clone();
+        let meta: Option<VideoMeta> =
+            tokio::task::spawn_blocking(move || probe_video_meta(&probe_src))
+                .await
+                .ok()
+                .flatten();
+
+        // Extract thumbnail (blocking); failure → send without one.
+        let thumb_src = src.clone();
+        let thumb: Option<PathBuf> =
+            tokio::task::spawn_blocking(move || extract_video_thumbnail(&thumb_src))
+                .await
+                .ok()
+                .flatten();
+
+        let mut extra_text: Vec<(String, String)> = Vec::new();
+        if let Some(m) = meta {
+            extra_text.push(("duration".to_string(), m.duration_secs.to_string()));
+            extra_text.push(("width".to_string(), m.width.to_string()));
+            extra_text.push(("height".to_string(), m.height.to_string()));
+        }
+        let extra_files: Vec<(String, PathBuf)> = thumb
+            .iter()
+            .map(|p| ("thumbnail".to_string(), p.clone()))
+            .collect();
+
+        let result = self
+            .send_multipart_extra(
+                chat_id,
+                video_path,
+                caption,
+                "sendVideo",
+                "video",
+                &extra_text,
+                &extra_files,
+            )
+            .await;
+
+        for (_, p) in &extra_files {
+            let _ = tokio::fs::remove_file(p).await;
+        }
+        result
+    }
     /// Send a voice message (OGG Opus).
     pub async fn send_voice(
         &self,
@@ -447,6 +907,107 @@ impl TelegramAdapter {
     ) -> Result<i64, GatewayError> {
         self.send_multipart(chat_id, file_path, caption, "sendVoice", "voice")
             .await
+    }
+    /// Send audio as a native Telegram voice message or audio file (M-M3),
+    /// mirroring the original's `send_voice` routing:
+    /// - `is_voice == true` and not already Ogg/Opus → transcode via ffmpeg
+    ///   (when available) so the client renders a voice bubble;
+    /// - `.ogg`/`.opus` → `sendVoice` (voice bubble);
+    /// - `.mp3`/`.m4a` → `sendAudio` (Bot API audio);
+    /// - anything else → `sendDocument`.
+    ///
+    /// Duration is probed via ffprobe when available and passed along.
+    /// Every failure in the polish path degrades gracefully to the plain
+    /// send — the audio must never be dropped because of it.
+    pub async fn send_voice_smart(
+        &self,
+        chat_id: &str,
+        audio_path: &str,
+        caption: Option<&str>,
+        is_voice: bool,
+    ) -> Result<i64, GatewayError> {
+        if tokio::fs::metadata(audio_path).await.is_err() {
+            return Err(GatewayError::SendFailed(format!(
+                "Audio file not found: {}",
+                audio_path
+            )));
+        }
+        let ext = Path::new(audio_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        // Transcode to Ogg/Opus for voice bubbles when needed (blocking).
+        let mut transcoded: Option<PathBuf> = None;
+        let mut effective = PathBuf::from(audio_path);
+        if is_voice && !matches!(voice_route(ext), VoiceRoute::VoiceBubble) {
+            let src = effective.clone();
+            transcoded = tokio::task::spawn_blocking(move || transcode_to_ogg_opus(&src))
+                .await
+                .ok()
+                .flatten();
+            match &transcoded {
+                Some(tmp) => effective = tmp.clone(),
+                None => debug!(
+                    "Telegram: voice transcode unavailable for {}, sending original format (install ffmpeg for voice bubbles)",
+                    Path::new(audio_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(audio_path)
+                ),
+            }
+        }
+
+        // Probe duration (blocking); missing ffprobe → None, no duration sent.
+        let src_for_probe = effective.clone();
+        let duration_secs: Option<u64> =
+            tokio::task::spawn_blocking(move || probe_media_duration_secs(&src_for_probe))
+                .await
+                .ok()
+                .flatten();
+
+        let route_ext = effective.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let result = match voice_route(route_ext) {
+            VoiceRoute::VoiceBubble => {
+                let extra = duration_secs
+                    .map(|d| vec![("duration".to_string(), d.to_string())])
+                    .unwrap_or_default();
+                self.send_multipart_extra(
+                    chat_id,
+                    effective.to_str().unwrap_or(audio_path),
+                    caption,
+                    "sendVoice",
+                    "voice",
+                    &extra,
+                    &[],
+                )
+                .await
+            }
+            VoiceRoute::Audio => {
+                let extra = duration_secs
+                    .map(|d| vec![("duration".to_string(), d.to_string())])
+                    .unwrap_or_default();
+                self.send_multipart_extra(
+                    chat_id,
+                    effective.to_str().unwrap_or(audio_path),
+                    caption,
+                    "sendAudio",
+                    "audio",
+                    &extra,
+                    &[],
+                )
+                .await
+            }
+            VoiceRoute::Document => {
+                self.send_document(chat_id, effective.to_str().unwrap_or(audio_path), caption)
+                    .await
+            }
+        };
+
+        if let Some(tmp) = transcoded {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+        result
     }
     /// Send an animation (GIF / MPEG4).
     pub async fn send_animation(
@@ -493,6 +1054,24 @@ impl TelegramAdapter {
         method: &str,
         field_name: &str,
     ) -> Result<i64, GatewayError> {
+        self.send_multipart_extra(chat_id, file_path, caption, method, field_name, &[], &[])
+            .await
+    }
+    /// Multipart upload with extra text fields and extra file parts
+    /// (M-M3/M-M4: `duration`/`width`/`height` text fields, `thumbnail`
+    /// file part). Extra file parts that fail to read are skipped with a
+    /// warning — the main file must still go out.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_multipart_extra(
+        &self,
+        chat_id: &str,
+        file_path: &str,
+        caption: Option<&str>,
+        method: &str,
+        field_name: &str,
+        extra_text: &[(String, String)],
+        extra_files: &[(String, PathBuf)],
+    ) -> Result<i64, GatewayError> {
         let url = format!("{}/{}", self.api_base, method);
 
         let file_bytes = tokio::fs::read(file_path).await.map_err(|e| {
@@ -515,6 +1094,34 @@ impl TelegramAdapter {
             // Cap at Telegram's 1024-char caption limit (M-S2): an over-long
             // caption fails the whole request with HTTP 400.
             form = form.text("caption", truncate_caption(cap));
+        }
+
+        for (key, value) in extra_text {
+            form = form.text(key.clone(), value.clone());
+        }
+
+        for (field, path) in extra_files {
+            match tokio::fs::read(path).await {
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    form = form.part(
+                        field.clone(),
+                        reqwest::multipart::Part::bytes(bytes).file_name(name),
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Telegram: cannot read {} for {}; sending without it: {}",
+                        path.display(),
+                        method,
+                        e
+                    );
+                }
+            }
         }
 
         let resp = self
@@ -1264,5 +1871,190 @@ mod tests {
         assert_eq!(REACTION_PROCESSING, "👀");
         assert_eq!(REACTION_SUCCESS, "👍");
         assert_eq!(REACTION_ERROR, "👎");
+    }
+
+    // ── Outbound media polish (M-M1…M-M4) ──────────────────────────
+
+    #[test]
+    fn photo_strategy_small_png_is_direct() {
+        assert_eq!(photo_strategy(100, "png"), PhotoStrategy::Direct);
+    }
+
+    #[test]
+    fn photo_strategy_large_png_compresses() {
+        assert_eq!(
+            photo_strategy(PHOTO_COMPRESS_THRESHOLD_BYTES + 1, "png"),
+            PhotoStrategy::Compress
+        );
+        // Dotted extension and case-insensitivity.
+        assert_eq!(
+            photo_strategy(PHOTO_COMPRESS_THRESHOLD_BYTES + 1, ".PNG"),
+            PhotoStrategy::Compress
+        );
+    }
+
+    #[test]
+    fn photo_strategy_large_jpeg_skips_compress() {
+        // Already JPEG — recompressing gains nothing.
+        assert_eq!(
+            photo_strategy(PHOTO_COMPRESS_THRESHOLD_BYTES * 5, "jpg"),
+            PhotoStrategy::Direct
+        );
+        assert_eq!(
+            photo_strategy(PHOTO_COMPRESS_THRESHOLD_BYTES * 5, ".jpeg"),
+            PhotoStrategy::Direct
+        );
+    }
+
+    #[test]
+    fn photo_strategy_huge_goes_as_document() {
+        assert_eq!(
+            photo_strategy(PHOTO_DOCUMENT_FALLBACK_BYTES + 1, "png"),
+            PhotoStrategy::AsDocument
+        );
+        // Even a JPEG over the ceiling can't use sendPhoto.
+        assert_eq!(
+            photo_strategy(PHOTO_DOCUMENT_FALLBACK_BYTES + 1, "jpg"),
+            PhotoStrategy::AsDocument
+        );
+    }
+
+    #[test]
+    fn voice_route_by_extension() {
+        assert_eq!(voice_route("ogg"), VoiceRoute::VoiceBubble);
+        assert_eq!(voice_route(".opus"), VoiceRoute::VoiceBubble);
+        assert_eq!(voice_route("mp3"), VoiceRoute::Audio);
+        assert_eq!(voice_route("M4A"), VoiceRoute::Audio);
+        assert_eq!(voice_route("wav"), VoiceRoute::Document);
+        assert_eq!(voice_route("flac"), VoiceRoute::Document);
+        assert_eq!(voice_route(""), VoiceRoute::Document);
+    }
+
+    #[test]
+    fn parse_media_duration_secs_parses_ffprobe_output() {
+        assert_eq!(parse_media_duration_secs("12.345000\n"), Some(12));
+        assert_eq!(parse_media_duration_secs("0.5"), Some(0));
+        assert_eq!(parse_media_duration_secs("3600.0"), Some(3600));
+        assert_eq!(parse_media_duration_secs("N/A"), None);
+        assert_eq!(parse_media_duration_secs(""), None);
+    }
+
+    #[test]
+    fn parse_video_meta_parses_ffprobe_output() {
+        let out = "width=1920\nheight=1080\nduration=12.345000\n";
+        assert_eq!(
+            parse_video_meta(out),
+            Some(VideoMeta {
+                duration_secs: 12,
+                width: 1920,
+                height: 1080,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_video_meta_missing_field_is_none() {
+        assert_eq!(parse_video_meta("width=1920\nheight=1080\n"), None);
+        assert_eq!(parse_video_meta(""), None);
+    }
+
+    #[test]
+    fn find_binary_missing_returns_none() {
+        assert!(find_binary("definitely-not-a-real-binary-xyz-123").is_none());
+    }
+
+    #[test]
+    fn find_binary_finds_sh() {
+        // `sh` is present on every Unix CI/dev machine.
+        assert!(find_binary("sh").is_some());
+    }
+
+    #[tokio::test]
+    async fn send_photo_url_rejects_unsafe_url() {
+        let server = MockServer::start().await;
+        // No mock mounted: any request would fail the test via expect(0)-style
+        // reasoning — instead assert the error comes back before any HTTP.
+        let adapter = mock_server_adapter(&server.uri());
+        let err = adapter
+            .send_photo_url("12345", "http://169.254.169.254/latest/meta-data", None)
+            .await
+            .expect_err("private IP URL must be rejected");
+        assert!(err.to_string().contains("Unsafe photo URL"));
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty(), "unsafe URL must never be requested");
+    }
+
+    #[tokio::test]
+    async fn send_photo_url_rejects_non_http_scheme() {
+        let server = MockServer::start().await;
+        let adapter = mock_server_adapter(&server.uri());
+        adapter
+            .send_photo_url("12345", "ftp://example.com/pic.jpg", None)
+            .await
+            .expect_err("non-http scheme must be rejected");
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_photo_url_posts_photo_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 99 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = mock_server_adapter(&server.uri());
+        let id = adapter
+            .send_photo_url("12345", "https://example.com/pic.jpg", Some("nice pic"))
+            .await
+            .expect("send ok");
+        assert_eq!(id, 99);
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json body");
+        assert_eq!(
+            body["photo"],
+            serde_json::json!("https://example.com/pic.jpg")
+        );
+        assert_eq!(body["caption"], serde_json::json!("nice pic"));
+    }
+
+    #[tokio::test]
+    async fn send_voice_smart_missing_file_errors() {
+        let server = MockServer::start().await;
+        let adapter = mock_server_adapter(&server.uri());
+        adapter
+            .send_voice_smart("12345", "/nonexistent/path/voice.ogg", None, true)
+            .await
+            .expect_err("missing file must error, not hang");
+    }
+
+    #[tokio::test]
+    async fn send_video_smart_missing_file_errors() {
+        let server = MockServer::start().await;
+        let adapter = mock_server_adapter(&server.uri());
+        adapter
+            .send_video_smart("12345", "/nonexistent/path/video.mp4", None)
+            .await
+            .expect_err("missing file must error, not hang");
+    }
+
+    #[test]
+    fn transcode_with_unusable_ffmpeg_returns_none() {
+        // An ffmpeg binary that can't be executed must degrade gracefully
+        // (no panic, no temp file left behind) — no PATH mutation needed,
+        // so this stays thread-safe alongside the other tests.
+        let tmp = std::env::temp_dir().join("tg_test_voice_src.tmp");
+        std::fs::write(&tmp, b"not real audio").unwrap();
+        let result = transcode_with_ffmpeg(Path::new("/nonexistent-dir-xyz/ffmpeg"), &tmp);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(result.is_none(), "unusable ffmpeg → no transcode, no panic");
     }
 }
