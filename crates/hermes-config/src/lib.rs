@@ -44,7 +44,8 @@ pub use paths::{
     gateway_pid_path_in, hermes_home, memory_path, sessions_dir, skills_dir, state_dir, user_path,
 };
 pub use platform::{
-    extra_string, platform_token_or_extra, NtfyConfig, PlatformConfig, UnauthorizedDmBehavior,
+    extra_string, platform_token_or_extra, BuzzConfig, GoogleChatConfig, NtfyConfig,
+    PlatformConfig, SimplexConfig, TeamsConfig, UnauthorizedDmBehavior,
 };
 pub use session::{DailyReset, IdleReset, SessionConfig, SessionResetPolicy, SessionType};
 pub use streaming::StreamingConfig;

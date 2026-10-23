@@ -31,6 +31,10 @@ a2a = []
 line = []
 irc = []
 ntfy = []
+buzz = []
+google_chat = []
+teams = []
+simplex = []
 
 [dependencies]
 hermes-core = { workspace = true }

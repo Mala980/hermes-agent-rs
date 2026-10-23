@@ -26,7 +26,11 @@
     feature = "irc",
     feature = "line",
     feature = "ntfy",
-    feature = "a2a"
+    feature = "a2a",
+    feature = "buzz",
+    feature = "google_chat",
+    feature = "teams",
+    feature = "simplex"
 ))]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,7 +62,11 @@ use crate::gateway::Gateway;
     feature = "irc",
     feature = "line",
     feature = "ntfy",
-    feature = "a2a"
+    feature = "a2a",
+    feature = "buzz",
+    feature = "google_chat",
+    feature = "teams",
+    feature = "simplex"
 ))]
 use crate::platform_requirements::{
     evaluate_gateway_requirements, RequirementScope, RequirementSeverity,
@@ -105,7 +113,11 @@ pub async fn register_platforms(
         feature = "irc",
         feature = "line",
         feature = "ntfy",
-        feature = "a2a"
+        feature = "a2a",
+        feature = "buzz",
+        feature = "google_chat",
+        feature = "teams",
+        feature = "simplex"
     )))]
     {
         let _ = (gateway, config, sidecar_tasks);
@@ -138,7 +150,11 @@ pub async fn register_platforms(
         feature = "irc",
         feature = "line",
         feature = "ntfy",
-        feature = "a2a"
+        feature = "a2a",
+        feature = "buzz",
+        feature = "google_chat",
+        feature = "teams",
+        feature = "simplex"
     ))]
     {
         let mut registered = Vec::new();
@@ -890,6 +906,130 @@ pub async fn register_platforms(
                             registered.push("ntfy".to_string());
                         }
                         Err(e) => errors.push(("ntfy".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // buzz
+        #[cfg(feature = "buzz")]
+        if let Some(platform_cfg) = config.platforms.get("buzz") {
+            if platform_cfg.enabled {
+                use crate::platforms::buzz::BuzzAdapter;
+                use hermes_config::BuzzConfig;
+
+                if let Some(msg) = fatal_by_platform.remove("buzz") {
+                    errors.push(("buzz".to_string(), msg));
+                } else {
+                    let buzz_cfg = BuzzConfig::from_platform_config(platform_cfg);
+                    match BuzzAdapter::new(buzz_cfg, Default::default()) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("buzz", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("buzz".to_string());
+                        }
+                        Err(e) => errors.push(("buzz".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // google_chat
+        #[cfg(feature = "google_chat")]
+        if let Some(platform_cfg) = config.platforms.get("google_chat") {
+            if platform_cfg.enabled {
+                use crate::platforms::google_chat::GoogleChatAdapter;
+                use hermes_config::GoogleChatConfig;
+
+                if let Some(msg) = fatal_by_platform.remove("google_chat") {
+                    errors.push(("google_chat".to_string(), msg));
+                } else {
+                    let google_chat_cfg = GoogleChatConfig::from_platform_config(platform_cfg);
+                    match GoogleChatAdapter::new(google_chat_cfg, Default::default()) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "google_chat",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("google_chat".to_string());
+                        }
+                        Err(e) => errors.push(("google_chat".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // teams
+        #[cfg(feature = "teams")]
+        if let Some(platform_cfg) = config.platforms.get("teams") {
+            if platform_cfg.enabled {
+                use crate::platforms::teams::TeamsAdapter;
+                use hermes_config::TeamsConfig;
+
+                if let Some(msg) = fatal_by_platform.remove("teams") {
+                    errors.push(("teams".to_string(), msg));
+                } else {
+                    let teams_cfg = TeamsConfig::from_platform_config(platform_cfg);
+                    match TeamsAdapter::new(teams_cfg, Default::default()) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("teams", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("teams".to_string());
+                        }
+                        Err(e) => errors.push(("teams".to_string(), e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // simplex
+        #[cfg(feature = "simplex")]
+        if let Some(platform_cfg) = config.platforms.get("simplex") {
+            if platform_cfg.enabled {
+                use crate::platforms::simplex::SimplexAdapter;
+                use hermes_config::SimplexConfig;
+
+                if let Some(msg) = fatal_by_platform.remove("simplex") {
+                    errors.push(("simplex".to_string(), msg));
+                } else {
+                    let simplex_cfg = SimplexConfig::from_platform_config(platform_cfg);
+                    match SimplexAdapter::new(simplex_cfg, Default::default()) {
+                        Ok(adapter) => {
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "simplex",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            registered.push("simplex".to_string());
+                        }
+                        Err(e) => errors.push(("simplex".to_string(), e.to_string())),
                     }
                 }
             }

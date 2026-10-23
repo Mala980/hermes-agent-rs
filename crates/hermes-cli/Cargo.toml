@@ -45,6 +45,10 @@ hermes-gateway = { workspace = true, features = [
     "a2a",
     "line",
     "ntfy",
+    "buzz",
+    "google_chat",
+    "teams",
+    "simplex",
 ] }
 hermes-cron = { workspace = true }
 hermes-environments = { workspace = true }

@@ -72,4 +72,16 @@ pub mod a2a;
 #[cfg(feature = "ntfy")]
 pub mod ntfy;
 
+#[cfg(feature = "buzz")]
+pub mod buzz;
+
+#[cfg(feature = "google_chat")]
+pub mod google_chat;
+
+#[cfg(feature = "teams")]
+pub mod teams;
+
+#[cfg(feature = "simplex")]
+pub mod simplex;
+
 pub mod helpers;

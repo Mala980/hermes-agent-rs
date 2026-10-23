@@ -327,6 +327,299 @@ impl NtfyConfig {
 }
 
 // ---------------------------------------------------------------------------
+// BuzzConfig
+// ---------------------------------------------------------------------------
+
+/// Buzz team-messaging adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`. An empty `webhook_url` (nothing can
+/// be sent) or an empty `webhook_secret` (inbound signatures cannot be
+/// verified) fails adapter construction (fail-closed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BuzzConfig {
+    /// Buzz API base URL for outgoing messages, e.g. `https://buzz.example.com/api`.
+    pub webhook_url: String,
+    /// Bearer token for the Buzz API (outbound auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_token: Option<String>,
+    /// Shared secret for HMAC-SHA256 (`sha256=<hex>`) verification of inbound
+    /// webhook payloads. Required.
+    pub webhook_secret: String,
+    /// Local bind address for the inbound webhook listener.
+    pub bind_addr: String,
+    /// Local port for the inbound webhook listener.
+    pub webhook_port: u16,
+    /// Webhook path Buzz posts events to.
+    pub webhook_path: String,
+    /// Whether this adapter is enabled.
+    pub enabled: bool,
+}
+
+impl Default for BuzzConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: String::new(),
+            bot_token: None,
+            webhook_secret: String::new(),
+            bind_addr: "127.0.0.1".to_string(),
+            webhook_port: 8765,
+            webhook_path: "/buzz/webhook".to_string(),
+            enabled: true,
+        }
+    }
+}
+
+/// Parse a port from a JSON number or a numeric string.
+fn parse_port(v: &serde_json::Value) -> Option<u16> {
+    if let Some(n) = v.as_u64() {
+        return u16::try_from(n).ok();
+    }
+    v.as_str()?.trim().parse().ok()
+}
+
+impl BuzzConfig {
+    /// Build from a generic [`PlatformConfig`].
+    ///
+    /// `extra["bot_token"]` wins; the first-class `token` (or
+    /// `extra["token"]`) is the fallback. `extra["webhook_port"]` accepts a
+    /// JSON number or a string. `enabled` follows `extra["enabled"]` when set,
+    /// otherwise the top-level platform `enabled` flag.
+    pub fn from_platform_config(p: &PlatformConfig) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = extra_string(p, "webhook_url") {
+            cfg.webhook_url = v.trim_end_matches('/').to_string();
+        }
+        cfg.bot_token = extra_string(p, "bot_token").or_else(|| platform_token_or_extra(p));
+        if let Some(v) = extra_string(p, "webhook_secret") {
+            cfg.webhook_secret = v;
+        }
+        if let Some(v) = extra_string(p, "bind_addr") {
+            cfg.bind_addr = v;
+        }
+        if let Some(port) = p.extra.get("webhook_port").and_then(parse_port) {
+            cfg.webhook_port = port;
+        }
+        if let Some(v) = extra_string(p, "webhook_path") {
+            cfg.webhook_path = v;
+        }
+        cfg.enabled = p
+            .extra
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(p.enabled);
+        cfg
+    }
+
+    /// `bind_addr:webhook_port` the webhook listener binds to.
+    pub fn bind_address(&self) -> String {
+        format!("{}:{}", self.bind_addr, self.webhook_port)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TeamsConfig
+// ---------------------------------------------------------------------------
+
+/// Microsoft Teams (Bot Framework) adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`; an empty `app_id` or `app_password`
+/// fails adapter construction (fail-closed). The Bot Framework default
+/// webhook port is 3978.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TeamsConfig {
+    /// Bot Framework app (client) ID.
+    pub app_id: String,
+    /// Bot Framework app password (client secret): used for OAuth token
+    /// acquisition and inbound Bearer-token validation.
+    pub app_password: String,
+    /// Local port for the `/api/messages` webhook listener.
+    pub webhook_port: u16,
+    /// Fallback Bot Framework service URL used for outbound calls when the
+    /// target conversation has not supplied one via an inbound activity.
+    pub service_url: String,
+    /// Master switch for the adapter.
+    pub enabled: bool,
+}
+
+impl Default for TeamsConfig {
+    fn default() -> Self {
+        Self {
+            app_id: String::new(),
+            app_password: String::new(),
+            webhook_port: 3978,
+            service_url: String::new(),
+            enabled: false,
+        }
+    }
+}
+
+impl TeamsConfig {
+    /// Build from a generic [`PlatformConfig`].
+    ///
+    /// `extra["app_password"]` wins; the first-class `token` (or
+    /// `extra["token"]`) is the fallback. Everything else comes from `extra`.
+    pub fn from_platform_config(p: &PlatformConfig) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = extra_string(p, "app_id") {
+            cfg.app_id = v;
+        }
+        cfg.app_password = extra_string(p, "app_password")
+            .or_else(|| platform_token_or_extra(p))
+            .unwrap_or_default();
+        if let Some(port) = p
+            .extra
+            .get("webhook_port")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+        {
+            cfg.webhook_port = port;
+        }
+        if let Some(v) = extra_string(p, "service_url") {
+            cfg.service_url = v.trim_end_matches('/').to_string();
+        }
+        if let Some(v) = p.extra.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.enabled = v;
+        }
+        cfg
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GoogleChatConfig
+// ---------------------------------------------------------------------------
+
+/// Google Chat adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`. Inbound events arrive on a local
+/// HTTP webhook listener (`bind_addr:webhook_port`) as Google Chat event
+/// JSON; each request must carry `Authorization: Bearer <verification_token>`
+/// or it is rejected (fail-closed). Outbound messages go to
+/// `{webhook_url}/spaces/{space}/messages` with `bot_token` as the Bearer
+/// token (a service-account OAuth2 access token in production).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoogleChatConfig {
+    /// Outgoing API base URL, e.g. `https://chat.googleapis.com/v1`.
+    pub webhook_url: String,
+    /// Bearer token for the Chat API (OAuth2 access token). Required;
+    /// the adapter refuses to construct without one (fail-closed).
+    pub bot_token: String,
+    /// Token Google Chat must present as `Authorization: Bearer <token>` on
+    /// inbound webhook calls. When empty, all inbound webhooks are rejected.
+    pub verification_token: String,
+    /// Local bind address for the inbound webhook listener.
+    pub bind_addr: String,
+    /// Local port for the inbound webhook listener.
+    pub webhook_port: u16,
+    /// Master switch for the adapter.
+    pub enabled: bool,
+}
+
+impl Default for GoogleChatConfig {
+    fn default() -> Self {
+        Self {
+            webhook_url: "https://chat.googleapis.com/v1".to_string(),
+            bot_token: String::new(),
+            verification_token: String::new(),
+            bind_addr: "0.0.0.0".to_string(),
+            webhook_port: 8647,
+            enabled: false,
+        }
+    }
+}
+
+impl GoogleChatConfig {
+    /// Build from a generic [`PlatformConfig`].
+    ///
+    /// `extra["bot_token"]` wins; the first-class `token` (or
+    /// `extra["token"]`) is the fallback. `enabled` mirrors the platform
+    /// entry's flag unless `extra["enabled"]` overrides it. Everything else
+    /// comes from `extra`.
+    pub fn from_platform_config(p: &PlatformConfig) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = extra_string(p, "webhook_url") {
+            cfg.webhook_url = v.trim_end_matches('/').to_string();
+        }
+        cfg.bot_token = extra_string(p, "bot_token")
+            .or_else(|| platform_token_or_extra(p))
+            .unwrap_or_default();
+        if let Some(v) = extra_string(p, "verification_token") {
+            cfg.verification_token = v;
+        }
+        if let Some(v) = extra_string(p, "bind_addr") {
+            cfg.bind_addr = v;
+        }
+        if let Some(port) = p
+            .extra
+            .get("webhook_port")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok())
+        {
+            cfg.webhook_port = port;
+        }
+        cfg.enabled = p.enabled;
+        if let Some(v) = p.extra.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.enabled = v;
+        }
+        cfg
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SimplexConfig
+// ---------------------------------------------------------------------------
+
+/// SimpleX Chat adapter configuration.
+///
+/// Deserializes with `#[serde(default)]`. SimpleX bots talk to a locally
+/// running SimpleX chat agent over WebSocket (`agent_url`, default
+/// `ws://localhost:5225`). SimpleX has no user IDs: contacts are display
+/// names (e.g. `@alice`) and double as conversation targets. An empty
+/// `agent_url` fails adapter construction (fail-closed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SimplexConfig {
+    /// SimpleX chat agent WebSocket URL, e.g. `ws://localhost:5225`.
+    pub agent_url: String,
+    /// Default contact to message when `chat_id` is empty (e.g. `@alice`).
+    pub contact: String,
+    /// Master switch for the adapter.
+    pub enabled: bool,
+}
+
+impl Default for SimplexConfig {
+    fn default() -> Self {
+        Self {
+            agent_url: "ws://localhost:5225".to_string(),
+            contact: String::new(),
+            enabled: false,
+        }
+    }
+}
+
+impl SimplexConfig {
+    /// Build from a generic [`PlatformConfig`].
+    ///
+    /// `extra["agent_url"]` and `extra["contact"]` set the agent endpoint and
+    /// the default contact; `extra["enabled"]` (bool) flips the master switch.
+    pub fn from_platform_config(p: &PlatformConfig) -> Self {
+        let mut cfg = Self::default();
+        if let Some(v) = extra_string(p, "agent_url") {
+            cfg.agent_url = v.trim_end_matches('/').to_string();
+        }
+        if let Some(v) = extra_string(p, "contact") {
+            cfg.contact = v;
+        }
+        if let Some(v) = p.extra.get("enabled").and_then(|v| v.as_bool()) {
+            cfg.enabled = v;
+        }
+        cfg
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -423,6 +716,58 @@ mod tests {
     }
 
     #[test]
+    fn google_chat_config_defaults() {
+        let cfg = GoogleChatConfig::default();
+        assert_eq!(cfg.webhook_url, "https://chat.googleapis.com/v1");
+        assert!(cfg.bot_token.is_empty());
+        assert!(cfg.verification_token.is_empty());
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.webhook_port, 8647);
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn google_chat_config_serde_default() {
+        let cfg: GoogleChatConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.webhook_url, "https://chat.googleapis.com/v1");
+        assert_eq!(cfg.webhook_port, 8647);
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn google_chat_config_from_platform_config() {
+        let mut pc = PlatformConfig::default();
+        pc.enabled = true;
+        pc.token = Some("top-level-token".to_string());
+        for (k, v) in [
+            ("webhook_url", "https://chat.example.com/v1/"),
+            ("verification_token", "hook-secret"),
+            ("bind_addr", "127.0.0.1"),
+        ] {
+            pc.extra.insert(k.to_string(), json!(v));
+        }
+        pc.extra.insert("webhook_port".to_string(), json!(9001));
+        let cfg = GoogleChatConfig::from_platform_config(&pc);
+        assert_eq!(cfg.webhook_url, "https://chat.example.com/v1");
+        // first-class token falls back to bot_token
+        assert_eq!(cfg.bot_token, "top-level-token");
+        assert_eq!(cfg.verification_token, "hook-secret");
+        assert_eq!(cfg.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.webhook_port, 9001);
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn google_chat_config_bot_token_prefers_extra() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        pc.extra
+            .insert("bot_token".to_string(), json!("extra-bot-token"));
+        let cfg = GoogleChatConfig::from_platform_config(&pc);
+        assert_eq!(cfg.bot_token, "extra-bot-token");
+    }
+
+    #[test]
     fn ntfy_config_access_token_prefers_extra() {
         let mut pc = PlatformConfig::default();
         pc.token = Some("top-level-token".to_string());
@@ -439,6 +784,109 @@ mod tests {
         assert_eq!(cfg.port, 8646);
         let cfg: LineConfig = serde_json::from_value(serde_json::json!({"port": 9001})).unwrap();
         assert_eq!(cfg.port, 9001);
+    }
+
+    #[test]
+    fn teams_config_defaults() {
+        let cfg = TeamsConfig::default();
+        assert!(cfg.app_id.is_empty());
+        assert!(cfg.app_password.is_empty());
+        assert_eq!(cfg.webhook_port, 3978);
+        assert!(cfg.service_url.is_empty());
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn teams_config_from_platform_config() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        pc.extra.insert("app_id".to_string(), json!("appid-123"));
+        pc.extra.insert(
+            "service_url".to_string(),
+            json!("https://smba.trafficmanager.net/teams/"),
+        );
+        pc.extra.insert("webhook_port".to_string(), json!(5000));
+        pc.extra.insert("enabled".to_string(), json!(true));
+        let cfg = TeamsConfig::from_platform_config(&pc);
+        assert_eq!(cfg.app_id, "appid-123");
+        // first-class token falls back to app_password
+        assert_eq!(cfg.app_password, "top-level-token");
+        assert_eq!(cfg.webhook_port, 5000);
+        assert_eq!(cfg.service_url, "https://smba.trafficmanager.net/teams");
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn teams_config_app_password_prefers_extra() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        pc.extra
+            .insert("app_password".to_string(), json!("secret-abc"));
+        let cfg = TeamsConfig::from_platform_config(&pc);
+        assert_eq!(cfg.app_password, "secret-abc");
+    }
+
+    #[test]
+    fn buzz_config_defaults() {
+        let cfg = BuzzConfig::default();
+        assert!(cfg.webhook_url.is_empty());
+        assert!(cfg.bot_token.is_none());
+        assert!(cfg.webhook_secret.is_empty());
+        assert_eq!(cfg.bind_addr, "127.0.0.1");
+        assert_eq!(cfg.webhook_port, 8765);
+        assert_eq!(cfg.webhook_path, "/buzz/webhook");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bind_address(), "127.0.0.1:8765");
+    }
+
+    #[test]
+    fn buzz_config_serde_default() {
+        let cfg: BuzzConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.webhook_port, 8765);
+        assert_eq!(cfg.webhook_path, "/buzz/webhook");
+        let cfg: BuzzConfig =
+            serde_json::from_value(serde_json::json!({"webhook_port": 9001})).unwrap();
+        assert_eq!(cfg.webhook_port, 9001);
+    }
+
+    #[test]
+    fn buzz_config_from_platform_config() {
+        let mut pc = PlatformConfig::default();
+        pc.enabled = true;
+        pc.token = Some("top-level-token".to_string());
+        for (k, v) in [
+            ("webhook_url", "https://buzz.example.com/api/"),
+            ("webhook_secret", "s3cr3t"),
+            ("bind_addr", "0.0.0.0"),
+            ("webhook_path", "/hooks/buzz"),
+        ] {
+            pc.extra.insert(k.to_string(), json!(v));
+        }
+        pc.extra.insert("webhook_port".to_string(), json!(9123));
+        let cfg = BuzzConfig::from_platform_config(&pc);
+        assert_eq!(cfg.webhook_url, "https://buzz.example.com/api");
+        assert_eq!(cfg.webhook_secret, "s3cr3t");
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert_eq!(cfg.webhook_port, 9123);
+        assert_eq!(cfg.webhook_path, "/hooks/buzz");
+        assert!(cfg.enabled);
+        // first-class token falls back to bot_token
+        assert_eq!(cfg.bot_token.as_deref(), Some("top-level-token"));
+        assert_eq!(cfg.bind_address(), "0.0.0.0:9123");
+    }
+
+    #[test]
+    fn buzz_config_port_from_string_and_token_prefers_extra() {
+        let mut pc = PlatformConfig::default();
+        pc.token = Some("top-level-token".to_string());
+        pc.extra.insert("webhook_port".to_string(), json!("9999"));
+        pc.extra
+            .insert("bot_token".to_string(), json!("extra-bot-token"));
+        let cfg = BuzzConfig::from_platform_config(&pc);
+        assert_eq!(cfg.webhook_port, 9999);
+        assert_eq!(cfg.bot_token.as_deref(), Some("extra-bot-token"));
+        // follows the top-level platform enabled flag
+        assert!(!cfg.enabled);
     }
 
     #[test]
