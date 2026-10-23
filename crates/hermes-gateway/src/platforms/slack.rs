@@ -947,6 +947,7 @@ impl SlackAdapter {
             user_id: msg.user_id.clone().unwrap_or_default(),
             text: msg.text.clone(),
             message_id: Some(msg.ts.clone()),
+            thread_id: None,
             is_dm: msg.channel.starts_with('D'),
         }
     }
