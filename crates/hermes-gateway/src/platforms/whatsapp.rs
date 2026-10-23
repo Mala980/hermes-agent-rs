@@ -663,7 +663,7 @@ async fn handle_webhook_request(
             }
             let signature = headers
                 .iter()
-                .find(|(k, _)| k == "x-hub-signature-256")
+                .find(|(k, _)| k.as_str() == "x-hub-signature-256")
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("");
             if !verify_hmac_sha256_signature(secret, &body, signature) {
