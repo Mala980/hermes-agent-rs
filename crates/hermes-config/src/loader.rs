@@ -5,7 +5,7 @@ use std::path::Path;
 // Re-export ConfigError for convenience
 pub use hermes_core::ConfigError;
 
-use crate::config::{GatewayConfig, ProxyConfig};
+use crate::config::{CheapModelRouteConfig, GatewayConfig, LlmProviderConfig, ProxyConfig};
 use crate::merge::merge_configs;
 use crate::paths;
 
@@ -171,7 +171,7 @@ pub fn load_user_config_file(path: &Path) -> Result<GatewayConfig, ConfigError> 
     }
 }
 
-const CONFIG_PATCH_HELP: &str = "model, personality, max_turns, system_prompt, display.skin, budget.max_result_size_chars, budget.max_aggregate_chars, proxy.http, proxy.socks, tui.theme, llm.<provider>.api_key|base_url|model|command|args|oauth_token_url|oauth_client_id, smart_model_routing.enabled|max_simple_chars|max_simple_words|cheap_model.model|cheap_model.provider";
+const CONFIG_PATCH_HELP: &str = "model, personality, max_turns, system_prompt, budget.max_result_size_chars, budget.max_aggregate_chars, proxy.http, proxy.socks, llm.<provider>.api_key|base_url|model|command|args|oauth_token_url|oauth_client_id, smart_model_routing.enabled|max_simple_chars|max_simple_words|cheap_model.model|cheap_model.provider";
 
 fn mask_secret(s: &str) -> String {
     if s.is_empty() {
@@ -337,12 +337,6 @@ fn apply_user_config_patch_dotted(
                 .get_or_insert_with(crate::CheapModelRouteConfig::default);
             cheap.provider = Some(value.to_string());
         }
-        ["tui", "theme"] => {
-            config.tui.theme = Some(value.trim().to_string());
-        }
-        ["display", "skin"] => {
-            config.display.skin = Some(value.trim().to_string());
-        }
         _ => {
             return Err(ConfigError::NotFound(format!(
                 "unknown config key: {} (supported: {})",
@@ -456,20 +450,6 @@ pub fn user_config_field_display(config: &GatewayConfig, key: &str) -> Result<St
             .map(|s| s.to_string())
             .unwrap_or_else(|| "(not set)".to_string())),
         ["smart_model_routing", "enabled"] => Ok(config.smart_model_routing.enabled.to_string()),
-        ["tui", "theme"] => Ok(config
-            .tui
-            .theme
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "(not set)".to_string())),
-        ["display", "skin"] => Ok(config
-            .display
-            .skin
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "(not set)".to_string())),
         ["smart_model_routing", "max_simple_chars"] => {
             Ok(config.smart_model_routing.max_simple_chars.to_string())
         }
@@ -499,36 +479,28 @@ pub fn user_config_field_display(config: &GatewayConfig, key: &str) -> Result<St
     }
 }
 
-/// Reset a single config field to its default for `hermes config unset`
+/// Reset a single config field to its default value for `hermes config unset`
 /// (same keys as [`apply_user_config_patch`]).
 ///
-/// `Option` fields become `None`; numeric fields return to their defaults.
-/// Unknown keys produce the same `NotFound` error as `config set`.
+/// Optional sections (`proxy`, per-provider `llm.<provider>` entries,
+/// `smart_model_routing.cheap_model`) are removed entirely when resetting
+/// their last set field, keeping the saved YAML clean.
 pub fn reset_user_config_field(config: &mut GatewayConfig, key: &str) -> Result<(), ConfigError> {
     let defaults = GatewayConfig::default();
     if !key.contains('.') {
-        return match key {
-            "model" => {
-                config.model = None;
-                Ok(())
+        match key {
+            "model" => config.model = defaults.model,
+            "personality" => config.personality = defaults.personality,
+            "max_turns" => config.max_turns = defaults.max_turns,
+            "system_prompt" => config.system_prompt = defaults.system_prompt,
+            other => {
+                return Err(ConfigError::NotFound(format!(
+                    "unknown config key: {} (supported: {})",
+                    other, CONFIG_PATCH_HELP
+                )));
             }
-            "personality" => {
-                config.personality = None;
-                Ok(())
-            }
-            "max_turns" => {
-                config.max_turns = defaults.max_turns;
-                Ok(())
-            }
-            "system_prompt" => {
-                config.system_prompt = None;
-                Ok(())
-            }
-            other => Err(ConfigError::NotFound(format!(
-                "unknown config key: {} (supported: {})",
-                other, CONFIG_PATCH_HELP
-            ))),
-        };
+        }
+        return Ok(());
     }
 
     let parts: Vec<&str> = key.split('.').collect();
@@ -542,46 +514,41 @@ pub fn reset_user_config_field(config: &mut GatewayConfig, key: &str) -> Result<
         ["proxy", "http"] | ["proxy", "http_proxy"] => {
             if let Some(proxy) = config.proxy.as_mut() {
                 proxy.http_proxy = None;
+                if proxy == &ProxyConfig::default() {
+                    config.proxy = None;
+                }
             }
         }
         ["proxy", "socks"] | ["proxy", "socks_proxy"] => {
             if let Some(proxy) = config.proxy.as_mut() {
                 proxy.socks_proxy = None;
+                if proxy == &ProxyConfig::default() {
+                    config.proxy = None;
+                }
             }
         }
-        ["llm", provider, "api_key"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.api_key = None;
+        ["llm", provider, field] => {
+            let Some(entry) = config.llm_providers.get_mut(*provider) else {
+                return Err(ConfigError::NotFound(format!(
+                    "no llm provider configured: {provider}"
+                )));
+            };
+            match *field {
+                "api_key" => entry.api_key = None,
+                "base_url" => entry.base_url = None,
+                "model" => entry.model = None,
+                "command" => entry.command = None,
+                "args" => entry.args.clear(),
+                "oauth_token_url" => entry.oauth_token_url = None,
+                "oauth_client_id" => entry.oauth_client_id = None,
+                other => {
+                    return Err(ConfigError::NotFound(format!(
+                        "unknown llm field: llm.{provider}.{other} (supported: api_key, base_url, model, command, args, oauth_token_url, oauth_client_id)"
+                    )));
+                }
             }
-        }
-        ["llm", provider, "base_url"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.base_url = None;
-            }
-        }
-        ["llm", provider, "model"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.model = None;
-            }
-        }
-        ["llm", provider, "command"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.command = None;
-            }
-        }
-        ["llm", provider, "args"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.args.clear();
-            }
-        }
-        ["llm", provider, "oauth_token_url"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.oauth_token_url = None;
-            }
-        }
-        ["llm", provider, "oauth_client_id"] => {
-            if let Some(entry) = config.llm_providers.get_mut(*provider) {
-                entry.oauth_client_id = None;
+            if entry == &LlmProviderConfig::default() {
+                config.llm_providers.remove(*provider);
             }
         }
         ["smart_model_routing", "enabled"] => {
@@ -596,13 +563,19 @@ pub fn reset_user_config_field(config: &mut GatewayConfig, key: &str) -> Result<
                 defaults.smart_model_routing.max_simple_words;
         }
         ["smart_model_routing", "cheap_model", "model"] => {
-            if let Some(route) = config.smart_model_routing.cheap_model.as_mut() {
-                route.model = None;
+            if let Some(cheap) = config.smart_model_routing.cheap_model.as_mut() {
+                cheap.model = None;
+                if cheap == &CheapModelRouteConfig::default() {
+                    config.smart_model_routing.cheap_model = None;
+                }
             }
         }
         ["smart_model_routing", "cheap_model", "provider"] => {
-            if let Some(route) = config.smart_model_routing.cheap_model.as_mut() {
-                route.provider = None;
+            if let Some(cheap) = config.smart_model_routing.cheap_model.as_mut() {
+                cheap.provider = None;
+                if cheap == &CheapModelRouteConfig::default() {
+                    config.smart_model_routing.cheap_model = None;
+                }
             }
         }
         _ => {
@@ -884,28 +857,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_tui_theme_roundtrip() {
-        use tempfile::tempdir;
-
-        let mut c = GatewayConfig::default();
-        assert!(c.tui.theme.is_none());
-        apply_user_config_patch(&mut c, "tui.theme", "light").unwrap();
-        assert_eq!(c.tui.theme.as_deref(), Some("light"));
-        assert_eq!(user_config_field_display(&c, "tui.theme").unwrap(), "light");
-
-        // Persisted through a save/load round-trip (what the TUI F2 toggle does).
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        save_config_yaml(&path, &c).unwrap();
-        let loaded = load_user_config_file(&path).unwrap();
-        assert_eq!(loaded.tui.theme.as_deref(), Some("light"));
-
-        // Unknown theme names are stored verbatim; the TUI falls back to dark.
-        apply_user_config_patch(&mut c, "tui.theme", "neon").unwrap();
-        assert_eq!(c.tui.theme.as_deref(), Some("neon"));
-    }
-
-    #[test]
     fn apply_patch_dotted_llm_proxy_budget() {
         let mut c = GatewayConfig::default();
         apply_user_config_patch(&mut c, "llm.openai.api_key", "sk-test").unwrap();
@@ -954,90 +905,44 @@ mod tests {
     }
 
     #[test]
-    fn reset_flat_keys_to_defaults() {
-        let defaults = GatewayConfig::default();
+    fn reset_field_restores_defaults() {
         let mut c = GatewayConfig::default();
-        c.model = Some("gpt-4o".into());
-        c.personality = Some("pirate".into());
-        c.max_turns = 5;
-        c.system_prompt = Some("be nice".into());
+        apply_user_config_patch(&mut c, "model", "openai:gpt-4o-mini").unwrap();
+        apply_user_config_patch(&mut c, "max_turns", "15").unwrap();
+        apply_user_config_patch(&mut c, "llm.openai.api_key", "sk-test").unwrap();
+        apply_user_config_patch(&mut c, "llm.openai.base_url", "https://api.openai.com/v1")
+            .unwrap();
+        apply_user_config_patch(&mut c, "proxy.http", "http://127.0.0.1:8080").unwrap();
+        apply_user_config_patch(&mut c, "budget.max_result_size_chars", "500").unwrap();
 
-        for key in ["model", "personality", "system_prompt"] {
-            reset_user_config_field(&mut c, key).unwrap();
-        }
-        assert!(c.model.is_none());
-        assert!(c.personality.is_none());
-        assert!(c.system_prompt.is_none());
-
+        reset_user_config_field(&mut c, "model").unwrap();
         reset_user_config_field(&mut c, "max_turns").unwrap();
-        assert_eq!(c.max_turns, defaults.max_turns);
-    }
-
-    #[test]
-    fn reset_dotted_keys_to_defaults() {
-        let defaults = GatewayConfig::default();
-        let mut c = GatewayConfig::default();
-        c.budget.max_result_size_chars = 1;
-        c.proxy = Some(ProxyConfig {
-            http_proxy: Some("http://127.0.0.1:8080".into()),
-            socks_proxy: Some("socks5://127.0.0.1:1080".into()),
-        });
-        let mut providers = HashMap::new();
-        providers.insert(
-            "openai".into(),
-            crate::config::LlmProviderConfig {
-                api_key: Some("sk-test".into()),
-                base_url: Some("https://example.com".into()),
-                args: vec!["--stdio".into()],
-                ..Default::default()
-            },
-        );
-        c.llm_providers = providers;
-        c.smart_model_routing.enabled = true;
-        c.smart_model_routing.max_simple_chars = 1;
-
+        reset_user_config_field(&mut c, "llm.openai.api_key").unwrap();
+        reset_user_config_field(&mut c, "proxy.http").unwrap();
         reset_user_config_field(&mut c, "budget.max_result_size_chars").unwrap();
+
+        let defaults = GatewayConfig::default();
+        assert_eq!(c.model, defaults.model);
+        assert_eq!(c.max_turns, defaults.max_turns);
+        // Only base_url remains, so the provider entry is kept.
+        assert_eq!(c.llm_providers.get("openai").unwrap().api_key, None);
+        assert_eq!(
+            c.llm_providers.get("openai").unwrap().base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        // Proxy section is dropped once its last field is cleared.
+        assert_eq!(c.proxy, None);
         assert_eq!(
             c.budget.max_result_size_chars,
             defaults.budget.max_result_size_chars
         );
 
-        reset_user_config_field(&mut c, "proxy.http").unwrap();
-        assert!(c.proxy.as_ref().unwrap().http_proxy.is_none());
-        assert!(c.proxy.as_ref().unwrap().socks_proxy.is_some());
+        // Resetting the last llm field removes the provider entry entirely.
+        reset_user_config_field(&mut c, "llm.openai.base_url").unwrap();
+        assert!(!c.llm_providers.contains_key("openai"));
 
-        for key in [
-            "llm.openai.api_key",
-            "llm.openai.base_url",
-            "llm.openai.args",
-        ] {
-            reset_user_config_field(&mut c, key).unwrap();
-        }
-        let entry = c.llm_providers.get("openai").unwrap();
-        assert!(entry.api_key.is_none());
-        assert!(entry.base_url.is_none());
-        assert!(entry.args.is_empty());
-
-        // Unknown provider is a no-op, not an error.
-        reset_user_config_field(&mut c, "llm.unknown.api_key").unwrap();
-
-        reset_user_config_field(&mut c, "smart_model_routing.enabled").unwrap();
-        assert_eq!(
-            c.smart_model_routing.enabled,
-            defaults.smart_model_routing.enabled
-        );
-        reset_user_config_field(&mut c, "smart_model_routing.max_simple_chars").unwrap();
-        assert_eq!(
-            c.smart_model_routing.max_simple_chars,
-            defaults.smart_model_routing.max_simple_chars
-        );
-    }
-
-    #[test]
-    fn reset_unknown_key_errors() {
-        let mut c = GatewayConfig::default();
-        assert!(reset_user_config_field(&mut c, "nope").is_err());
-        assert!(reset_user_config_field(&mut c, "budget.nope").is_err());
-        assert!(reset_user_config_field(&mut c, "llm.openai.nope").is_err());
+        // Unknown keys and unknown providers are errors, not silent no-ops.
+        assert!(reset_user_config_field(&mut c, "bogus_key").is_err());
+        assert!(reset_user_config_field(&mut c, "llm.nonexistent.api_key").is_err());
     }
 }

@@ -319,6 +319,9 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                             .filter(|s| !s.is_empty())
                     }),
                     proxy: Default::default(),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: None,
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                 };
                 match WhatsAppAdapter::new(wa_cfg) {
                     Ok(adapter) => {
@@ -359,6 +362,9 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     verification_token: extra_string(platform_cfg, "verification_token"),
                     encrypt_key: extra_string(platform_cfg, "encrypt_key"),
                     proxy: Default::default(),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: None,
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                 };
                 match FeishuAdapter::new(feishu_cfg) {
                     Ok(adapter) => {
@@ -429,6 +435,9 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     server_url,
                     password,
                     proxy: Default::default(),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: None,
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
                 };
                 match BlueBubblesAdapter::new(bb_cfg) {
                     Ok(adapter) => {
@@ -492,6 +501,10 @@ async fn register_outbound_adapters(config: &GatewayConfig, gateway: &Arc<Gatewa
                     auth_token,
                     from_number,
                     proxy: Default::default(),
+                    webhook_host: extra_string(platform_cfg, "webhook_host"),
+                    webhook_port: None,
+                    webhook_path: extra_string(platform_cfg, "webhook_path"),
+                    webhook_url: extra_string(platform_cfg, "webhook_url"),
                 };
                 match SmsAdapter::new(sms_cfg) {
                     Ok(adapter) => {
