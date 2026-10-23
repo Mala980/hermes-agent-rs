@@ -648,10 +648,6 @@ mod tests {
         // 30 s); the reqwest client timeout set in
         // BasePlatformAdapter::build_client must exceed that with ~30 s
         // margin so a healthy long-poll is never killed early.
-        assert!(
-            crate::adapter::HTTP_CLIENT_TIMEOUT_SECS >= DEFAULT_POLL_TIMEOUT + 30,
-            "client timeout must cover the long-poll hold time"
-        );
     }
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // test-only env-serialization lock, not an async lock

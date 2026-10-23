@@ -444,8 +444,6 @@ pub(crate) const REPLY_QUOTE_MAX_CHARS: usize = 500;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platforms::telegram::test_helpers::*;
-    use crate::platforms::telegram::*;
 
     #[test]
     fn chat_kind_from_str_variants() {

@@ -306,7 +306,6 @@ impl TelegramAdapter {
 mod tests {
     use super::*;
     use crate::platforms::telegram::test_helpers::*;
-    use crate::platforms::telegram::*;
 
     #[test]
     fn parse_update_text_message() {
