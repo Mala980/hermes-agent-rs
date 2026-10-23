@@ -251,6 +251,7 @@ impl BlueBubblesAdapter {
             user_id: msg.sender.clone(),
             text: msg.text.clone(),
             message_id: None,
+            thread_id: None,
             is_dm: !msg.is_group,
         }
     }
