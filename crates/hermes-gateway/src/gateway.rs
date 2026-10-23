@@ -1937,8 +1937,9 @@ mod tests {
 
     /// Test adapter that records the thread id passed to
     /// `send_message_threaded` (M-G5).
+    type SentMessages = Vec<(String, String, Option<String>)>;
     struct ThreadRecordingAdapter {
-        sent: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+        sent: Arc<Mutex<SentMessages>>,
     }
 
     #[async_trait]
