@@ -371,6 +371,19 @@ impl PlatformAdapter for TelegramAdapter {
             }
         }
     }
+
+    /// Outcome reaction (👍/👎) for `Gateway::route_message`: delegates to
+    /// [`TelegramAdapter::set_message_reaction`], which no-ops when the
+    /// `message_reactions` config flag is off and swallows API errors at
+    /// debug so the reaction can never break the message flow.
+    async fn send_reaction(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<(), GatewayError> {
+        self.set_message_reaction(chat_id, message_id, emoji).await
+    }
 }
 
 #[cfg(test)]

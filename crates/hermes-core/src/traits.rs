@@ -196,6 +196,21 @@ pub trait PlatformAdapter: Send + Sync {
         self.send_typing(chat_id).await
     }
 
+    /// React to a message with an emoji (best-effort).
+    ///
+    /// Default is a no-op. Platforms with a reaction API (e.g. Telegram's
+    /// `setMessageReaction`) override this. Failures should be swallowed
+    /// by the implementation (logged at debug) — a reaction must never
+    /// break the message flow.
+    async fn send_reaction(
+        &self,
+        _chat_id: &str,
+        _message_id: i64,
+        _emoji: &str,
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
     /// Periodic maintenance: prune token caches, dedup maps, etc.
     ///
     /// Default is a no-op. Adapters with long-lived in-memory caches should

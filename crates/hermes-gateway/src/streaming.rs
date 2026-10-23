@@ -1,13 +1,17 @@
 //! Streaming message state for edit-in-place progressive updates.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock;
 use tracing::debug;
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::PlatformAdapter;
+
+use crate::gateway::IncomingMessage;
 
 /// Mutable state shared between streaming flush tasks and finalization.
 ///
@@ -147,4 +151,43 @@ pub(crate) fn is_not_modified_error(err: &GatewayError) -> bool {
     err.to_string()
         .to_lowercase()
         .contains("message is not modified")
+}
+
+/// Fire-and-forget outcome reaction for `Gateway::route_message`.
+///
+/// Reacts with 👍 when the agent pipeline succeeded, 👎 when it failed —
+/// but only for Telegram, and only when the adapter's `message_reactions`
+/// config flag is enabled. Everything else is a no-op: non-Telegram
+/// platforms return early, a missing/unparseable `message_id` returns
+/// early, and the adapter's `send_reaction` itself swallows API errors at
+/// debug (Telegram's impl no-ops entirely when the flag is off).
+///
+/// This must never fail or block routing: all error paths are swallowed
+/// and the future completes without touching `route_result`.
+pub(crate) async fn react_to_route_result(
+    adapters: &Arc<RwLock<HashMap<String, Arc<dyn PlatformAdapter>>>>,
+    incoming: &IncomingMessage,
+    succeeded: bool,
+) {
+    if incoming.platform != "telegram" {
+        return;
+    }
+    let message_id = match incoming
+        .message_id
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        Some(id) => id,
+        None => return,
+    };
+    // Mirror `REACTION_SUCCESS` / `REACTION_ERROR` in
+    // `platforms::telegram::sending` (kept as literals here so this helper
+    // stays feature-agnostic — `platforms::telegram` is feature-gated).
+    let emoji = if succeeded { "👍" } else { "👎" };
+    let adapter = adapters.read().await.get("telegram").cloned();
+    if let Some(adapter) = adapter {
+        let _ = adapter
+            .send_reaction(&incoming.chat_id, message_id, emoji)
+            .await;
+    }
 }
