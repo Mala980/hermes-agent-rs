@@ -468,6 +468,8 @@ pub enum CliCommand {
         action: Option<String>,
         /// Config key.
         key: Option<String>,
+        /// Config value (for set action).
+        value: Option<String>,
     },
     /// Cron job management.
     Cron {
