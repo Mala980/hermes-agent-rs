@@ -168,7 +168,6 @@ pub(crate) fn extract_retry_after_seconds(msg: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platforms::telegram::test_helpers::*;
     use crate::platforms::telegram::*;
 
     #[test]

@@ -1073,7 +1073,7 @@ mod tests {
         assert!(chunks.len() > 1);
         for chunk in &chunks {
             let line = format!("PRIVMSG #chan :{chunk}\r\n");
-            assert!(line.as_bytes().len() <= 512);
+            assert!(line.len() <= 512);
             assert!(std::str::from_utf8(line.as_bytes()).is_ok());
         }
         assert_eq!(chunks.concat().chars().count(), 200);

@@ -158,86 +158,6 @@ pub fn media_category(ext: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_split_long_message_short() {
-        let chunks = split_long_message("hello world", 100);
-        assert_eq!(chunks, vec!["hello world"]);
-    }
-
-    #[test]
-    fn test_split_long_message_sentence_break() {
-        let text = "First sentence. Second sentence. Third sentence is long.";
-        let chunks = split_long_message(text, 35);
-        assert!(chunks.len() >= 2);
-        assert!(chunks[0].ends_with('.'));
-    }
-
-    #[test]
-    fn test_escape_markdown() {
-        assert_eq!(escape_markdown("hello *world*"), "hello \\*world\\*");
-        assert_eq!(escape_markdown("no_special"), "no\\_special");
-    }
-
-    #[test]
-    fn test_truncate_with_ellipsis() {
-        assert_eq!(truncate_with_ellipsis("short", 100), "short");
-        let result = truncate_with_ellipsis("this is a long sentence that should be truncated", 20);
-        assert!(result.ends_with("..."));
-        assert!(result.len() <= 20);
-    }
-
-    #[test]
-    fn test_extract_urls() {
-        let text = "Visit https://example.com and http://foo.bar/baz for more.";
-        let urls = extract_urls(text);
-        assert_eq!(urls.len(), 2);
-        assert!(urls[0].starts_with("https://"));
-    }
-
-    #[test]
-    fn test_format_code_block() {
-        assert_eq!(
-            format_code_block("let x = 1;", Some("rust")),
-            "```rust\nlet x = 1;\n```"
-        );
-        assert_eq!(format_code_block("hello", None), "```\nhello\n```");
-    }
-
-    #[test]
-    fn test_sanitize_html() {
-        assert_eq!(
-            sanitize_html("<b>bold</b> &amp; <i>italic</i>"),
-            "bold & italic"
-        );
-    }
-
-    #[test]
-    fn test_estimate_read_time() {
-        let words_200: String = (0..200).map(|_| "word").collect::<Vec<_>>().join(" ");
-        let time = estimate_read_time(&words_200);
-        assert_eq!(time, 60);
-    }
-
-    #[test]
-    fn test_mime_from_extension() {
-        assert_eq!(mime_from_extension("png"), "image/png");
-        assert_eq!(mime_from_extension("mp4"), "video/mp4");
-        assert_eq!(mime_from_extension("xyz"), "application/octet-stream");
-    }
-
-    #[test]
-    fn test_media_category() {
-        assert_eq!(media_category("jpg"), "image");
-        assert_eq!(media_category("mp4"), "video");
-        assert_eq!(media_category("mp3"), "audio");
-        assert_eq!(media_category("pdf"), "document");
-    }
-}
-
 // ── HTTP / webhook helpers ──
 
 use std::collections::HashMap;
@@ -392,7 +312,7 @@ pub async fn write_http_response(
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -417,4 +337,84 @@ pub fn verify_hmac_sha256_signature(secret: &str, body: &[u8], header: &str) -> 
     mac.update(body);
     let result = mac.finalize().into_bytes();
     constant_time_eq(&result[..], &expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_long_message_short() {
+        let chunks = split_long_message("hello world", 100);
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    #[test]
+    fn test_split_long_message_sentence_break() {
+        let text = "First sentence. Second sentence. Third sentence is long.";
+        let chunks = split_long_message(text, 35);
+        assert!(chunks.len() >= 2);
+        assert!(chunks[0].ends_with('.'));
+    }
+
+    #[test]
+    fn test_escape_markdown() {
+        assert_eq!(escape_markdown("hello *world*"), "hello \\*world\\*");
+        assert_eq!(escape_markdown("no_special"), "no\\_special");
+    }
+
+    #[test]
+    fn test_truncate_with_ellipsis() {
+        assert_eq!(truncate_with_ellipsis("short", 100), "short");
+        let result = truncate_with_ellipsis("this is a long sentence that should be truncated", 20);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 20);
+    }
+
+    #[test]
+    fn test_extract_urls() {
+        let text = "Visit https://example.com and http://foo.bar/baz for more.";
+        let urls = extract_urls(text);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].starts_with("https://"));
+    }
+
+    #[test]
+    fn test_format_code_block() {
+        assert_eq!(
+            format_code_block("let x = 1;", Some("rust")),
+            "```rust\nlet x = 1;\n```"
+        );
+        assert_eq!(format_code_block("hello", None), "```\nhello\n```");
+    }
+
+    #[test]
+    fn test_sanitize_html() {
+        assert_eq!(
+            sanitize_html("<b>bold</b> &amp; <i>italic</i>"),
+            "bold & italic"
+        );
+    }
+
+    #[test]
+    fn test_estimate_read_time() {
+        let words_200: String = (0..200).map(|_| "word").collect::<Vec<_>>().join(" ");
+        let time = estimate_read_time(&words_200);
+        assert_eq!(time, 60);
+    }
+
+    #[test]
+    fn test_mime_from_extension() {
+        assert_eq!(mime_from_extension("png"), "image/png");
+        assert_eq!(mime_from_extension("mp4"), "video/mp4");
+        assert_eq!(mime_from_extension("xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_media_category() {
+        assert_eq!(media_category("jpg"), "image");
+        assert_eq!(media_category("mp4"), "video");
+        assert_eq!(media_category("mp3"), "audio");
+        assert_eq!(media_category("pdf"), "document");
+    }
 }
