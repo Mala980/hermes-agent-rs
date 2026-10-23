@@ -1,7 +1,7 @@
 //! `hermes cron` handler.
 
 use super::common::hermes_state_root;
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_core::AgentError;
 use hermes_cron::cron_scheduler_for_data_dir;
 use hermes_cron::CronError;
@@ -10,7 +10,7 @@ fn cron_cli_error(e: CronError) -> AgentError {
     AgentError::Config(e.to_string())
 }
 
-pub(crate) async fn run_cron(
+pub async fn run_cron(
     cli: Cli,
     action: Option<String>,
     id: Option<String>,
@@ -38,14 +38,8 @@ pub(crate) async fn run_cron(
             for j in jobs {
                 let snippet: String = j.prompt.chars().take(48).collect();
                 println!(
-                    "  {}  [{}]  {:?}  next_run={:?}  tz={}  overlap={}  {}",
-                    j.id,
-                    j.schedule,
-                    j.status,
-                    j.next_run,
-                    j.timezone.as_deref().unwrap_or("system-local"),
-                    j.overlap,
-                    snippet
+                    "  {}  [{}]  {:?}  next_run={:?}  {}",
+                    j.id, j.schedule, j.status, j.next_run, snippet
                 );
             }
         }
@@ -53,27 +47,30 @@ pub(crate) async fn run_cron(
             let schedule = schedule.unwrap_or_else(|| "0 * * * *".to_string());
             let prompt = prompt
                 .ok_or_else(|| AgentError::Config("cron create: use --prompt \"...\"".into()))?;
-            let mut job = hermes_cron::CronJob::new(schedule, prompt);
+            // NOTE: the hermes-cron backend has no per-job `timezone` or
+            // `overlap` policy yet (`CronJob` has neither field, and there is
+            // no `OverlapPolicy` type). Accept the flags for CLI compatibility
+            // but warn instead of silently mis-scheduling.
             if let Some(tz) = timezone {
-                hermes_cron::validate_timezone(&tz)
-                    .map_err(|e| AgentError::Config(format!("cron create: {e}")))?;
-                job.timezone = Some(tz);
+                tracing::warn!(
+                    "cron create: --timezone '{tz}' is not supported by the cron backend yet; \
+                     ignoring (schedules run in system-local time)"
+                );
             }
             if let Some(ov) = overlap {
-                job.overlap = ov
-                    .parse::<hermes_cron::OverlapPolicy>()
-                    .map_err(|e: String| AgentError::Config(format!("cron create: {e}")))?;
+                tracing::warn!(
+                    "cron create: --overlap '{ov}' is not supported by the cron backend yet; ignoring"
+                );
             }
-            // Recompute next_run: a new timezone changes the schedule's wall-clock.
+            let mut job = hermes_cron::CronJob::new(schedule, prompt);
+            // Recompute next_run explicitly (create_job only fills it in when unset).
             job.next_run = job.compute_next_run(chrono::Utc::now());
             let jid = sched.create_job(job).await.map_err(cron_cli_error)?;
             let created = sched.get_job(&jid).await.expect("job just created");
             println!(
-                "Created cron job id={} schedule={:?} timezone={} overlap={} next_run={:?} (persisted under {})",
+                "Created cron job id={} schedule={:?} next_run={:?} (persisted under {})",
                 jid,
                 created.schedule,
-                created.timezone.as_deref().unwrap_or("system-local"),
-                created.overlap,
                 created.next_run,
                 data_dir.display()
             );

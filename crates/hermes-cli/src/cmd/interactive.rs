@@ -1,18 +1,18 @@
 //! Default interactive REPL and `hermes model` handlers.
 
-use hermes_cli::cli::Cli;
-use hermes_cli::App;
+use crate::cli::Cli;
+use crate::App;
 use hermes_config::load_config;
 use hermes_core::AgentError;
 
 /// Run the interactive REPL (default command).
-pub(crate) async fn run_interactive(cli: Cli) -> Result<(), AgentError> {
+pub async fn run_interactive(cli: Cli) -> Result<(), AgentError> {
     let app = App::new(cli).await?;
-    hermes_cli::tui::run(app).await
+    crate::tui::run(app).await
 }
 
 /// Handle `hermes model [provider:model]`.
-pub(crate) async fn run_model(cli: Cli, provider_model: Option<String>) -> Result<(), AgentError> {
+pub async fn run_model(cli: Cli, provider_model: Option<String>) -> Result<(), AgentError> {
     let config =
         load_config(cli.config_dir.as_deref()).map_err(|e| AgentError::Config(e.to_string()))?;
 

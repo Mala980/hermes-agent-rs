@@ -1,14 +1,14 @@
 //! Remaining small subcommand handlers (dump/completion/uninstall/lumio/
 //! setup/doctor/update/status/logs/profile).
 
+use crate::cli::Cli;
 use clap::CommandFactory;
 use clap_complete::{generate, Shell as CompletionShell};
-use hermes_cli::cli::Cli;
 use hermes_config::{hermes_home, load_config};
 use hermes_core::AgentError;
 use std::path::PathBuf;
 
-pub(crate) async fn run_dump(
+pub async fn run_dump(
     cli: Cli,
     session: Option<String>,
     output: Option<String>,
@@ -35,7 +35,7 @@ pub(crate) async fn run_dump(
     Ok(())
 }
 
-pub(crate) fn run_completion(shell: Option<String>) -> Result<(), AgentError> {
+pub fn run_completion(shell: Option<String>) -> Result<(), AgentError> {
     let mut cmd = Cli::command();
     let sh = match shell.as_deref().unwrap_or("zsh") {
         "bash" => CompletionShell::Bash,
@@ -48,7 +48,7 @@ pub(crate) fn run_completion(shell: Option<String>) -> Result<(), AgentError> {
     Ok(())
 }
 
-pub(crate) async fn run_uninstall(yes: bool) -> Result<(), AgentError> {
+pub async fn run_uninstall(yes: bool) -> Result<(), AgentError> {
     let home = hermes_config::hermes_home();
     if !yes {
         println!("Uninstall is destructive. Re-run with `hermes uninstall --yes`.");
@@ -65,19 +65,16 @@ pub(crate) async fn run_uninstall(yes: bool) -> Result<(), AgentError> {
 }
 
 /// Handle `hermes lumio [action]`.
-pub(crate) async fn run_lumio(
-    action: Option<String>,
-    model: Option<String>,
-) -> Result<(), AgentError> {
+pub async fn run_lumio(action: Option<String>, model: Option<String>) -> Result<(), AgentError> {
     match action.as_deref() {
         None | Some("login") => {
-            hermes_cli::lumio::setup(model.as_deref(), true).await?;
+            crate::lumio::setup(model.as_deref(), true).await?;
         }
         Some("logout") => {
-            hermes_cli::lumio::clear_token();
+            crate::lumio::clear_token();
             println!("✅ Lumio token removed.");
         }
-        Some("status") => match hermes_cli::lumio::load_token() {
+        Some("status") => match crate::lumio::load_token() {
             Some(t) => {
                 let user = if t.username.is_empty() {
                     "(unknown)"
@@ -178,7 +175,7 @@ fn read_prompt_line(reader: &mut impl std::io::BufRead, prompt: &str) -> String 
 }
 
 /// Handle `hermes setup`.
-pub(crate) async fn run_setup() -> Result<(), AgentError> {
+pub async fn run_setup() -> Result<(), AgentError> {
     use std::io;
 
     println!("Hermes Agent — Setup Wizard");
@@ -253,7 +250,9 @@ pub(crate) async fn run_setup() -> Result<(), AgentError> {
                         break;
                     }
                     None => {
-                        println!("Invalid model. Use the form 'provider:model', e.g. 'atmo:deepseek-v4.1-flash'.");
+                        println!(
+                            "Invalid model. Use the form 'provider:model', e.g. 'atmo:deepseek-v4.1-flash'."
+                        );
                     }
                 }
             }
@@ -323,7 +322,7 @@ pub(crate) async fn run_setup() -> Result<(), AgentError> {
 }
 
 /// Handle `hermes doctor`.
-pub(crate) async fn run_doctor(cli: Cli) -> Result<(), AgentError> {
+pub async fn run_doctor(cli: Cli) -> Result<(), AgentError> {
     println!("Hermes Agent — System Check");
     println!("===========================\n");
 
@@ -404,14 +403,14 @@ pub(crate) async fn run_doctor(cli: Cli) -> Result<(), AgentError> {
 }
 
 /// Handle `hermes update`.
-pub(crate) async fn run_update() -> Result<(), AgentError> {
+pub async fn run_update() -> Result<(), AgentError> {
     println!("Hermes Agent v{}", env!("CARGO_PKG_VERSION"));
-    println!("{}", hermes_cli::update::check_for_updates().await?);
+    println!("{}", crate::update::check_for_updates().await?);
     Ok(())
 }
 
 /// Handle `hermes status`.
-pub(crate) async fn run_status(cli: Cli, full: bool, deep: bool) -> Result<(), AgentError> {
+pub async fn run_status(cli: Cli, full: bool, deep: bool) -> Result<(), AgentError> {
     println!("Hermes Agent — Status");
     println!("=====================\n");
 
@@ -645,7 +644,7 @@ pub(crate) async fn run_status(cli: Cli, full: bool, deep: bool) -> Result<(), A
 ///
 /// `hermes logs --list` lists available log files; `hermes logs --name <log>`
 /// reads a specific log (bare name like "gateway" or "gateway.log").
-pub(crate) async fn run_logs(
+pub async fn run_logs(
     cli: Cli,
     lines: u32,
     follow: bool,
@@ -748,7 +747,7 @@ pub(crate) async fn run_logs(
 }
 
 /// Handle `hermes profile [action] [name]`.
-pub(crate) async fn run_profile(
+pub async fn run_profile(
     cli: Cli,
     action: Option<String>,
     name: Option<String>,
