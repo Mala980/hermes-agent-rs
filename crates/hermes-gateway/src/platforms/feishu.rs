@@ -291,6 +291,7 @@ impl FeishuAdapter {
             user_id: msg.sender_id.clone().unwrap_or_default(),
             text: msg.text.clone(),
             message_id: Some(msg.message_id.clone()),
+            thread_id: None,
             is_dm: msg.chat_type == "p2p",
         }
     }
