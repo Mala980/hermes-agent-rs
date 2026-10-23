@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_core::{AgentError, Message, MessageRole, UsageStats};
 
 /// A single parsed batch input line.
@@ -97,7 +97,7 @@ fn last_assistant_reply(messages: &[Message]) -> String {
 /// Prompts that share a `session` id share one in-memory conversation
 /// history, keyed by session id. Failing prompts produce an error record and
 /// the batch continues with the next prompt.
-pub(crate) async fn cmd_batch(cli: &Cli, input: &str, out: Option<&str>) -> Result<(), AgentError> {
+pub async fn cmd_batch(cli: &Cli, input: &str, out: Option<&str>) -> Result<(), AgentError> {
     let data = std::fs::read_to_string(input)
         .map_err(|e| AgentError::Io(format!("cannot read batch input {input:?}: {e}")))?;
 
@@ -113,7 +113,7 @@ pub(crate) async fn cmd_batch(cli: &Cli, input: &str, out: Option<&str>) -> Resu
 
     // One App build for the whole batch; the agent loop is stateless across
     // runs, so per-session conversation history is tracked in `histories`.
-    let app = hermes_cli::app::App::new(cli.clone()).await?;
+    let app = crate::app::App::new(cli.clone()).await?;
     let mut histories: HashMap<String, Vec<Message>> = HashMap::new();
     let mut out_buf: Vec<String> = Vec::with_capacity(items.len());
 
@@ -216,8 +216,6 @@ mod tests {
             completion_tokens: 20,
             total_tokens: 30,
             estimated_cost: None,
-            cache_read_input_tokens: None,
-            cache_creation_input_tokens: None,
         };
         let rec = success_record(&item("p", "s"), "hello", Some(&usage), 123);
         assert_eq!(rec["prompt"], "p");

@@ -6,7 +6,7 @@
 //! (`BenchmarkAdapter`, run records, pass@1, checkpoint resume) — a poor
 //! fit for the simple prompt → reply → string/file-checks contract here.
 //! The pass/fail verdict helpers (`eval_passes`, `clamp_threshold`) are
-//! reused from `hermes-eval` instead.
+//! defined locally: `hermes-eval` exposes no such helpers.
 //!
 //! Suite format (one JSON object per line):
 //! `{"name": "...", "prompt": "...", "checks": ["contains:teks",
@@ -16,12 +16,11 @@
 
 use std::sync::Arc;
 
+use crate::cli::{Cli, EvalCmd};
 use hermes_agent::agent_builder::{bridge_tool_registry, build_agent_config, build_provider};
-use hermes_cli::cli::{Cli, EvalCmd};
 use hermes_config::load_config;
 use hermes_core::{AgentError, Message, MessageRole};
 use hermes_environments::LocalBackend;
-use hermes_eval::{clamp_threshold, eval_passes};
 use hermes_skills::{FileSkillStore, SkillManager};
 use hermes_tools::ToolRegistry;
 
@@ -30,8 +29,18 @@ use hermes_tools::ToolRegistry;
 /// config section, so the strict default (100%) applies.
 const DEFAULT_EVAL_THRESHOLD: f64 = 100.0;
 
+/// Clamp a pass threshold to the 0–100 percent range.
+fn clamp_threshold(threshold: f64) -> f64 {
+    threshold.clamp(0.0, 100.0)
+}
+
+/// Epsilon-tolerant pass verdict: `score` meets or exceeds `threshold`.
+fn eval_passes(score: f64, threshold: f64) -> bool {
+    score + 1e-9 >= threshold
+}
+
 /// Handle `hermes eval list|run`.
-pub(crate) async fn cmd_eval(cli: &Cli, cmd: &EvalCmd) -> Result<(), AgentError> {
+pub async fn cmd_eval(cli: &Cli, cmd: &EvalCmd) -> Result<(), AgentError> {
     match cmd {
         EvalCmd::List => {
             let tools = builtin_tool_suite();
@@ -55,7 +64,7 @@ pub(crate) async fn cmd_eval(cli: &Cli, cmd: &EvalCmd) -> Result<(), AgentError>
 ///
 /// `threshold_override`: pass threshold percent from `--threshold`;
 /// when `None`, the strict default (100%) is used.
-pub(crate) async fn cmd_eval_run(
+pub async fn cmd_eval_run(
     cli: &Cli,
     suite: &str,
     out: Option<&str>,
@@ -368,8 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn threshold_helpers_from_hermes_eval() {
-        // Re-exported from hermes-eval: epsilon-tolerant pass verdict.
+    fn threshold_helpers() {
+        // Epsilon-tolerant pass verdict.
         assert!(eval_passes(100.0, 100.0));
         assert!(eval_passes(80.0, 75.0));
         assert!(!eval_passes(74.9, 75.0));
@@ -417,11 +426,9 @@ mod tests {
 
     #[tokio::test]
     async fn eval_list_does_not_need_agent() {
-        let cli = Cli::try_parse_from(["hermes", "eval", "list"]).unwrap();
-        let cmd = match cli.effective_command() {
-            hermes_cli::cli::CliCommand::Eval { cmd } => cmd,
-            other => panic!("expected Eval, got {other:?}"),
-        };
-        cmd_eval(&cli, &cmd).await.unwrap();
+        // NOTE: intentionally does not go through `CliCommand::Eval` parsing —
+        // the `eval` subcommand wiring in cli.rs is owned by the coordinator.
+        let cli = Cli::try_parse_from(["hermes"]).unwrap();
+        cmd_eval(&cli, &EvalCmd::List).await.unwrap();
     }
 }

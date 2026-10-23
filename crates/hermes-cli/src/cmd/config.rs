@@ -1,6 +1,6 @@
 //! `hermes config` handler.
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_config::{
     apply_user_config_patch, hermes_home, load_config, load_user_config_file,
     reset_user_config_field, save_config_yaml, user_config_field_display, validate_config,
@@ -10,7 +10,7 @@ use hermes_core::AgentError;
 use std::path::PathBuf;
 
 /// Handle `hermes config [action] [key] [value]`.
-pub(crate) async fn run_config(
+pub async fn run_config(
     cli: Cli,
     action: Option<String>,
     key: Option<String>,

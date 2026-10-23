@@ -3,11 +3,11 @@
 use super::common::{hermes_state_root, is_truthy};
 use super::gateway::configure_platform_basic_prompts;
 use super::serve::resolve_llm_login_token;
+use crate::app::provider_api_key_from_env;
+use crate::cli::Cli;
 use crate::oauth_store::AuthManager;
 use crate::oauth_store::FileTokenStore;
 use crate::oauth_store::OAuthCredential;
-use hermes_cli::app::provider_api_key_from_env;
-use hermes_cli::cli::Cli;
 use hermes_config::{
     hermes_home, load_user_config_file, platform_token_or_extra, save_config_yaml, validate_config,
     PlatformConfig,
@@ -525,7 +525,7 @@ async fn print_auth_status_matrix(cli: &Cli, manager: &AuthManager) -> Result<()
     Ok(())
 }
 
-pub(crate) async fn run_auth(
+pub async fn run_auth(
     cli: Cli,
     action: Option<String>,
     provider: Option<String>,
@@ -655,7 +655,7 @@ pub(crate) async fn run_auth(
                 return Ok(());
             }
             if provider == "copilot" || provider == "github-copilot" {
-                let access_token = hermes_cli::copilot_auth::start_copilot_device_flow().await?;
+                let access_token = crate::copilot_auth::start_copilot_device_flow().await?;
                 manager
                     .save_credential(OAuthCredential {
                         provider: "copilot".to_string(),
@@ -682,7 +682,7 @@ pub(crate) async fn run_auth(
                     expires_at: None,
                 })
                 .await?;
-            let msg = hermes_cli::auth::login(&provider).await?;
+            let msg = crate::auth::login(&provider).await?;
             println!("{}", msg);
         }
         "logout" => {
@@ -738,7 +738,7 @@ pub(crate) async fn run_auth(
                 );
                 return Ok(());
             }
-            let msg = hermes_cli::auth::logout(&provider).await?;
+            let msg = crate::auth::logout(&provider).await?;
             token_store.remove(&provider).await?;
             println!("{} (removed credential for provider: {})", msg, provider);
         }
