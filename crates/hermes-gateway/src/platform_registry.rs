@@ -213,15 +213,23 @@ pub async fn register_platforms(
                     match TelegramAdapter::new(telegram_config) {
                         Ok(adapter) => {
                             let adapter = Arc::new(adapter);
-                            gateway.register_adapter("telegram", adapter.clone()).await;
-                            registered.push("telegram".to_string());
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound(
+                                    "telegram",
+                                    adapter.clone(),
+                                    inbound_rx,
+                                )
+                                .await;
+                            sidecar_tasks.push(inbound_task);
 
-                            // Start Telegram poll loop
+                            // Start Telegram poll loop with the inbound sender
+                            let poll_adapter = adapter.clone();
                             sidecar_tasks.push(tokio::spawn(async move {
-                                // Simplified: actual implementation would run telegram poll loop
-                                // For now, just log that we would start it
-                                tracing::info!("Telegram poll loop would start here");
+                                poll_adapter.run_poll_loop(inbound_tx).await;
                             }));
+                            registered.push("telegram".to_string());
                         }
                         Err(e) => errors.push(("telegram".to_string(), e.to_string())),
                     }
