@@ -117,6 +117,7 @@ async fn main() {
         CliCommand::Version => {
             hermes_cli::commands::handle_cli_version().map_err(|e| e.to_string())
         }
+        CliCommand::Setup => cmd::misc::run_setup().await.map_err(|e| e.to_string()),
         // ── Ported from hermes-rs (working) ─────────────────────────
         CliCommand::Voice { cmd } => cmd::voice::cmd_voice(&cli, &cmd)
             .await

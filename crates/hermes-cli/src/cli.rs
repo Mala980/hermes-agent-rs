@@ -258,6 +258,9 @@ pub enum CliCommand {
     /// Show version information.
     Version,
 
+    /// Interactive setup wizard.
+    Setup,
+
     /// Generate shell completion scripts.
 
     /// Uninstall helper (removes ~/.hermes by default).
