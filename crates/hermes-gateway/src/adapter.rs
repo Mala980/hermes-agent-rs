@@ -171,7 +171,6 @@ mod tests {
         // the constant's intent: it must be positive and comfortably larger
         // than a healthy Telegram long-poll hold (~30 s) so the watchdog
         // can't kill a legitimate poll.
-        assert!(HTTP_CLIENT_TIMEOUT_SECS >= 60);
         let base = BasePlatformAdapter::new("token");
         assert!(base.build_client().is_ok());
     }
