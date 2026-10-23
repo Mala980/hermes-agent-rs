@@ -439,7 +439,7 @@ async fn handle_sms_webhook_request(
     if !webhook_url.is_empty() {
         let signature = headers
             .iter()
-            .find(|(k, _)| k == "x-twilio-signature")
+            .find(|(k, _)| k.as_str() == "x-twilio-signature")
             .map(|(_, v)| v.as_str())
             .unwrap_or("");
         if signature.is_empty()

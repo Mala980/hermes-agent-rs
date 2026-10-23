@@ -480,12 +480,16 @@ async fn handle_bluebubbles_webhook_request(
     let q = parse_http_query(query);
     let query_token = q
         .iter()
-        .find(|(k, _)| k == "password" || k == "guid")
+        .find(|(k, _)| k.as_str() == "password" || k.as_str() == "guid")
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
     let header_token = headers
         .iter()
-        .find(|(k, _)| k == "x-password" || k == "x-guid" || k == "x-bluebubbles-guid")
+        .find(|(k, _)| {
+            k.as_str() == "x-password"
+                || k.as_str() == "x-guid"
+                || k.as_str() == "x-bluebubbles-guid"
+        })
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
     let provided = if !query_token.is_empty() {
@@ -513,7 +517,9 @@ async fn handle_bluebubbles_webhook_request(
             let form = parse_http_query(&String::from_utf8_lossy(&body));
             let json_str = form
                 .iter()
-                .find(|(k, _)| k == "payload" || k == "data" || k == "message")
+                .find(|(k, _)| {
+                    k.as_str() == "payload" || k.as_str() == "data" || k.as_str() == "message"
+                })
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
             match serde_json::from_str(&json_str) {
