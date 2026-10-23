@@ -82,14 +82,14 @@ async fn main() {
         CliCommand::Memory {
             action,
             arg,
-            target: _,
+            target,
         } => {
             if action.as_deref() == Some("setup") || (action.is_none() && arg.is_some()) {
                 hermes_cli::commands::handle_cli_memory_setup(action, arg)
                     .await
                     .map_err(|e| e.to_string())
             } else {
-                hermes_cli::commands::handle_cli_memory(action)
+                hermes_cli::commands::handle_cli_memory(action, arg, target)
                     .await
                     .map_err(|e| e.to_string())
             }

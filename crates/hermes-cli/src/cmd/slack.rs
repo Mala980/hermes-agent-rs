@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-use hermes_cli::cli::Cli;
-use hermes_cli::commands::SLASH_COMMANDS;
+use crate::cli::Cli;
+use crate::commands::SLASH_COMMANDS;
 use hermes_config::hermes_home;
 use hermes_core::AgentError;
 
@@ -144,7 +144,7 @@ fn build_full_manifest(
 
 /// Handle `hermes slack [manifest]`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn cmd_slack(
+pub async fn cmd_slack(
     _cli: Cli,
     action: Option<String>,
     name: Option<String>,

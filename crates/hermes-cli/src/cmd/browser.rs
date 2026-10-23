@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_core::AgentError;
 
 /// (cli flag key, binary names to probe, linux config subdir, mac support
@@ -262,7 +262,7 @@ fn close_browser_holding_profile(src: &std::path::Path) -> (bool, String) {
 }
 
 /// Handle `hermes browser [close-profile]`.
-pub(crate) async fn cmd_browser(
+pub async fn cmd_browser(
     _cli: Cli,
     action: Option<String>,
     browser: Option<String>,

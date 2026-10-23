@@ -59,7 +59,7 @@ fn disengage() -> bool {
 }
 
 /// Engage the global emergency stop.
-pub(crate) async fn cmd_pause(reason: Option<String>) -> Result<(), AgentError> {
+pub async fn cmd_pause(reason: Option<String>) -> Result<(), AgentError> {
     let already = is_engaged();
     let path = engage(reason.as_deref())?;
     let detail = reason
@@ -83,7 +83,7 @@ pub(crate) async fn cmd_pause(reason: Option<String>) -> Result<(), AgentError> 
 }
 
 /// Disengage the global emergency stop.
-pub(crate) async fn cmd_resume() -> Result<(), AgentError> {
+pub async fn cmd_resume() -> Result<(), AgentError> {
     if disengage() {
         println!("▶️  Hermes resumed — dispatch picks up on the next tick.");
     } else {

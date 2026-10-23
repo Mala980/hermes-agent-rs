@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hermes_cli::cli::Cli;
-use hermes_cli::App;
+use crate::cli::Cli;
+use crate::App;
 use hermes_core::{AgentError, Message, MessageRole};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,7 +108,7 @@ struct WebhookState {
 }
 
 /// Run the standalone webhook server until Ctrl-C.
-pub(crate) async fn cmd_webhook(cli: &Cli, port: u16) -> Result<(), AgentError> {
+pub async fn cmd_webhook(cli: &Cli, port: u16) -> Result<(), AgentError> {
     let app = App::new(cli.clone()).await?;
     let state = Arc::new(WebhookState {
         app,

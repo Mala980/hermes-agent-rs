@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use hermes_cli::cli::{Cli, VoiceCmd};
+use crate::cli::{Cli, VoiceCmd};
 use hermes_config::{resolve_managed_tool_gateway, resolve_openai_audio_api_key, ResolveOptions};
 use hermes_core::{AgentError, ToolHandler};
 use hermes_tools::backends::tts::MultiTtsBackend;
@@ -22,7 +22,7 @@ use hermes_tools::tools::tts::TextToSpeechHandler;
 use serde_json::json;
 
 /// Dispatch `hermes voice <say|listen>`.
-pub(crate) async fn cmd_voice(_cli: &Cli, cmd: &VoiceCmd) -> Result<(), AgentError> {
+pub async fn cmd_voice(_cli: &Cli, cmd: &VoiceCmd) -> Result<(), AgentError> {
     match cmd {
         VoiceCmd::Say { text, out, voice } => say(text, out.as_deref(), voice.as_deref()).await,
         VoiceCmd::Listen { file, language } => listen(file, language.as_deref()).await,
