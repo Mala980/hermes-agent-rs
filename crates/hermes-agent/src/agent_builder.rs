@@ -18,11 +18,14 @@ use crate::agent_loop::{
     CheapModelRouteConfig, RuntimeProviderConfig, SmartModelRoutingConfig,
     ToolRegistry as AgentToolRegistry,
 };
+use crate::api_bridge::CodexProvider;
+use crate::copilot_oauth::CopilotOauthProvider;
 use crate::provider::{AnthropicProvider, GenericProvider, OpenAiProvider, OpenRouterProvider};
 use crate::providers_extra::{
     CopilotProvider, KimiProvider, MiniMaxProvider, NousProvider, QwenProvider,
 };
 use crate::providers_native::{AzureOpenAiProvider, BedrockProvider, GeminiProvider};
+use crate::qwen_oauth::QwenOAuthProvider;
 use crate::AgentConfig;
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,7 @@ pub fn provider_api_key_from_env(provider: &str) -> Option<String> {
         "minimax" => "MINIMAX_API_KEY",
         "nous" => "NOUS_API_KEY",
         "copilot" => "GITHUB_COPILOT_TOKEN",
+        "openai-codex" | "codex" => "OPENAI_API_KEY",
         "azure" => "AZURE_OPENAI_API_KEY",
         "azure-foundry" | "azure_foundry" => "AZURE_FOUNDRY_API_KEY",
         _ => return None,
@@ -243,6 +247,45 @@ pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvide
         }
     }
 
+    // Qwen OAuth: token comes from the OAuth2 flow (QWEN_OAUTH_* env),
+    // not a static API key, so it is resolved before the generic key
+    // lookup below (mirrors the bedrock special case).
+    if provider_name == "qwen-oauth" {
+        match QwenOAuthProvider::from_env(model_name) {
+            Ok(p) => {
+                let mut p = p;
+                if let Some(url) = resolve_provider_base_url(config, provider_name) {
+                    p = p.with_base_url(url);
+                }
+                return Arc::new(p);
+            }
+            Err(e) => {
+                tracing::warn!("Qwen OAuth not configured ({e}); falling back to StubProvider");
+                return Arc::new(StubProvider {
+                    model: model.to_string(),
+                });
+            }
+        }
+    }
+
+    // Copilot OAuth device flow: token comes from the GitHub device
+    // authorization flow, not a static API key.
+    if provider_name == "copilot-oauth" {
+        let client_id = std::env::var("COPILOT_OAUTH_CLIENT_ID")
+            .or_else(|_| std::env::var("GITHUB_CLIENT_ID"))
+            .unwrap_or_default();
+        if client_id.is_empty() {
+            tracing::warn!("COPILOT_OAUTH_CLIENT_ID not set; falling back to StubProvider");
+            return Arc::new(StubProvider {
+                model: model.to_string(),
+            });
+        }
+        let url = resolve_provider_base_url(config, provider_name)
+            .unwrap_or_else(|| "https://api.github.com/copilot".to_string());
+        let p = CopilotOauthProvider::from_client_id(client_id, url, model_name);
+        return Arc::new(p);
+    }
+
     let provider_config = config.llm_providers.get(provider_name);
 
     let api_key = provider_config
@@ -269,6 +312,13 @@ pub fn build_provider(config: &GatewayConfig, model: &str) -> Arc<dyn LlmProvide
     match provider_name {
         "openai" => {
             let mut p = OpenAiProvider::new(&api_key).with_model(model_name);
+            if let Some(url) = base_url {
+                p = p.with_base_url(url);
+            }
+            Arc::new(p)
+        }
+        "codex" | "openai-codex" => {
+            let mut p = CodexProvider::new(&api_key).with_model(model_name);
             if let Some(url) = base_url {
                 p = p.with_base_url(url);
             }

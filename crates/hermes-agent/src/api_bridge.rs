@@ -496,6 +496,7 @@ impl LlmProvider for CodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_convert_input_basic() {
@@ -577,5 +578,222 @@ mod tests {
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0].id, "fc_1");
         assert_eq!(tc[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn test_builder_defaults_and_overrides() {
+        let p = CodexProvider::new("k");
+        assert_eq!(p.base_url, "https://api.openai.com/v1");
+        assert_eq!(p.model, "codex-mini-latest");
+        assert_eq!(p.api_key, "k");
+        let p = p
+            .with_model("gpt-5-codex")
+            .with_base_url("https://proxy.example/v1/");
+        assert_eq!(p.model, "gpt-5-codex");
+        assert_eq!(p.base_url, "https://proxy.example/v1/");
+    }
+
+    // --- Mock-HTTP tests (no real tokens; local TCP loopback server) ---
+
+    /// Index just past the `\r\n\r\n` header terminator, if present.
+    fn find_headers_end(request: &[u8]) -> Option<usize> {
+        request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+    }
+
+    /// Spin up a one-shot HTTP server on 127.0.0.1 that captures the raw
+    /// request and replies with `response`. Returns the base URL to point
+    /// the provider at plus a receiver for the captured request bytes.
+    async fn serve_once(response: String) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = socket.read(&mut buf).await.expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(headers_end) = find_headers_end(&request) {
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|l| {
+                            let (name, value) = l.split_once(':')?;
+                            if name.trim().eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + content_len {
+                        break;
+                    }
+                }
+                if request.len() > 4 * 1024 * 1024 {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&request).into_owned());
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            // Give the client a moment to read before the socket drops.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        (base_url, rx)
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_against_mock_server() {
+        let body = serde_json::json!({
+            "id": "resp_123",
+            "object": "response",
+            "model": "codex-mini-latest",
+            "status": "completed",
+            "output": [
+                {"type": "message",
+                 "content": [{"type": "output_text", "text": "Hello from codex"}]},
+                {"type": "function_call", "call_id": "call_1",
+                 "name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+            ],
+            "usage": {"input_tokens": 12, "output_tokens": 7}
+        })
+        .to_string();
+        let (base_url, rx) = serve_once(http_ok(&body)).await;
+
+        // Trailing slash must not produce a double slash in the path.
+        let provider = CodexProvider::new("test-key")
+            .with_base_url(format!("{base_url}/"))
+            .with_model("test-model");
+
+        let resp = provider
+            .chat_completion(
+                &[Message::user("Hi")],
+                &[],
+                Some(100),
+                Some(0.5),
+                None,
+                None,
+            )
+            .await
+            .expect("mock chat completion should succeed");
+
+        assert_eq!(resp.message.content.as_deref(), Some("Hello from codex"));
+        let tool_calls = resp.message.tool_calls.as_ref().expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(resp.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(resp.model, "codex-mini-latest");
+        let usage = resp.usage.as_ref().expect("usage");
+        assert_eq!(usage.total_tokens, 19);
+
+        let request = rx.await.expect("request captured").to_lowercase();
+        assert!(
+            request.starts_with("post /responses http/1.1"),
+            "request line: {request}"
+        );
+        assert!(
+            request.contains("authorization: bearer test-key"),
+            "auth header: {request}"
+        );
+        assert!(
+            request.contains("\"model\":\"test-model\""),
+            "model in body: {request}"
+        );
+        assert!(request.contains("\"input\""), "input in body: {request}");
+        assert!(
+            request.contains("\"max_output_tokens\":100"),
+            "max tokens in body: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_surfaces_http_error() {
+        let body = r#"{"error":{"message":"invalid key","type":"invalid_request_error"}}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (base_url, _rx) = serve_once(response).await;
+        let provider = CodexProvider::new("bad-key").with_base_url(base_url);
+        let err = provider
+            .chat_completion(&[Message::user("Hi")], &[], None, None, None, None)
+            .await
+            .expect_err("401 should surface as an error");
+        match err {
+            AgentError::LlmApi(msg) => {
+                assert!(msg.contains("401"), "status in error: {msg}");
+                assert!(msg.contains("invalid key"), "body in error: {msg}");
+            }
+            other => panic!("expected AgentError::LlmApi, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_completion_stream_parses_sse() {
+        let sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"Hello \"}\n",
+            "\n",
+            "event: response.output_text.delta\n",
+            "data: {\"delta\":\"world\"}\n",
+            "\n",
+            "event: response.completed\n",
+            "data: {\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+            "\n",
+        );
+        let (base_url, rx) = serve_once(http_ok(sse)).await;
+        let provider = CodexProvider::new("test-key").with_base_url(base_url);
+
+        let mut stream =
+            provider.chat_completion_stream(&[Message::user("Hi")], &[], None, None, None, None);
+        let mut text = String::new();
+        let mut finish_reason = None;
+        let mut total_tokens = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream chunk should be Ok");
+            if let Some(delta) = chunk.delta {
+                if let Some(content) = delta.content {
+                    text.push_str(&content);
+                }
+            }
+            if chunk.finish_reason.is_some() {
+                finish_reason = chunk.finish_reason;
+            }
+            if let Some(usage) = chunk.usage {
+                total_tokens = usage.total_tokens;
+            }
+        }
+        assert_eq!(text, "Hello world");
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+        assert_eq!(total_tokens, 8);
+
+        let request = rx.await.expect("request captured").to_lowercase();
+        assert!(
+            request.contains("\"stream\":true"),
+            "stream flag in body: {request}"
+        );
     }
 }

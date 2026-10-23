@@ -25,6 +25,7 @@ which = "7"
 eventsource-stream = { workspace = true }
 tokio-stream = { workspace = true }
 async-stream = "0.3"
+base64 = { workspace = true }
 lazy_static = "1"
 dirs = "6"
 rusqlite = { workspace = true }

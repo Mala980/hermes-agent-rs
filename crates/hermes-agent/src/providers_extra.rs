@@ -49,6 +49,14 @@ impl QwenProvider {
             inner: self.inner.with_base_url(url),
         }
     }
+
+    /// Replace the bearer credential used for requests.
+    ///
+    /// Used by OAuth wrappers (e.g. `crate::qwen_oauth::QwenOAuthProvider`)
+    /// that mint a fresh token per request instead of holding a static key.
+    pub fn set_api_key(&mut self, api_key: impl Into<String>) {
+        self.inner.api_key = api_key.into();
+    }
 }
 
 #[async_trait]
