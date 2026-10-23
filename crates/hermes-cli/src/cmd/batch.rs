@@ -216,6 +216,8 @@ mod tests {
             completion_tokens: 20,
             total_tokens: 30,
             estimated_cost: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         };
         let rec = success_record(&item("p", "s"), "hello", Some(&usage), 123);
         assert_eq!(rec["prompt"], "p");
