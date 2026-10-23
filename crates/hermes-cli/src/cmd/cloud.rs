@@ -68,7 +68,7 @@ fn clear_cloud_credential() -> Result<bool, AgentError> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_cloud(
+pub async fn run_cloud(
     action: Option<String>,
     agent_id: Option<String>,
     prompt: Option<String>,

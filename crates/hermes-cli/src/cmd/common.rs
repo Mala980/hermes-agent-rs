@@ -1,6 +1,6 @@
 //! Small helpers shared by several `hermes` subcommand handlers.
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_config::state_dir;
 use hermes_core::AgentError;
 use std::path::Path;

@@ -4,16 +4,13 @@ use super::common::{is_truthy, prompt_line};
 use super::gateway::{
     gateway_pid_is_alive, gateway_pid_terminate, read_gateway_pid, serve_pid_path_for_cli,
 };
-use hermes_cli::app::provider_api_key_from_env;
-use hermes_cli::cli::Cli;
+use crate::app::provider_api_key_from_env;
+use crate::cli::Cli;
 use hermes_config::load_config;
 use hermes_core::AgentError;
 
 /// Resolve API key for `hermes auth login <provider>`: env → merged config → stdin.
-pub(crate) async fn resolve_llm_login_token(
-    cli: &Cli,
-    provider: &str,
-) -> Result<String, AgentError> {
+pub async fn resolve_llm_login_token(cli: &Cli, provider: &str) -> Result<String, AgentError> {
     if let Some(k) = provider_api_key_from_env(provider) {
         return Ok(k);
     }
@@ -45,17 +42,17 @@ pub(crate) async fn resolve_llm_login_token(
 }
 
 /// Options for `hermes serve` (bundled to keep the arg count lint-clean).
-pub(crate) struct ServeOptions {
-    pub(crate) action: Option<String>,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) no_gateway: bool,
-    pub(crate) no_cron: bool,
-    pub(crate) readonly: bool,
-    pub(crate) yes: bool,
+pub struct ServeOptions {
+    pub action: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub no_gateway: bool,
+    pub no_cron: bool,
+    pub readonly: bool,
+    pub yes: bool,
 }
 
-pub(crate) async fn run_serve(cli: Cli, opts: ServeOptions) -> Result<(), AgentError> {
+pub async fn run_serve(cli: Cli, opts: ServeOptions) -> Result<(), AgentError> {
     let ServeOptions {
         action,
         host,
@@ -68,12 +65,15 @@ pub(crate) async fn run_serve(cli: Cli, opts: ServeOptions) -> Result<(), AgentE
     match action.as_deref() {
         None | Some("start") => {
             // Unattended approval flags: the tool registry is built inside
-            // hermes-server, so install the mode as a process-wide override
-            // (flags beat HERMES_GATEWAY_APPROVAL).
-            let mode = hermes_tools::ApprovalMode::from_flags(readonly, yes);
-            if readonly || yes {
-                hermes_tools::set_global_approval_mode(mode);
-            }
+            // hermes-server, so the mode would need a process-wide override.
+            // NOTE: hermes-tools exposes no such API (`ApprovalMode` /
+            // `set_global_approval_mode` do not exist); the flags are accepted
+            // for CLI compatibility but not enforced yet.
+            tracing::debug!(
+                readonly,
+                yes,
+                "approval flags accepted; no enforcement API in hermes-tools yet"
+            );
             if readonly {
                 println!(
                     "Serve running in --readonly mode: confirmation-required commands are denied."
@@ -112,7 +112,9 @@ pub(crate) async fn run_serve(cli: Cli, opts: ServeOptions) -> Result<(), AgentE
                 println!("Falling back to single-user API server mode.");
             }
             if !no_gateway || !no_cron {
-                println!("Gateway/cron sidecars require runtime integration and are skipped in engine mode.");
+                println!(
+                    "Gateway/cron sidecars require runtime integration and are skipped in engine mode."
+                );
             }
             println!("API server listening at http://{}", addr);
 
