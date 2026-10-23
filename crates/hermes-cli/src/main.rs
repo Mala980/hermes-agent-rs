@@ -21,8 +21,13 @@ use hermes_telemetry::init_telemetry_from_env;
 async fn main() {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    init_tracing(cli.verbose);
+    // In TUI mode, redirect tracing logs to a file — writing to stdout/stderr
+    // corrupts the alternate-screen rendering (log lines overwrite TUI widgets).
+    let is_tui = matches!(
+        cli.effective_command(),
+        CliCommand::Hermes | CliCommand::Tui | CliCommand::Chat { .. }
+    );
+    init_tracing(cli.verbose, is_tui);
 
     tracing::debug!("Hermes Agent starting");
 
@@ -118,6 +123,20 @@ async fn main() {
             hermes_cli::commands::handle_cli_version().map_err(|e| e.to_string())
         }
         CliCommand::Setup => cmd::misc::run_setup().await.map_err(|e| e.to_string()),
+        CliCommand::Completion { shell } => {
+            cmd::misc::run_completion(shell).map_err(|e| e.to_string())
+        }
+        CliCommand::Doctor => cmd::misc::run_doctor(cli).await.map_err(|e| e.to_string()),
+        CliCommand::Lumio { action, model } => cmd::misc::run_lumio(action, model)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Status { full, deep } => cmd::misc::run_status(cli, full, deep)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Uninstall { yes } => cmd::misc::run_uninstall(yes)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Update => cmd::misc::run_update().await.map_err(|e| e.to_string()),
         // ── Ported from hermes-rs (working) ─────────────────────────
         CliCommand::Voice { cmd } => cmd::voice::cmd_voice(&cli, &cmd)
             .await
@@ -283,7 +302,20 @@ async fn main() {
 }
 
 /// Initialize the tracing subscriber with env filter.
-fn init_tracing(verbose: bool) {
+fn init_tracing(verbose: bool, tui_mode: bool) {
+    if tui_mode {
+        // Redirect logs to a file so they don't corrupt the TUI.
+        let log_dir = hermes_config::hermes_home().join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_file = log_dir.join("tui.log");
+        let level = if verbose { "debug" } else { "info" };
+        if hermes_telemetry::init_telemetry_to_file(&log_file, level).is_ok() {
+            return;
+        }
+        // Fallback: disable logging rather than corrupting the TUI.
+        let _ = hermes_telemetry::init_telemetry_to_file(std::path::Path::new("/dev/null"), "off");
+        return;
+    }
     let default = if verbose { "debug" } else { "info" };
     init_telemetry_from_env("hermes-cli", default);
 }

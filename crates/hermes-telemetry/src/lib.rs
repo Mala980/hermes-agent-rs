@@ -32,6 +32,31 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Initialize telemetry writing logs to a file instead of stdout.
+///
+/// Use this in TUI mode — writing log lines to the terminal corrupts the
+/// alternate-screen rendering. Returns the log file path on success.
+pub fn init_telemetry_to_file(
+    log_path: &std::path::Path,
+    default_level: &str,
+) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map_err(|e| format!("cannot open log file {}: {e}", log_path.display()))?;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
+    let writer = std::sync::Mutex::new(file);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
+    Ok(())
+}
+
 /// Build [`TelemetryConfig`] from environment and call [`init_telemetry`].
 ///
 /// Honors `RUST_LOG` / `HERMES_LOG_JSON` / `HERMES_OTLP_ENDPOINT` like the CLI and HTTP binaries.

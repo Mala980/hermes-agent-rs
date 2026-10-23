@@ -97,11 +97,44 @@ pub fn help_for(cmd: &str) -> Option<&'static str> {
 ///
 /// `cmd` is the full command token including the `/` prefix
 /// (e.g. `/model`, `/new`). `args` are the remaining tokens.
+///
+/// Unique prefixes are resolved to the full command (e.g. `/q` → `/quit`).
+/// Ambiguous prefixes return an error listing the candidates.
 pub async fn handle_slash_command(
     app: &mut App,
     cmd: &str,
     args: &[&str],
 ) -> Result<CommandResult, AgentError> {
+    // Resolve unique prefixes (e.g. `/q` → `/quit`). Exact matches skip this.
+    let resolved;
+    let cmd = {
+        let exact = SLASH_COMMANDS.iter().any(|(c, _)| *c == cmd);
+        if exact {
+            cmd
+        } else {
+            let matches: Vec<&str> = SLASH_COMMANDS
+                .iter()
+                .filter(|(c, _)| c.starts_with(cmd))
+                .map(|(c, _)| *c)
+                .collect();
+            match matches.len() {
+                0 => cmd, // unknown — falls through to the `_` arm below
+                1 => {
+                    resolved = matches[0];
+                    &resolved
+                }
+                _ => {
+                    println!(
+                        "Ambiguous command '{}'. Did you mean one of: {}?",
+                        cmd,
+                        matches.join(", ")
+                    );
+                    return Ok(CommandResult::Handled);
+                }
+            }
+        }
+    };
+
     match cmd {
         "/new" => {
             app.new_session();

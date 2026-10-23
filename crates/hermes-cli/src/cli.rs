@@ -262,6 +262,45 @@ pub enum CliCommand {
     Setup,
 
     /// Generate shell completion scripts.
+    Completion {
+        /// Shell name (bash, zsh, fish, powershell).
+        #[arg(long)]
+        shell: Option<String>,
+    },
+
+    /// Run diagnostics.
+    Doctor,
+
+    /// Lumio-specific utilities.
+    Lumio {
+        /// Action to perform.
+        action: Option<String>,
+        /// Model name.
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Show system status.
+    Status {
+        /// Show full details.
+        #[arg(long)]
+        full: bool,
+        /// Deep check.
+        #[arg(long)]
+        deep: bool,
+    },
+
+    /// Uninstall hermes.
+    Uninstall {
+        /// Skip confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Check for updates.
+    Update,
+
+    /// Generate shell completion scripts.
 
     /// Uninstall helper (removes ~/.hermes by default).
 
