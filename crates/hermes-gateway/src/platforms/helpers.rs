@@ -193,13 +193,17 @@ pub fn constant_time_eq<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> bool {
     diff == 0
 }
 
-/// Parse a URL query string into key/value pairs.
+/// Parse a URL query string or `application/x-www-form-urlencoded` body
+/// into key/value pairs, percent-decoding keys and values (`+` → space).
 pub fn parse_http_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter_map(|pair| {
             let (k, v) = pair.split_once('=')?;
-            Some((k.to_string(), v.to_string()))
+            Some((
+                String::from_utf8_lossy(&http_url_decode(k)).into_owned(),
+                String::from_utf8_lossy(&http_url_decode(v)).into_owned(),
+            ))
         })
         .collect()
 }
@@ -322,10 +326,17 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Verify an HMAC-SHA256 webhook signature (`sha256=<hex>` format).
+///
+/// The `sha256=` prefix is REQUIRED: a bare-hex header is rejected, since
+/// Meta (and our own webhook docs) always send the prefixed form and
+/// silently accepting unprefixed input weakens format strictness.
 pub fn verify_hmac_sha256_signature(secret: &str, body: &[u8], header: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let hex = header.strip_prefix("sha256=").unwrap_or(header);
+    let hex = match header.strip_prefix("sha256=") {
+        Some(h) => h,
+        None => return false,
+    };
     let expected = match hex_decode(hex) {
         Some(v) => v,
         None => return false,

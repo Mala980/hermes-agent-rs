@@ -492,8 +492,10 @@ async fn handle_bluebubbles_webhook_request(
         })
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
-    let provided = if !query_token.is_empty() {
-        http_url_decode(query_token)
+    // Query params are already percent-decoded by `parse_http_query`;
+    // only the raw header value still needs decoding.
+    let provided: Vec<u8> = if !query_token.is_empty() {
+        query_token.as_bytes().to_vec()
     } else {
         http_url_decode(header_token)
     };
