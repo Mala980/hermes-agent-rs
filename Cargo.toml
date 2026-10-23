@@ -86,6 +86,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10" }
 iana-time-zone = { version = "0.1" }
+libc = { version = "0.2" }
 cron = "0.15"
 
 # Utils
