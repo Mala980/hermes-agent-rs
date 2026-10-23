@@ -1043,6 +1043,7 @@ impl MatrixAdapter {
             user_id: msg.sender.clone(),
             text: msg.body.clone(),
             message_id: Some(msg.event_id.clone()),
+            thread_id: None,
             is_dm: false,
         }
     }
