@@ -421,6 +421,9 @@ pub async fn register_platforms(
                         ),
                         verify_token: hermes_config::extra_string(platform_cfg, "verify_token"),
                         app_secret: None,
+                        webhook_host: None,
+                        webhook_port: None,
+                        webhook_path: None,
                         proxy: Default::default(),
                     };
                     match WhatsAppAdapter::new(wa_cfg) {
@@ -480,6 +483,9 @@ pub async fn register_platforms(
                             "verification_token",
                         ),
                         encrypt_key: hermes_config::extra_string(platform_cfg, "encrypt_key"),
+                        webhook_host: None,
+                        webhook_port: None,
+                        webhook_path: None,
                         proxy: Default::default(),
                     };
                     match FeishuAdapter::new(feishu_cfg) {
@@ -593,6 +599,9 @@ pub async fn register_platforms(
                     let bb_cfg = BlueBubblesConfig {
                         server_url,
                         password,
+                        webhook_host: None,
+                        webhook_port: None,
+                        webhook_path: None,
                         proxy: Default::default(),
                     };
                     match BlueBubblesAdapter::new(bb_cfg) {
@@ -671,6 +680,10 @@ pub async fn register_platforms(
                         account_sid,
                         auth_token,
                         from_number,
+                        webhook_host: None,
+                        webhook_port: None,
+                        webhook_path: None,
+                        webhook_url: None,
                         proxy: Default::default(),
                     };
                     match SmsAdapter::new(sms_cfg) {
