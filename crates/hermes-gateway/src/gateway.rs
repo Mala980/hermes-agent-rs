@@ -555,6 +555,10 @@ impl Gateway {
                 .await
         };
 
+        // Reaction hooks: 👍 on success, 👎 on failure (fire-and-forget).
+        let succeeded = route_result.is_ok();
+        crate::streaming::react_to_route_result(&self.adapters, incoming, succeeded).await;
+
         // Stop the typing indicator.
         if let Some(handle) = typing_handle {
             handle.abort();

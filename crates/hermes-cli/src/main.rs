@@ -218,9 +218,11 @@ async fn main() {
         )
         .await
         .map_err(|e| e.to_string()),
-        CliCommand::Config { action, key, value } => cmd::config::run_config(cli, action, key, value)
-            .await
-            .map_err(|e| e.to_string()),
+        CliCommand::Config { action, key, value } => {
+            cmd::config::run_config(cli, action, key, value)
+                .await
+                .map_err(|e| e.to_string())
+        }
         CliCommand::Cron { action } => {
             cmd::cron::run_cron(cli, action, None, None, None, None, None)
                 .await
