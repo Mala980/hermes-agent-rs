@@ -193,8 +193,12 @@ pub async fn register_platforms(
 
                     let telegram_config = TelegramConfig {
                         token,
-                        webhook_url: None,
-                        polling: true,
+                        webhook_url: platform_cfg.webhook_url.clone(),
+                        polling: platform_cfg
+                            .extra
+                            .get("polling")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
                         proxy: Default::default(),
                         parse_markdown: false,
                         parse_html: false,
@@ -205,7 +209,7 @@ pub async fn register_platforms(
                         } else {
                             Some(platform_cfg.allowed_users.clone())
                         },
-                        group_require_mention: false,
+                        group_require_mention: platform_cfg.require_mention.unwrap_or(false),
                         command_menu_max: None,
                         message_reactions: false,
                         command_menu_skills: true,
