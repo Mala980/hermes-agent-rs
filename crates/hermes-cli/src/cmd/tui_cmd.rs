@@ -1,8 +1,14 @@
 //! `hermes tui` — launch the interactive TUI directly.
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
+use crate::App;
 use hermes_core::AgentError;
 
-pub(crate) async fn cmd_tui(cli: Cli) -> Result<(), AgentError> {
-    super::interactive::run_interactive(cli).await
+/// Build the full [`App`] and hand it to the TUI runner.
+///
+/// (Previously this delegated to `cmd::interactive::run_interactive`; the
+/// delegation is inlined here so `hermes tui` does not depend on that module.)
+pub async fn cmd_tui(cli: Cli) -> Result<(), AgentError> {
+    let app = App::new(cli).await?;
+    crate::tui::run(app).await
 }

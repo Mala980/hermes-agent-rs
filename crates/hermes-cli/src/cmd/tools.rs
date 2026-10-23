@@ -1,6 +1,6 @@
 //! `hermes tools` handler.
 
-use hermes_cli::cli::Cli;
+use crate::cli::Cli;
 use hermes_config::{hermes_home, load_user_config_file, save_config_yaml};
 use hermes_core::AgentError;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// `enable`/`disable` persist the tool name in `tools_config.enabled` /
 /// `tools_config.disabled` inside config.yaml (mirrors the agent runtime's
 /// tool gating). `list` marks tools that are currently disabled.
-pub(crate) async fn run_tools(
+pub async fn run_tools(
     cli: Cli,
     action: Option<String>,
     name: Option<String>,

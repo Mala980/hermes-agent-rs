@@ -4,7 +4,7 @@
 //!
 //! - `skin` / `skin list` — list built-in + user-installed skins, marking the
 //!   active one with `*`.
-//! - `skin use <name>` — persist the choice as `display.skin` in config.
+//! - `skin use <name>` — persist the choice in `$HERMES_HOME/skins/active`.
 //! - `skin set <key> <value> [--skin <name>]` — change ONE color of the active
 //!   skin in place (`<name>.yaml` under `$HERMES_HOME/skins/`). Editing a
 //!   built-in skin forks it into `<name>-custom.yaml` so the built-in stays
@@ -12,14 +12,14 @@
 //!
 //! Divergence from the original: the fork's skin engine (`skin_engine.rs`)
 //! only resolves TUI themes, so a forked `<name>-custom.yaml` starts from the
-//! overridden color alone instead of the built-in's full palette.
+//! overridden color alone instead of the built-in's full palette. Also, this
+//! fork's config schema has no `display.skin` field, so the active skin is
+//! tracked in a sidecar file (`skins/active`) rather than in `config.yaml`.
 
 use std::path::PathBuf;
 
-use hermes_cli::cli::Cli;
-use hermes_config::{
-    hermes_home, load_user_config_file, save_config_yaml, user_config_field_display,
-};
+use crate::cli::Cli;
+use hermes_config::hermes_home;
 use hermes_core::AgentError;
 
 /// Built-in skins (names + descriptions, from the original `skin_engine.py`).
@@ -97,29 +97,26 @@ fn list_skins() -> Vec<SkinRow> {
     rows
 }
 
-/// Read the active skin name from config (`display.skin`), default `"default"`.
+/// Read the active skin name from the `$HERMES_HOME/skins/active` sidecar
+/// file (written by `skin use`), defaulting to `"default"`.
 fn active_skin_name(home: &std::path::Path) -> String {
-    let cfg_path = home.join("config.yaml");
-    load_user_config_file(&cfg_path)
+    let path = home.join("skins").join("active");
+    std::fs::read_to_string(&path)
         .ok()
-        .and_then(|cfg| user_config_field_display(&cfg, "display.skin").ok())
-        .map(|s| {
-            if s == "(not set)" {
-                "default".to_string()
-            } else {
-                s
-            }
-        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string())
 }
 
-/// Persist `display.skin` in the user's config file.
+/// Persist the active skin name in the `$HERMES_HOME/skins/active` sidecar
+/// file (this fork's config schema has no `display.skin` field).
 fn persist_active_skin(home: &std::path::Path, name: &str) -> Result<(), AgentError> {
-    let cfg_path = home.join("config.yaml");
-    let mut cfg =
-        load_user_config_file(&cfg_path).map_err(|e| AgentError::Config(e.to_string()))?;
-    cfg.display.skin = Some(name.to_string());
-    save_config_yaml(&cfg_path, &cfg).map_err(|e| AgentError::Config(e.to_string()))?;
+    let skins_dir = home.join("skins");
+    std::fs::create_dir_all(&skins_dir)
+        .map_err(|e| AgentError::Io(format!("create {}: {}", skins_dir.display(), e)))?;
+    let path = skins_dir.join("active");
+    std::fs::write(&path, name.trim())
+        .map_err(|e| AgentError::Io(format!("write {}: {}", path.display(), e)))?;
     Ok(())
 }
 
@@ -233,7 +230,7 @@ fn cmd_set(
         persist_active_skin(home, &target)?;
     }
     println!(
-        "✓ {} = {} in {}/skins/{}.yaml (live within ~1s)",
+        "✓ {} = {} in {}/skins/{}.yaml",
         key,
         value,
         home.display(),
@@ -243,7 +240,7 @@ fn cmd_set(
 }
 
 /// Handle `hermes skin [list|use|set]`.
-pub(crate) async fn cmd_skin(
+pub async fn cmd_skin(
     cli: Cli,
     action: Option<String>,
     key: Option<String>,
@@ -273,7 +270,7 @@ pub(crate) async fn cmd_skin(
                 AgentError::Config("Missing skin name. Usage: hermes skin use <name>".into())
             })?;
             persist_active_skin(&home, name)?;
-            println!("✓ active skin → {} (live within ~1s)", name);
+            println!("✓ active skin → {}", name);
             Ok(())
         }
         "set" => {
