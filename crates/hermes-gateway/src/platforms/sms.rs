@@ -184,6 +184,7 @@ impl SmsAdapter {
             } else {
                 Some(msg.message_sid.clone())
             },
+            thread_id: None,
             is_dm: true,
         }
     }
