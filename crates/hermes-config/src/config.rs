@@ -100,6 +100,27 @@ pub struct MoaConfig {
 // GatewayConfig
 // ---------------------------------------------------------------------------
 
+/// TUI configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TuiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Display configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct DisplayConfig {
+    #[serde(default)]
+    pub theme: String,
+}
+
+/// Mixture-of-Agents configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MoaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Top-level configuration for the hermes gateway.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GatewayConfig {

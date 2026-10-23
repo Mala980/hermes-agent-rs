@@ -22,9 +22,9 @@ pub mod streaming;
 // Re-export key types for convenience
 pub use config::{
     AgentLoopBehaviorConfig, ApprovalConfig, CheapModelRouteConfig, GatewayConfig,
-    LlmProviderConfig, McpServerEntry, ProfileConfig, ProxyConfig, SkillsSettings,
+    LlmProviderConfig, McpServerEntry, MoaConfig, ProfileConfig, ProxyConfig, SkillsSettings,
     SmartModelRoutingConfig, TerminalBackendType, TerminalConfig, ToolCapabilityConfig,
-    ToolsSettings,
+    ToolsSettings, TuiConfig,
 };
 pub use loader::{
     apply_user_config_patch, load_config, load_user_config_file, save_config_yaml,
