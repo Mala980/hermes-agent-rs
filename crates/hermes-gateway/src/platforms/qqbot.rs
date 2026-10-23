@@ -235,6 +235,7 @@ impl QqBotAdapter {
             } else {
                 Some(msg.message_id.clone())
             },
+            thread_id: None,
             is_dm: msg.is_dm,
         }
     }
