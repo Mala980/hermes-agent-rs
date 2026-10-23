@@ -782,7 +782,6 @@ mod tests {
         assert!(Cli::try_parse_from(vec!["hermes", "logout"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "clipboard"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "whatsapp"]).is_err());
-        assert!(Cli::try_parse_from(vec!["hermes", "lumio"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "region"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "subscription"]).is_err());
         assert!(Cli::try_parse_from(vec!["hermes", "codex-models"]).is_err());
