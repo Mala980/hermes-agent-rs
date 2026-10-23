@@ -64,6 +64,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show help for available commands"),
     ("/quit", "Quit the application"),
     ("/exit", "Alias for /quit"),
+    ("/q", "Alias for /quit"),
 ];
 
 /// Return auto-completion suggestions for a partial slash command.
@@ -149,7 +150,7 @@ pub async fn handle_slash_command(
             print_help();
             Ok(CommandResult::Handled)
         }
-        "/quit" | "/exit" => {
+        "/quit" | "/exit" | "/q" => {
             println!("Goodbye!");
             Ok(CommandResult::Quit)
         }
