@@ -28,8 +28,7 @@ pub use config::{
 };
 pub use loader::{
     apply_user_config_patch, load_config, load_user_config_file, reset_user_config_field,
-    save_config_yaml,
-    user_config_field_display, validate_config, ConfigError,
+    save_config_yaml, user_config_field_display, validate_config, ConfigError,
 };
 pub use managed_gateway::{
     build_vendor_gateway_url, coerce_modal_mode, env_var_enabled, get_tool_gateway_scheme,
