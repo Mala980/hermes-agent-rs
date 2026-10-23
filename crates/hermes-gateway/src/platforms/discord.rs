@@ -777,6 +777,7 @@ impl DiscordAdapter {
             user_id: msg.user_id.clone().unwrap_or_default(),
             text: msg.content.clone(),
             message_id: Some(msg.message_id.clone()),
+            thread_id: None,
             is_dm: msg.guild_id.is_none(),
         }
     }
