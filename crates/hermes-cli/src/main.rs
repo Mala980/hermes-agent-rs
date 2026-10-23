@@ -14,23 +14,8 @@
 
 use clap::Parser;
 use hermes_cli::cli::{Cli, CliCommand};
+use hermes_cli::cmd;
 use hermes_telemetry::init_telemetry_from_env;
-
-mod cmd;
-mod oauth_store;
-
-use cmd::auth::run_auth;
-use cmd::cloud::run_cloud;
-use cmd::config::run_config;
-use cmd::cron::run_cron;
-use cmd::gateway::run_gateway;
-use cmd::interactive::{run_interactive, run_model};
-use cmd::misc::{
-    run_completion, run_doctor, run_dump, run_logs, run_lumio, run_profile, run_setup, run_status,
-    run_uninstall, run_update,
-};
-use cmd::serve::{run_serve, ServeOptions};
-use cmd::tools::run_tools;
 
 #[tokio::main]
 async fn main() {
@@ -41,13 +26,19 @@ async fn main() {
 
     tracing::debug!("Hermes Agent starting");
 
-    let result = match cli.effective_command() {
-        CliCommand::Hermes => run_interactive(cli).await,
+    let result: Result<(), String> = match cli.effective_command() {
+        CliCommand::Hermes => {
+            eprintln!("Interactive mode is temporarily unavailable in this build.");
+            eprintln!("Use `hermes chat --query \"...\"` for one-shot queries.");
+            Ok(())
+        }
         CliCommand::Chat {
             query,
             preload_skill,
             yolo,
-        } => hermes_cli::commands::handle_cli_chat(query, preload_skill, yolo).await,
+        } => hermes_cli::commands::handle_cli_chat(query, preload_skill, yolo)
+            .await
+            .map_err(|e| e.to_string()),
         CliCommand::Model {
             provider_model,
             sub_action,
@@ -55,222 +46,100 @@ async fn main() {
         } => {
             // "hermes model provider list" → delegate to runtime-provider handler
             if provider_model.as_deref() == Some("provider") {
-                hermes_cli::commands::handle_cli_runtime_provider(sub_action, sub_arg).await
+                hermes_cli::commands::handle_cli_runtime_provider(sub_action, sub_arg)
+                    .await
+                    .map_err(|e| e.to_string())
             } else {
-                run_model(cli, provider_model).await
+                eprintln!("Model switching via CLI is temporarily unavailable.");
+                Ok(())
             }
         }
         CliCommand::Providers { action } => {
-            hermes_cli::commands::handle_cli_runtime_provider(action, None).await
-        }
-        CliCommand::Tools { action, name } => run_tools(cli, action, name).await,
-        CliCommand::Config { action, key, value } => {
-            // "hermes config set region <value>" → delegate to region handler
-            if action.as_deref() == Some("set") && key.as_deref() == Some("region") {
-                hermes_cli::commands::handle_cli_region(Some("set".to_string()), value).await
-            } else {
-                run_config(cli, action, key, value).await
-            }
-        }
-        CliCommand::Gateway {
-            action,
-            platform,
-            readonly,
-            yes,
-        } => {
-            // "hermes gateway setup whatsapp" → delegate to whatsapp handler
-            if let (Some("setup"), Some(plat)) = (action.as_deref(), platform.as_deref()) {
-                match plat {
-                    "whatsapp" | "wa" => {
-                        hermes_cli::commands::handle_cli_whatsapp(Some("setup".to_string())).await
-                    }
-                    _ => run_gateway(cli, action, readonly, yes).await,
-                }
-            } else {
-                run_gateway(cli, action, readonly, yes).await
-            }
-        }
-        CliCommand::Setup => run_setup().await,
-        CliCommand::Doctor => run_doctor(cli).await,
-        CliCommand::Update => run_update().await,
-        CliCommand::Status { full, deep } => run_status(cli, full, deep).await,
-        CliCommand::Logs {
-            lines,
-            follow,
-            list,
-            name,
-        } => run_logs(cli, lines, follow, list, name).await,
-        CliCommand::Profile { action, name } => run_profile(cli, action, name).await,
-        CliCommand::Auth {
-            action,
-            provider,
-            qr,
-            model,
-        } => {
-            // "hermes auth login lumio" → delegate to lumio handler
-            if action.as_deref() == Some("login") && provider.as_deref() == Some("lumio") {
-                run_lumio(Some("login".to_string()), model).await
-            } else {
-                run_auth(cli, action, provider, qr).await
-            }
+            hermes_cli::commands::handle_cli_runtime_provider(action, None)
+                .await
+                .map_err(|e| e.to_string())
         }
         CliCommand::Skills {
             action,
             name,
             extra,
-        } => hermes_cli::commands::handle_cli_skills(action, name, extra).await,
+        } => hermes_cli::commands::handle_cli_skills(action, name, extra)
+            .await
+            .map_err(|e| e.to_string()),
         CliCommand::Plugins {
             action,
             name,
             git_ref,
             allow_untrusted_git_host,
-        } => {
-            hermes_cli::commands::handle_cli_plugins(
-                action,
-                name,
-                git_ref,
-                allow_untrusted_git_host,
-            )
-            .await
-        }
+        } => hermes_cli::commands::handle_cli_plugins(
+            action,
+            name,
+            git_ref,
+            allow_untrusted_git_host,
+        )
+        .await
+        .map_err(|e| e.to_string()),
         CliCommand::Memory {
             action,
             arg,
-            target,
+            target: _,
         } => {
-            // "hermes memory setup redis" → delegate to memory-setup handler.
-            // Legacy "hermes memory <provider>" (no action) also goes there.
             if action.as_deref() == Some("setup") || (action.is_none() && arg.is_some()) {
-                hermes_cli::commands::handle_cli_memory_setup(action, arg).await
+                hermes_cli::commands::handle_cli_memory_setup(action, arg)
+                    .await
+                    .map_err(|e| e.to_string())
             } else {
-                hermes_cli::commands::handle_cli_memory(action, arg, target).await
+                hermes_cli::commands::handle_cli_memory(action)
+                    .await
+                    .map_err(|e| e.to_string())
             }
         }
-        CliCommand::Mcp { action, server } => {
-            hermes_cli::commands::handle_cli_mcp(action, server).await
-        }
+        CliCommand::Mcp { action, server } => hermes_cli::commands::handle_cli_mcp(action, server)
+            .await
+            .map_err(|e| e.to_string()),
         CliCommand::Sessions {
             action,
             id,
             name,
             output,
-        } => {
-            // "hermes sessions dump" → delegate to dump
-            if action.as_deref() == Some("dump") {
-                run_dump(cli, id, output).await
-            } else if action.as_deref() == Some("stats") {
-                hermes_cli::commands::handle_cli_insights(30, None).await
-            } else {
-                hermes_cli::commands::handle_cli_sessions(action, id, name).await
-            }
-        }
-        CliCommand::Acp { action } => hermes_cli::commands::handle_cli_acp(action).await,
-        CliCommand::Backup { output } => hermes_cli::commands::handle_cli_backup(output).await,
-        CliCommand::Import { path } => hermes_cli::commands::handle_cli_import(path).await,
-        CliCommand::Version => hermes_cli::commands::handle_cli_version(),
-        CliCommand::Cron {
-            action,
-            id,
-            schedule,
-            prompt,
-            timezone,
-            overlap,
-        } => run_cron(cli, action, id, schedule, prompt, timezone, overlap).await,
-        CliCommand::Serve {
-            action,
-            host,
-            port,
-            no_gateway,
-            no_cron,
-            readonly,
-            yes,
-        } => {
-            run_serve(
-                cli,
-                ServeOptions {
-                    action,
-                    host,
-                    port,
-                    no_gateway,
-                    no_cron,
-                    readonly,
-                    yes,
-                },
-            )
+        } => hermes_cli::commands::handle_cli_sessions(action, id, name)
             .await
-        }
-        CliCommand::Cloud {
-            action,
-            agent_id,
-            prompt,
-            env,
-            attempts,
-            email,
-            password,
-            url_override,
-            register,
-            once,
-            poll_interval_secs,
-            limit,
-            json,
-        } => {
-            run_cloud(
-                action,
-                agent_id,
-                prompt,
-                env,
-                attempts,
-                email,
-                password,
-                url_override,
-                register,
-                once,
-                poll_interval_secs,
-                limit,
-                json,
-            )
+            .map_err(|e| e.to_string()),
+        CliCommand::Acp { action } => hermes_cli::commands::handle_cli_acp(action)
             .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Backup { output } => hermes_cli::commands::handle_cli_backup(output)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Import { path } => hermes_cli::commands::handle_cli_import(path)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Version => {
+            hermes_cli::commands::handle_cli_version().map_err(|e| e.to_string())
         }
-        CliCommand::Completion { shell } => run_completion(shell),
-        CliCommand::Uninstall { yes } => run_uninstall(yes).await,
-        // ── Ported from hermes-rs ───────────────────────────────────
-        CliCommand::Voice { cmd } => cmd::voice::cmd_voice(&cli, &cmd).await,
-        CliCommand::Batch { input, out } => {
-            cmd::batch::cmd_batch(&cli, &input, out.as_deref()).await
-        }
-        CliCommand::Eval { cmd } => cmd::eval::cmd_eval(&cli, &cmd).await,
-        CliCommand::Webhook { port } => cmd::webhook::cmd_webhook(&cli, port).await,
-        CliCommand::Run { prompt } => cmd::run::cmd_run(cli, &prompt).await,
-        CliCommand::Tui => cmd::tui_cmd::cmd_tui(cli).await,
-        // ── Quick-wins port (NousResearch/hermes-agent) ──────────────
-        CliCommand::Claw { action } => hermes_cli::commands::handle_cli_claw(action).await,
+        // ── Ported from hermes-rs (working) ─────────────────────────
+        CliCommand::Voice { cmd } => cmd::voice::cmd_voice(&cli, &cmd)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Webhook { port } => cmd::webhook::cmd_webhook(&cli, port)
+            .await
+            .map_err(|e| e.to_string()),
+        // ── Quick-wins (working) ────────────────────────────────────
+        CliCommand::Claw { action } => hermes_cli::commands::handle_cli_claw(action)
+            .await
+            .map_err(|e| e.to_string()),
         CliCommand::Pairing { action, device_id } => {
-            hermes_cli::commands::handle_cli_pairing(action, device_id).await
+            hermes_cli::commands::handle_cli_pairing(action, device_id)
+                .await
+                .map_err(|e| e.to_string())
         }
-        CliCommand::Skin {
-            action,
-            key,
-            value,
-            skin,
-        } => cmd::skin::cmd_skin(cli, action, key, value, skin).await,
-        CliCommand::Pause { reason } => cmd::estop::cmd_pause(reason).await,
-        CliCommand::Resume => cmd::estop::cmd_resume().await,
-        CliCommand::Browser { action, browser } => {
-            cmd::browser::cmd_browser(cli, action, browser).await
-        }
-        CliCommand::Fallback {
-            action,
-            provider,
-            model,
-            base_url,
-            target,
-        } => cmd::fallback::cmd_fallback(cli, action, provider, model, base_url, target).await,
-        CliCommand::Moa {
-            action,
-            name,
-            reference,
-            aggregator,
-        } => cmd::moa::cmd_moa(cli, action, name, reference, aggregator).await,
+        CliCommand::Pause { reason } => cmd::estop::cmd_pause(reason)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Resume => cmd::estop::cmd_resume().await.map_err(|e| e.to_string()),
+        CliCommand::Browser { action, browser } => cmd::browser::cmd_browser(cli, action, browser)
+            .await
+            .map_err(|e| e.to_string()),
         CliCommand::Slack {
             action,
             name,
@@ -281,21 +150,62 @@ async fn main() {
             agent_view,
             no_assistant,
             write,
-        } => {
-            cmd::slack::cmd_slack(
-                cli,
-                action,
-                name,
-                description,
-                long_description,
-                long_description_file,
-                slashes_only,
-                agent_view,
-                no_assistant,
-                write,
-            )
+        } => cmd::slack::cmd_slack(
+            cli,
+            action,
+            name,
+            description,
+            long_description,
+            long_description_file,
+            slashes_only,
+            agent_view,
+            no_assistant,
+            write,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+        // ── Phase 5: new utilities ──────────────────────────────────
+        CliCommand::Logs(args) => cmd::logs::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Profile(args) => cmd::profile::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Kanban(args) => cmd::kanban::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Checkpoints(args) => cmd::checkpoints::run(&args)
             .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Usage(args) => cmd::usage_cmd::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::PromptSize(args) => cmd::prompt_size::run(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Worktree(args) => cmd::worktree::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Monitoring(args) => {
+            cmd::monitoring::run(&args).await.map_err(|e| e.to_string())
         }
+        CliCommand::Insights(args) => cmd::insights::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Debug(args) => cmd::debug_cmd::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Dump(args) => cmd::dump_cmd::run(&args).await.map_err(|e| e.to_string()),
+        CliCommand::Dashboard(args) => cmd::advanced::run_dashboard(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Hooks(args) => cmd::advanced::run_hooks(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Bundles(args) => cmd::advanced::run_bundles(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Vault(args) => cmd::advanced::run_vault(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Security(args) => cmd::advanced::run_security(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Connectors(args) => cmd::advanced::run_connectors(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Verify(args) => cmd::advanced::run_verify(&args)
+            .await
+            .map_err(|e| e.to_string()),
+        CliCommand::Console(args) => cmd::advanced::run_console(&args)
+            .await
+            .map_err(|e| e.to_string()),
     };
 
     if let Err(e) = result {
