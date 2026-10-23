@@ -200,7 +200,11 @@ pub async fn register_platforms(
                         parse_html: false,
                         poll_timeout: 30,
                         bot_username: None,
-                        allowed_users: None,
+                        allowed_users: if platform_cfg.allowed_users.is_empty() {
+                            None
+                        } else {
+                            Some(platform_cfg.allowed_users.clone())
+                        },
                         group_require_mention: false,
                         command_menu_max: None,
                         message_reactions: false,
