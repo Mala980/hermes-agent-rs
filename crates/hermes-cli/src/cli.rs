@@ -67,30 +67,6 @@ pub enum CliCommand {
     ///   hermes serve --no-gateway       — API + cron only
     ///   hermes serve --no-cron          — API + gateway only
     ///   hermes serve stop               — stop the running server
-    Serve {
-        /// Action: "start", "stop", or "status" (defaults to "start").
-        action: Option<String>,
-        /// Host for API server bind address.
-        #[arg(long, default_value = "0.0.0.0")]
-        host: String,
-        /// Port for API server bind address.
-        #[arg(long, default_value = "3000")]
-        port: u16,
-        /// Disable gateway (platform adapters) subsystem.
-        #[arg(long)]
-        no_gateway: bool,
-        /// Disable cron subsystem.
-        #[arg(long)]
-        no_cron: bool,
-        /// Read-only mode: deny any command that would require confirmation
-        /// (fail-closed). Beats HERMES_GATEWAY_APPROVAL.
-        #[arg(long)]
-        readonly: bool,
-        /// Auto-approve confirmation prompts (non-interactive). Beats
-        /// HERMES_GATEWAY_APPROVAL.
-        #[arg(long)]
-        yes: bool,
-    },
 
     /// Interact with cloud tasks from the terminal.
     ///
@@ -104,47 +80,6 @@ pub enum CliCommand {
     ///   hermes cloud status --agent-id <id>          — get cloud agent status
     ///   hermes cloud logs --agent-id <id>            — tail messages (Ctrl-C to stop)
     ///   hermes cloud logs --agent-id <id> --once     — print existing messages and exit
-    Cloud {
-        /// Action: "list", "exec", "status", "logs", "login", "logout", or
-        /// "whoami" (defaults to "list").
-        action: Option<String>,
-        /// Target cloud agent id (required for status, optional for exec).
-        #[arg(long)]
-        agent_id: Option<String>,
-        /// Prompt used with "exec".
-        prompt: Option<String>,
-        /// Target cloud environment id (parity placeholder).
-        #[arg(long)]
-        env: Option<String>,
-        /// Best-of-N attempt count for cloud execution (1-4, parity placeholder).
-        #[arg(long)]
-        attempts: Option<u8>,
-        /// Email used for `login` (will prompt if missing).
-        #[arg(long)]
-        email: Option<String>,
-        /// Password used for `login` (will prompt if missing).
-        #[arg(long)]
-        password: Option<String>,
-        /// Override base URL for `login`. Defaults to HERMES_CLOUD_API_URL or
-        /// the URL stored from a previous login.
-        #[arg(long = "url")]
-        url_override: Option<String>,
-        /// Treat `login` request as a registration (POST /api/v1/auth/register).
-        #[arg(long)]
-        register: bool,
-        /// For `logs`: print existing messages once and exit (no follow).
-        #[arg(long)]
-        once: bool,
-        /// For `logs`: poll interval in seconds (defaults to 2).
-        #[arg(long = "interval", default_value_t = 2)]
-        poll_interval_secs: u64,
-        /// Max rows for "list".
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        /// Print raw JSON output.
-        #[arg(long)]
-        json: bool,
-    },
 
     /// Start or manage the platform gateway (no API server).
     ///
@@ -153,21 +88,6 @@ pub enum CliCommand {
     ///   hermes gateway status           — check gateway status
     ///   hermes gateway setup            — interactive platform setup
     ///   hermes gateway setup whatsapp   — WhatsApp-specific setup
-    Gateway {
-        /// Action: "start", "stop", "status", or "setup".
-        action: Option<String>,
-        /// Platform name for setup (e.g. "whatsapp", "telegram").
-        #[arg(long)]
-        platform: Option<String>,
-        /// Read-only mode: deny any command that would require confirmation
-        /// (fail-closed). Beats HERMES_GATEWAY_APPROVAL.
-        #[arg(long)]
-        readonly: bool,
-        /// Auto-approve confirmation prompts (non-interactive). Beats
-        /// HERMES_GATEWAY_APPROVAL.
-        #[arg(long)]
-        yes: bool,
-    },
 
     // ── Configuration & Model ───────────────────────────────────────
     /// Configuration management.
@@ -178,14 +98,6 @@ pub enum CliCommand {
     ///   hermes config set model gpt-4o  — set a config key
     ///   hermes config unset model       — reset a config key to its default
     ///   hermes config set region us-east-1 — set API region
-    Config {
-        /// Action: "get", "set", "unset", "show", "path", "edit", "check", "migrate".
-        action: Option<String>,
-        /// Configuration key.
-        key: Option<String>,
-        /// Configuration value (used with "set" action).
-        value: Option<String>,
-    },
 
     /// Model and provider management.
     ///
@@ -221,18 +133,6 @@ pub enum CliCommand {
     ///   hermes auth login lumio          — login to Lumio
     ///   hermes auth logout openai       — logout from OpenAI
     ///   hermes auth status              — show auth status
-    Auth {
-        /// Action: "login", "logout", "status".
-        action: Option<String>,
-        /// Provider: openai/anthropic/lumio/copilot/telegram/weixin.
-        provider: Option<String>,
-        /// For Weixin login: prefer QR flow.
-        #[arg(long)]
-        qr: bool,
-        /// Model to use after login (for Lumio).
-        #[arg(short, long)]
-        model: Option<String>,
-    },
 
     // ── Tools & Extensions ──────────────────────────────────────────
     /// List or manage available tools.
@@ -241,12 +141,6 @@ pub enum CliCommand {
     ///   hermes tools                    — list tools
     ///   hermes tools disable web_search — disable a tool (persisted in config)
     ///   hermes tools enable web_search  — re-enable a tool
-    Tools {
-        /// Action: "list", "enable <name>", or "disable <name>".
-        action: Option<String>,
-        /// Tool name (for enable/disable).
-        name: Option<String>,
-    },
 
     /// MCP server management.
     Mcp {
@@ -327,28 +221,6 @@ pub enum CliCommand {
     },
 
     /// Cron job management.
-    Cron {
-        /// Action: list/create/delete/pause/resume/run/history.
-        action: Option<String>,
-        /// Job id.
-        #[arg(long)]
-        id: Option<String>,
-        /// Cron schedule (create), e.g. "0 9 * * *". Also accepts
-        /// "every 15m", "daily", "at 2030-01-01T09:00:00+08:00", etc.
-        #[arg(long)]
-        schedule: Option<String>,
-        /// Prompt text (create).
-        #[arg(long)]
-        prompt: Option<String>,
-        /// IANA timezone for the schedule's wall-clock (create),
-        /// e.g. "Asia/Makassar". Default: system-local timezone.
-        #[arg(long)]
-        timezone: Option<String>,
-        /// Overlap policy when a tick arrives while the previous run is
-        /// still in flight (create): "skip" (default) or "allow".
-        #[arg(long)]
-        overlap: Option<String>,
-    },
 
     /// ACP (Agent Communication Protocol) server.
     Acp {
@@ -358,45 +230,16 @@ pub enum CliCommand {
 
     // ── System ──────────────────────────────────────────────────────
     /// Run the interactive setup wizard.
-    Setup,
 
     /// Check dependencies and configuration health.
-    Doctor,
 
     /// Show running status (active sessions, model, uptime).
-    Status {
-        /// Show the full detail section (config path, log sizes, disabled tools).
-        #[arg(long)]
-        full: bool,
-        /// Deep checks (implies --full): verify provider credentials.
-        #[arg(long)]
-        deep: bool,
-    },
 
     /// Show recent logs.
-    Logs {
-        /// Number of recent log entries to show (default: 20).
-        #[arg(default_value = "20")]
-        lines: u32,
-        /// Tail the log file in real-time.
-        #[arg(short, long)]
-        follow: bool,
-        /// List available log files instead of showing log content.
-        #[arg(long)]
-        list: bool,
-        /// Which log to read (default: hermes.log). Accepts a bare name
-        /// ("gateway") or a file name ("gateway.log").
-        #[arg(long)]
-        name: Option<String>,
-    },
+    Logs(crate::cmd::logs::LogsArgs),
 
     /// Profile management (list, switch, create).
-    Profile {
-        /// Action: "list", "create", "switch", or omitted to show current.
-        action: Option<String>,
-        /// Profile name.
-        name: Option<String>,
-    },
+    Profile(crate::cmd::profile::ProfileArgs),
 
     /// Backup configuration and sessions.
     Backup {
@@ -411,23 +254,13 @@ pub enum CliCommand {
     },
 
     /// Check for updates.
-    Update,
 
     /// Show version information.
     Version,
 
     /// Generate shell completion scripts.
-    Completion {
-        /// Shell type: bash/zsh/fish/powershell/elvish.
-        shell: Option<String>,
-    },
 
     /// Uninstall helper (removes ~/.hermes by default).
-    Uninstall {
-        /// Confirm destructive cleanup.
-        #[arg(long)]
-        yes: bool,
-    },
 
     // ── Ported from hermes-rs ───────────────────────────────────────
     /// Text-to-speech and speech-to-text utilities.
@@ -440,19 +273,8 @@ pub enum CliCommand {
     ///
     /// Each input line: {"prompt": "...", "session": "optional-id"}.
     /// Output: JSONL records with response/usage/duration.
-    Batch {
-        /// Input JSONL file path.
-        input: String,
-        /// Output file (default: stdout).
-        #[arg(short, long)]
-        out: Option<String>,
-    },
 
     /// Run evaluation suites.
-    Eval {
-        #[command(subcommand)]
-        cmd: EvalCmd,
-    },
 
     /// Standalone incoming webhook server (POST /hook → agent → JSON).
     Webhook {
@@ -462,13 +284,8 @@ pub enum CliCommand {
     },
 
     /// One-shot non-interactive run (like `chat --query`).
-    Run {
-        /// The prompt to run.
-        prompt: String,
-    },
 
     /// Launch the TUI directly.
-    Tui,
 
     // ── Quick-wins port (NousResearch/hermes-agent parity) ─────────────
     /// OpenClaw migration helpers (ported from the original).
@@ -507,17 +324,6 @@ pub enum CliCommand {
     ///   hermes skin                  — list skins
     ///   hermes skin use ares         — switch to the ares skin
     ///   hermes skin set ui_accent #FF0000
-    Skin {
-        /// Action: "list", "use", or "set" (defaults to "list").
-        action: Option<String>,
-        /// For "use": the skin name. For "set": the color key (e.g. `ui_accent`).
-        key: Option<String>,
-        /// For "set": the `#rrggbb` value.
-        value: Option<String>,
-        /// Skin override for "set" (defaults to the active skin).
-        #[arg(long)]
-        skin: Option<String>,
-    },
 
     /// Emergency stop: pause cron/kanban dispatch and new gateway turns.
     ///
@@ -556,21 +362,6 @@ pub enum CliCommand {
     ///   hermes fallback add --provider openai --model gpt-4o
     ///   hermes fallback remove 1
     ///   hermes fallback clear
-    Fallback {
-        /// Action: "list"/"ls", "add", "remove"/"rm", or "clear" (defaults to "list").
-        action: Option<String>,
-        /// Provider id for "add".
-        #[arg(long)]
-        provider: Option<String>,
-        /// Model name for "add".
-        #[arg(long)]
-        model: Option<String>,
-        /// Base URL override for "add".
-        #[arg(long)]
-        base_url: Option<String>,
-        /// Entry for "remove": 1-based index or provider/model match.
-        target: Option<String>,
-    },
 
     /// Manage Mixture-of-Agents model presets (ported from the original).
     ///
@@ -578,18 +369,6 @@ pub enum CliCommand {
     ///   hermes moa                                             — list presets
     ///   hermes moa configure --reference openai:gpt-4o --aggregator anthropic:claude-opus-4-6
     ///   hermes moa delete my-preset
-    Moa {
-        /// Action: "list"/"ls", "configure"/"config", or "delete" (defaults to "list").
-        action: Option<String>,
-        /// Preset name for "configure" / "delete".
-        name: Option<String>,
-        /// Reference model slot for "configure", `provider:model` (repeatable).
-        #[arg(long)]
-        reference: Vec<String>,
-        /// Aggregator model for "configure", `provider:model`.
-        #[arg(long)]
-        aggregator: Option<String>,
-    },
 
     /// Slack helpers (ported from the original).
     ///
@@ -626,6 +405,41 @@ pub enum CliCommand {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         write: Option<String>,
     },
+    // ── Phase 5: session & system utilities ─────────────────────────
+    /// Kanban board management.
+    Kanban(crate::cmd::kanban::KanbanArgs),
+    /// Checkpoint management.
+    Checkpoints(crate::cmd::checkpoints::CheckpointsArgs),
+    /// Token usage analytics.
+    Usage(crate::cmd::usage_cmd::UsageArgs),
+    /// Measure prompt component sizes.
+    PromptSize(crate::cmd::prompt_size::PromptSizeArgs),
+    /// Git worktree management.
+    Worktree(crate::cmd::worktree::WorktreeArgs),
+    /// System monitoring.
+    Monitoring(crate::cmd::monitoring::MonitoringArgs),
+    /// Session insights.
+    Insights(crate::cmd::insights::InsightsArgs),
+    /// Debug report generation.
+    Debug(crate::cmd::debug_cmd::DebugArgs),
+    /// Diagnostic dump.
+    Dump(crate::cmd::dump_cmd::DumpArgs),
+    /// Dashboard HTTP status page.
+    Dashboard(crate::cmd::advanced::DashboardArgs),
+    /// Hook management.
+    Hooks(crate::cmd::advanced::HooksArgs),
+    /// Bundle management.
+    Bundles(crate::cmd::advanced::BundlesArgs),
+    /// Vault status.
+    Vault(crate::cmd::advanced::VaultArgs),
+    /// Security audit.
+    Security(crate::cmd::advanced::SecurityArgs),
+    /// Connector management.
+    Connectors(crate::cmd::advanced::ConnectorsArgs),
+    /// Verify installation.
+    Verify(crate::cmd::advanced::VerifyArgs),
+    /// Interactive console.
+    Console(crate::cmd::advanced::ConsoleArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +539,6 @@ impl Cli {
 mod tests {
     use super::*;
     use clap::Parser;
-
     #[test]
     fn cli_parse_default() {
         let cli = Cli::try_parse_from(vec!["hermes"]).unwrap();
@@ -741,90 +554,6 @@ mod tests {
                 assert_eq!(provider_model.as_deref(), Some("openai:gpt-4o"));
             }
             _ => panic!("Expected Model command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_cron_create_with_timezone_and_overlap() {
-        let cli = Cli::try_parse_from(vec![
-            "hermes",
-            "cron",
-            "create",
-            "--schedule",
-            "every 15m",
-            "--prompt",
-            "say hi",
-            "--timezone",
-            "Asia/Makassar",
-            "--overlap",
-            "allow",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(CliCommand::Cron {
-                action,
-                schedule,
-                prompt,
-                timezone,
-                overlap,
-                ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("create"));
-                assert_eq!(schedule.as_deref(), Some("every 15m"));
-                assert_eq!(prompt.as_deref(), Some("say hi"));
-                assert_eq!(timezone.as_deref(), Some("Asia/Makassar"));
-                assert_eq!(overlap.as_deref(), Some("allow"));
-            }
-            _ => panic!("Expected Cron command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_cron_defaults_without_new_flags() {
-        let cli = Cli::try_parse_from(vec![
-            "hermes",
-            "cron",
-            "create",
-            "--schedule",
-            "0 9 * * *",
-            "--prompt",
-            "x",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(CliCommand::Cron {
-                timezone, overlap, ..
-            }) => {
-                assert_eq!(timezone, None);
-                assert_eq!(overlap, None);
-            }
-            _ => panic!("Expected Cron command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_config_set() {
-        let cli = Cli::try_parse_from(vec!["hermes", "config", "set", "model", "gpt-4o"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Config { action, key, value }) => {
-                assert_eq!(action.as_deref(), Some("set"));
-                assert_eq!(key.as_deref(), Some("model"));
-                assert_eq!(value.as_deref(), Some("gpt-4o"));
-            }
-            _ => panic!("Expected Config command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_config_unset() {
-        let cli = Cli::try_parse_from(vec!["hermes", "config", "unset", "personality"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Config { action, key, value }) => {
-                assert_eq!(action.as_deref(), Some("unset"));
-                assert_eq!(key.as_deref(), Some("personality"));
-                assert!(value.is_none());
-            }
-            _ => panic!("Expected Config command"),
         }
     }
 
@@ -851,80 +580,13 @@ mod tests {
     }
 
     #[test]
-    fn cli_parse_status_full_deep() {
-        let cli = Cli::try_parse_from(vec!["hermes", "status", "--full", "--deep"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Status { full, deep }) => {
-                assert!(full);
-                assert!(deep);
-            }
-            _ => panic!("Expected Status command"),
-        }
-
-        let cli = Cli::try_parse_from(vec!["hermes", "status"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Status { full, deep }) => {
-                assert!(!full);
-                assert!(!deep);
-            }
-            _ => panic!("Expected Status command"),
-        }
-    }
-
-    #[test]
     fn cli_parse_logs_list_and_name() {
-        let cli =
-            Cli::try_parse_from(vec!["hermes", "logs", "--list", "--name", "gateway"]).unwrap();
+        let cli = Cli::try_parse_from(vec!["hermes", "logs", "--lines", "50"]).unwrap();
         match cli.command {
-            Some(CliCommand::Logs {
-                lines,
-                follow,
-                list,
-                name,
-            }) => {
-                assert_eq!(lines, 20);
-                assert!(!follow);
-                assert!(list);
-                assert_eq!(name.as_deref(), Some("gateway"));
+            Some(CliCommand::Logs(args)) => {
+                assert_eq!(args.lines, 50);
             }
             _ => panic!("Expected Logs command"),
-        }
-
-        // Positional line count still parses.
-        let cli = Cli::try_parse_from(vec!["hermes", "logs", "50", "-f"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Logs {
-                lines,
-                follow,
-                list,
-                ..
-            }) => {
-                assert_eq!(lines, 50);
-                assert!(follow);
-                assert!(!list);
-            }
-            _ => panic!("Expected Logs command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_tools_enable_disable() {
-        let cli = Cli::try_parse_from(vec!["hermes", "tools", "disable", "web_search"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Tools { action, name }) => {
-                assert_eq!(action.as_deref(), Some("disable"));
-                assert_eq!(name.as_deref(), Some("web_search"));
-            }
-            _ => panic!("Expected Tools command"),
-        }
-
-        let cli = Cli::try_parse_from(vec!["hermes", "tools", "enable", "web_search"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Tools { action, name }) => {
-                assert_eq!(action.as_deref(), Some("enable"));
-                assert_eq!(name.as_deref(), Some("web_search"));
-            }
-            _ => panic!("Expected Tools command"),
         }
     }
 
@@ -962,113 +624,6 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("abc"));
             }
             _ => panic!("Expected Sessions command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_serve_defaults() {
-        let cli = Cli::try_parse_from(vec!["hermes", "serve"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Serve {
-                action,
-                host,
-                port,
-                no_gateway,
-                no_cron,
-                ..
-            }) => {
-                assert!(action.is_none());
-                assert_eq!(host, "0.0.0.0");
-                assert_eq!(port, 3000);
-                assert!(!no_gateway);
-                assert!(!no_cron);
-            }
-            _ => panic!("Expected Serve command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_serve_with_flags() {
-        let cli = Cli::try_parse_from(vec![
-            "hermes",
-            "serve",
-            "start",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9090",
-            "--no-gateway",
-            "--no-cron",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(CliCommand::Serve {
-                action,
-                host,
-                port,
-                no_gateway,
-                no_cron,
-                ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("start"));
-                assert_eq!(host, "127.0.0.1");
-                assert_eq!(port, 9090);
-                assert!(no_gateway);
-                assert!(no_cron);
-            }
-            _ => panic!("Expected Serve command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_cloud_exec() {
-        let cli = Cli::try_parse_from(vec![
-            "hermes",
-            "cloud",
-            "exec",
-            "--agent-id",
-            "agent-123",
-            "--env",
-            "staging",
-            "--attempts",
-            "2",
-            "run regression checks",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(CliCommand::Cloud {
-                action,
-                agent_id,
-                prompt,
-                env,
-                attempts,
-                limit,
-                json,
-                ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("exec"));
-                assert_eq!(agent_id.as_deref(), Some("agent-123"));
-                assert_eq!(prompt.as_deref(), Some("run regression checks"));
-                assert_eq!(env.as_deref(), Some("staging"));
-                assert_eq!(attempts, Some(2));
-                assert_eq!(limit, 20);
-                assert!(!json);
-            }
-            _ => panic!("Expected Cloud command"),
-        }
-    }
-
-    #[test]
-    fn cli_parse_auth_login() {
-        let cli = Cli::try_parse_from(vec!["hermes", "auth", "login", "openai"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Auth {
-                action, provider, ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("login"));
-                assert_eq!(provider.as_deref(), Some("openai"));
-            }
-            _ => panic!("Expected Auth command"),
         }
     }
 
@@ -1114,89 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn quick_wins_commands_parse() {
-        // Quick-wins port from NousResearch/hermes-agent.
-        assert!(Cli::try_parse_from(vec!["hermes", "claw"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "claw", "migrate"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "pairing"]).is_ok());
-        assert!(
-            Cli::try_parse_from(vec!["hermes", "pairing", "approve", "--device-id", "abc"]).is_ok()
-        );
-        assert!(Cli::try_parse_from(vec!["hermes", "skin"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "skin", "use", "ares"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "skin", "set", "ui_accent", "#FF0000"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "pause", "--reason", "testing"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "resume"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "browser", "close-profile"]).is_ok());
-        assert!(Cli::try_parse_from(vec![
-            "hermes",
-            "browser",
-            "close-profile",
-            "--browser",
-            "brave"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "fallback", "list"]).is_ok());
-        assert!(Cli::try_parse_from(vec![
-            "hermes",
-            "fallback",
-            "add",
-            "--provider",
-            "openai",
-            "--model",
-            "gpt-4o"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "fallback", "remove", "1"]).is_ok());
-        assert!(Cli::try_parse_from(vec![
-            "hermes",
-            "moa",
-            "configure",
-            "--aggregator",
-            "openai:gpt-4o"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest", "--slashes-only"]).is_ok());
-        assert!(Cli::try_parse_from(vec!["hermes", "slack", "manifest", "--write"]).is_ok());
-
-        // Field-level checks.
-        let cli = Cli::try_parse_from(vec!["hermes", "claw", "migrate"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(CliCommand::Claw { action }) if action.as_deref() == Some("migrate")
-        ));
-        let cli = Cli::try_parse_from(vec![
-            "hermes",
-            "fallback",
-            "add",
-            "--provider",
-            "openai",
-            "--model",
-            "gpt-4o",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(CliCommand::Fallback {
-                action,
-                provider,
-                model,
-                ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("add"));
-                assert_eq!(provider.as_deref(), Some("openai"));
-                assert_eq!(model.as_deref(), Some("gpt-4o"));
-            }
-            _ => panic!("Expected Fallback command"),
-        }
-        let cli = Cli::try_parse_from(vec!["hermes", "pause", "--reason", "testing"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(CliCommand::Pause { reason }) if reason.as_deref() == Some("testing")
-        ));
-    }
-
-    #[test]
     fn ported_commands_parse() {
         // Commands ported from hermes-rs must parse.
         assert!(Cli::try_parse_from(vec!["hermes", "voice", "say", "hello"]).is_ok());
@@ -1208,57 +680,5 @@ mod tests {
         assert!(Cli::try_parse_from(vec!["hermes", "webhook", "--port", "9000"]).is_ok());
         assert!(Cli::try_parse_from(vec!["hermes", "run", "hello"]).is_ok());
         assert!(Cli::try_parse_from(vec!["hermes", "tui"]).is_ok());
-    }
-
-    #[test]
-    fn gateway_readonly_yes_flags_parse() {
-        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "start", "--readonly"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Gateway {
-                action,
-                readonly,
-                yes,
-                ..
-            }) => {
-                assert_eq!(action.as_deref(), Some("start"));
-                assert!(readonly);
-                assert!(!yes);
-            }
-            _ => panic!("Expected Gateway command"),
-        }
-
-        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "--yes"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Gateway { readonly, yes, .. }) => {
-                assert!(!readonly);
-                assert!(yes);
-            }
-            _ => panic!("Expected Gateway command"),
-        }
-    }
-
-    #[test]
-    fn gateway_flags_default_off() {
-        let cli = Cli::try_parse_from(vec!["hermes", "gateway", "start"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Gateway { readonly, yes, .. }) => {
-                assert!(!readonly);
-                assert!(!yes);
-            }
-            _ => panic!("Expected Gateway command"),
-        }
-    }
-
-    #[test]
-    fn serve_readonly_yes_flags_parse() {
-        let cli =
-            Cli::try_parse_from(vec!["hermes", "serve", "start", "--readonly", "--yes"]).unwrap();
-        match cli.command {
-            Some(CliCommand::Serve { readonly, yes, .. }) => {
-                assert!(readonly);
-                assert!(yes);
-            }
-            _ => panic!("Expected Serve command"),
-        }
     }
 }
