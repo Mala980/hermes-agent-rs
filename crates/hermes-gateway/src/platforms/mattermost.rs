@@ -202,6 +202,7 @@ impl MattermostAdapter {
             user_id: msg.user_id.clone(),
             text: msg.message.clone(),
             message_id: Some(msg.post_id.clone()),
+            thread_id: None,
             is_dm: false,
         }
     }
