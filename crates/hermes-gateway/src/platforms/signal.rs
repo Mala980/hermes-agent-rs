@@ -217,6 +217,7 @@ impl SignalAdapter {
             user_id: msg.source.clone(),
             text: msg.text.clone(),
             message_id: None,
+            thread_id: None,
             is_dm,
         }
     }
