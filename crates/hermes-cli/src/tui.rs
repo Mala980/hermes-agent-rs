@@ -170,6 +170,10 @@ pub struct TuiState {
     pub completion_index: Option<usize>,
     /// Whether the agent is currently processing.
     pub processing: bool,
+    /// Set when the user presses Enter mid-turn: the text typed into the
+    /// composer during the turn is submitted as the next turn as soon as
+    /// the current one finishes.
+    pub queued_submit: bool,
     /// Buffer for streaming agent output.
     pub stream_buffer: String,
     /// Whether post-response deltas are currently muted.
@@ -274,6 +278,7 @@ impl Default for TuiState {
             completions: Vec::new(),
             completion_index: None,
             processing: false,
+            queued_submit: false,
             stream_buffer: String::new(),
             stream_muted: false,
             stream_needs_break: false,
@@ -700,6 +705,122 @@ impl TuiState {
     fn page_size(&self) -> usize {
         self.viewport_height.saturating_sub(1).max(1) as usize
     }
+
+    /// Handle a key pressed while an agent turn is running.
+    ///
+    /// The turn loop cannot touch `App` (the turn future borrows it), so
+    /// this covers only state-local actions: scrolling the transcript and
+    /// editing the composer. Text typed mid-turn accumulates in
+    /// [`Self::input`] as a queued draft; pressing Enter sets
+    /// [`Self::queued_submit`] so the caller submits the draft as the
+    /// next turn once the current one finishes.
+    fn handle_key_while_processing(&mut self, key: &KeyEvent) -> MidTurnKey {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if is_ctrl_c(key) {
+            return MidTurnKey::Interrupt;
+        }
+        let mods = key.modifiers;
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(self.page_size());
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(self.page_size());
+            }
+            // Enter queues the draft for submission after this turn.
+            KeyCode::Enter if !mods.contains(KeyModifiers::SHIFT) => {
+                return MidTurnKey::QueuedSubmit;
+            }
+            // Shift+Enter → newline in the queued draft.
+            KeyCode::Enter => {
+                self.input.insert(self.cursor_position, '\n');
+                self.cursor_position += 1;
+                self.selection_anchor = None;
+            }
+            KeyCode::Char(c)
+                if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) =>
+            {
+                self.input.insert(self.cursor_position, c);
+                self.cursor_position += c.len_utf8();
+                self.selection_anchor = None;
+            }
+            // Ctrl+A / Ctrl+E → line start / end, as in the idle composer.
+            KeyCode::Char('a') if mods.contains(KeyModifiers::CONTROL) => {
+                self.cursor_position = self.line_start();
+                self.selection_anchor = None;
+            }
+            KeyCode::Char('e') if mods.contains(KeyModifiers::CONTROL) => {
+                self.cursor_position = self.line_end();
+                self.selection_anchor = None;
+            }
+            KeyCode::Backspace => {
+                if self.cursor_position > 0 {
+                    let prev = self.input[..self.cursor_position]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.input.drain(prev..self.cursor_position);
+                    self.cursor_position = prev;
+                    self.selection_anchor = None;
+                }
+            }
+            KeyCode::Delete => {
+                if self.cursor_position < self.input.len() {
+                    let next = self.input[self.cursor_position..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor_position + i)
+                        .unwrap_or(self.input.len());
+                    self.input.drain(self.cursor_position..next);
+                    self.selection_anchor = None;
+                }
+            }
+            KeyCode::Left => {
+                if self.cursor_position > 0 {
+                    self.cursor_position = self.input[..self.cursor_position]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                self.selection_anchor = None;
+            }
+            KeyCode::Right => {
+                if self.cursor_position < self.input.len() {
+                    self.cursor_position = self.input[self.cursor_position..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| self.cursor_position + i)
+                        .unwrap_or(self.input.len());
+                }
+                self.selection_anchor = None;
+            }
+            KeyCode::Home => {
+                self.cursor_position = self.line_start();
+                self.selection_anchor = None;
+            }
+            KeyCode::End => {
+                self.cursor_position = self.line_end();
+                self.selection_anchor = None;
+            }
+            _ => return MidTurnKey::Ignored,
+        }
+        MidTurnKey::Handled
+    }
+}
+
+/// What a key pressed during an agent turn should make the turn loop do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidTurnKey {
+    /// Ctrl+C — interrupt the running agent.
+    Interrupt,
+    /// Enter — submit the queued draft once this turn finishes.
+    QueuedSubmit,
+    /// The key was consumed (scroll or composer edit).
+    Handled,
+    /// The key has no mid-turn meaning and is dropped.
+    Ignored,
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +979,9 @@ fn input_cursor_xy(area: Rect, prefix_width: usize, input: &str, cursor_byte: us
         .saturating_add(row.min(area.height.saturating_sub(1) as usize) as u16);
     (x, y)
 }
+
+/// Status shown when the user queues a follow-up prompt mid-turn.
+const QUEUED_STATUS: &str = "Queued — sends when this turn finishes";
 
 /// Whether the key event is Ctrl+C.
 fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -1517,6 +1641,27 @@ pub async fn run(mut app: App) -> Result<(), AgentError> {
                                     &mut last_draw,
                                 )
                                 .await?;
+                                // Drain follow-ups queued with Enter while a
+                                // turn was running; text typed without Enter
+                                // stays in the composer as a draft.
+                                while state.queued_submit {
+                                    state.queued_submit = false;
+                                    let next = std::mem::take(&mut state.input);
+                                    state.cursor_position = 0;
+                                    state.scroll_offset = 0;
+                                    if next.trim().is_empty() {
+                                        break;
+                                    }
+                                    run_agent_turn(
+                                        &mut tui,
+                                        &mut app,
+                                        &mut state,
+                                        &interrupt_ctl,
+                                        next,
+                                        &mut last_draw,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                         draw_throttled(&mut tui, &TuiView::from_app(&app, tool_count), &mut state, &mut last_draw)?;
@@ -1601,14 +1746,20 @@ async fn run_agent_turn(
             event = tui.events.recv() => {
                 let Some(event) = event else { break Ok(()); };
                 match event {
-                    Event::Key(key) if is_ctrl_c(&key) => {
-                        // Real interrupt: the agent loop polls this controller.
-                        interrupt_ctl.interrupt(None);
-                        state.status_message = "Interrupted".to_string();
+                    Event::Key(key) => {
+                        match state.handle_key_while_processing(&key) {
+                            MidTurnKey::Interrupt => {
+                                // Real interrupt: the agent loop polls this controller.
+                                interrupt_ctl.interrupt(None);
+                                state.status_message = "Interrupted".to_string();
+                            }
+                            MidTurnKey::QueuedSubmit => {
+                                state.queued_submit = true;
+                                state.status_message = QUEUED_STATUS.to_string();
+                            }
+                            MidTurnKey::Handled | MidTurnKey::Ignored => {}
+                        }
                     }
-                    // Keys typed mid-turn are dropped rather than replayed
-                    // after the turn (no input queue in this TUI yet).
-                    Event::Key(_) => {}
                     ev => apply_event(state, ev),
                 }
                 draw_throttled(tui, &snap.view(), state, last_draw)?;
@@ -1632,8 +1783,10 @@ async fn run_agent_turn(
         state.thinking_buffer.clear();
         state.status_message = format!("Error: {e}");
         tracing::warn!("agent turn failed: {e}");
-    } else if state.status_message == "Processing..." {
+    } else if state.status_message == "Processing..." || state.status_message == QUEUED_STATUS {
         // Slash commands never send AgentDone; don't leave the sentinel stuck.
+        // The queued sentinel is likewise consumed here — the caller acts on
+        // `queued_submit` right after this returns.
         state.status_message.clear();
     }
     Ok(())
@@ -1771,6 +1924,69 @@ mod tests {
         assert!(!state.processing);
         assert!(state.selection_anchor.is_none());
         assert!(!state.history_search_active);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn test_mid_turn_typing_accumulates_queue_draft() {
+        let mut state = TuiState::default();
+        state.processing = true;
+        for c in "next prompt".chars() {
+            assert_eq!(
+                state.handle_key_while_processing(&key(KeyCode::Char(c))),
+                MidTurnKey::Handled
+            );
+        }
+        assert_eq!(state.input, "next prompt");
+        assert_eq!(state.cursor_position, "next prompt".len());
+        // Backspace edits the draft; the turn itself is untouched.
+        assert_eq!(
+            state.handle_key_while_processing(&key(KeyCode::Backspace)),
+            MidTurnKey::Handled
+        );
+        assert_eq!(state.input, "next promp");
+    }
+
+    #[test]
+    fn test_mid_turn_enter_queues_submit_and_ctrl_c_interrupts() {
+        let mut state = TuiState::default();
+        state.processing = true;
+        assert_eq!(
+            state.handle_key_while_processing(&key(KeyCode::Enter)),
+            MidTurnKey::QueuedSubmit
+        );
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            state.handle_key_while_processing(&ctrl_c),
+            MidTurnKey::Interrupt
+        );
+        // Ctrl-modified chars are commands, not draft text.
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            state.handle_key_while_processing(&ctrl_x),
+            MidTurnKey::Ignored
+        );
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn test_mid_turn_scroll_keys_adjust_offset() {
+        let mut state = TuiState::default();
+        state.processing = true;
+        state.viewport_height = 20;
+        assert_eq!(
+            state.handle_key_while_processing(&key(KeyCode::PageUp)),
+            MidTurnKey::Handled
+        );
+        assert_eq!(state.scroll_offset, 19);
+        assert_eq!(
+            state.handle_key_while_processing(&key(KeyCode::PageDown)),
+            MidTurnKey::Handled
+        );
+        assert_eq!(state.scroll_offset, 0);
     }
 
     #[test]
